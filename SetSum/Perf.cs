@@ -681,7 +681,7 @@ for (int i = 0; i < messages.Length; i++)
     ms = ms.Insert(Convert.FromBase64String(t));
 }
 
-// 20ms for 668 items
+// 13ms for 668 items
 Console.WriteLine((DateTime.Now - start).TotalMilliseconds);
 
 Console.WriteLine(ms.GetHash());

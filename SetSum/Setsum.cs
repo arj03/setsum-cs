@@ -86,24 +86,7 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
     }
 
     /// <summary>
-    /// Creates a setsum from an array of SetsumBytes.
-    /// </summary>
-    public static Setsum FromDigest(ReadOnlySpan<byte> digest)
-    {
-        if (digest.Length != SetsumBytes)
-            throw new ArgumentException($"Digest must be {SetsumBytes} bytes", nameof(digest));
-
-        var state = new uint[SetsumColumns];
-        for (var col = 0; col < SetsumColumns; col++)
-        {
-            var idx = col * SetsumBytesPerColumn;
-            state[col] = BinaryPrimitives.ReadUInt32LittleEndian(digest.Slice(idx, 4));
-        }
-        return new Setsum(state);
-    }
-
-    /// <summary>
-    /// Computes an ASCII/hex representation of setsum for comparison or use in other situations.
+    /// Computes an ASCII / hex representation of setsum for comparison or use in other situations.
     /// </summary>
     public string GetHash()
     {
@@ -111,7 +94,7 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
     }
 
     /// <summary>
-    /// Adds together two internal representations. The algorithm for column i is (A[i] + B[i]) % P[i].
+    /// Adds together two internal representations.
     /// </summary>
     private static uint[] AddState(uint[] lhs, uint[] rhs)
     {
