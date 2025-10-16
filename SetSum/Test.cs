@@ -1,4 +1,5 @@
-﻿using System.Security.Cryptography;
+﻿using System.Collections.Generic;
+using System.Security.Cryptography;
 using Xunit;
 
 namespace Setsum;
@@ -165,5 +166,18 @@ public class SetsumTests
         mset = mset.Insert(Data3Bytes);
 
         Assert.Equal(AllDataHash, mset.GetHash());
+    }
+
+    [Fact]
+    public void MissingElement()
+    {
+        var msetAll = new Setsum();
+        msetAll = msetAll.InsertHash(Convert.FromHexString(AllDataHash));
+
+        var mset12 = new Setsum();
+        mset12 = mset12.InsertHash(Convert.FromHexString(Data1AndData2Hash));
+
+        var mset3 = msetAll - mset12;
+        Assert.Equal(Data3Hash, mset3.GetHash());
     }
 }
