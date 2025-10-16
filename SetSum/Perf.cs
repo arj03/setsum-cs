@@ -678,7 +678,7 @@ var start = DateTime.Now;
 for (int i = 0; i < messages.Length; i++)
 {
     var t = messages[i][1..^7];
-    ms = ms.Insert(Convert.FromBase64String(t));
+    ms = ms.InsertHash(Convert.FromBase64String(t));
 }
 
 // 13ms for 668 items

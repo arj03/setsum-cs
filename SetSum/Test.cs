@@ -10,11 +10,11 @@ public class SetsumTests
     private static readonly byte[] Data3Bytes = Convert.FromHexString("44F672226090D85DB9A9F2FBFE5F0F9609B387AF7BE5B7FBB7A1767C831C9E9900000000030000000100F2052A0100000043410494B9D3E76C5B1629ECF97FFF95D7A4BBDAC87CC26099ADA28066C6FF1EB9191223CD897194A08D0C2726C5747F1DB49E8CF90E75DC3E3550AE9B30086F3CD5AAAC");
 
     private const string EmptyHash = "0000000000000000000000000000000000000000000000000000000000000000";
-    private const string Data1Hash = "f6173737e77f789f26fb288f6e0ce67703de5e45b6250f29728d38c69ba1196a";
-    private const string Data2Hash = "0205362fc6e33bcd13576e5a58afc80637275731c307a8007cab765dc1a706f2";
-    private const string Data3Hash = "bcac6eb1f17a463997c4ce7aeaee0b6d04ed8a903cead0adc48f7e3a52919bf5";
-    private const string Data1AndData2Hash = "f81c6d66be63b46c395297e9c6bbae7e3a05b676792db7298739af23154a205c";
-    private const string AllDataHash = "b9c9db17afdefaa511176664b0aabaeba9f24007b51788d74bc92d5e20dcbb51";
+    private const string Data1Hash = "d63b1784e706370a88f0e110526a18f7bb567f50763856f4b19f094cfb89dd45";
+    private const string Data2Hash = "626f788a3ecd1f0e966bc4bb37ca7b74424f98687a748bdcfa7cd51bc926f3b4";
+    private const string Data3Hash = "dcdc8ef900b933854f7302a92e3d8ce05eff332425c736d9169b014cca31bc79";
+    private const string Data1AndData2Hash = "3dab8f0e25d456181e5ca6ccec34946bfda517b977ade1d0ab1cdf67c4b0d0fa";
+    private const string AllDataHash = "1e881e08258d8a9daecfa8757d72204c5ba54bdd237518aac1b7e0b347e38c74";
 
     private static byte[] HashBytes(byte[] bytes)
     {
@@ -40,10 +40,19 @@ public class SetsumTests
     }
 
     [Fact]
+    public void Data1ByHash()
+    {
+        var mset = new Setsum();
+        mset = mset.InsertHash(HashBytes(Data1Bytes));
+
+        Assert.Equal(Data1Hash, mset.GetHash());
+    }
+
+    [Fact]
     public void Data1()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data1Bytes));
+        mset = mset.Insert(Data1Bytes);
 
         Assert.Equal(Data1Hash, mset.GetHash());
     }
@@ -52,7 +61,7 @@ public class SetsumTests
     public void Data2()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data2Bytes));
+        mset = mset.Insert(Data2Bytes);
 
         Assert.Equal(Data2Hash, mset.GetHash());
     }
@@ -61,7 +70,7 @@ public class SetsumTests
     public void Data3()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data3Bytes));
+        mset = mset.Insert(Data3Bytes);
 
         Assert.Equal(Data3Hash, mset.GetHash());
     }
@@ -70,22 +79,22 @@ public class SetsumTests
     public void Data1MultisetPlusData2Multiset()
     {
         var mset1 = new Setsum();
-        mset1 = mset1.Insert(HashBytes(Data1Bytes));
+        mset1 = mset1.Insert(Data1Bytes);
 
         var mset2 = new Setsum();
-        mset2 = mset2.Insert(HashBytes(Data2Bytes));
+        mset2 = mset2.Insert(Data2Bytes);
 
-        mset1 = mset1 + mset2;
+        var mset12 = mset1 + mset2;
 
-        Assert.Equal(Data1AndData2Hash, mset1.GetHash());
+        Assert.Equal(Data1AndData2Hash, mset12.GetHash());
     }
 
     [Fact]
     public void Data1PlusData2()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data1Bytes));
-        mset = mset.Insert(HashBytes(Data2Bytes));
+        mset = mset.Insert(Data1Bytes);
+        mset = mset.Insert(Data2Bytes);
 
         Assert.Equal(Data1AndData2Hash, mset.GetHash());
     }
@@ -94,26 +103,26 @@ public class SetsumTests
     public void Data1MultisetPlusData2MultisetPlusData3Multiset()
     {
         var mset1 = new Setsum();
-        mset1 = mset1.Insert(HashBytes(Data1Bytes));
+        mset1 = mset1.Insert(Data1Bytes);
 
         var mset2 = new Setsum();
-        mset2 = mset2.Insert(HashBytes(Data2Bytes));
+        mset2 = mset2.Insert(Data2Bytes);
 
         var mset3 = new Setsum();
-        mset3 = mset3.Insert(HashBytes(Data3Bytes));
+        mset3 = mset3.Insert(Data3Bytes);
 
-        mset1 = mset1 + mset2 + mset3;
+        var allHash = mset1 + mset2 + mset3;
 
-        Assert.Equal(AllDataHash, mset1.GetHash());
+        Assert.Equal(AllDataHash, allHash.GetHash());
     }
 
     [Fact]
     public void Data1PlusData2PlusData3()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data1Bytes));
-        mset = mset.Insert(HashBytes(Data2Bytes));
-        mset = mset.Insert(HashBytes(Data3Bytes));
+        mset = mset.Insert(Data1Bytes);
+        mset = mset.Insert(Data2Bytes);
+        mset = mset.Insert(Data3Bytes);
 
         Assert.Equal(AllDataHash, mset.GetHash());
     }
@@ -122,10 +131,10 @@ public class SetsumTests
     public void Data1PlusData2PlusData3MinusData3()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data1Bytes));
-        mset = mset.Insert(HashBytes(Data2Bytes));
-        mset = mset.Insert(HashBytes(Data3Bytes));
-        mset = mset.Remove(HashBytes(Data3Bytes));
+        mset = mset.Insert(Data1Bytes);
+        mset = mset.Insert(Data2Bytes);
+        mset = mset.Insert(Data3Bytes);
+        mset = mset.Remove(Data3Bytes);
 
         Assert.Equal(Data1AndData2Hash, mset.GetHash());
     }
@@ -134,13 +143,13 @@ public class SetsumTests
     public void Data1PlusData2PlusData3MultisetMinusData2PlusData3Multiset()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data1Bytes));
-        mset = mset.Insert(HashBytes(Data2Bytes));
-        mset = mset.Insert(HashBytes(Data3Bytes));
+        mset = mset.Insert(Data1Bytes);
+        mset = mset.Insert(Data2Bytes);
+        mset = mset.Insert(Data3Bytes);
 
         var mset2 = new Setsum();
-        mset2 = mset2.Insert(HashBytes(Data2Bytes));
-        mset2 = mset2.Insert(HashBytes(Data3Bytes));
+        mset2 = mset2.Insert(Data2Bytes);
+        mset2 = mset2.Insert(Data3Bytes);
 
         mset = mset - mset2;
 
@@ -151,9 +160,9 @@ public class SetsumTests
     public void Data2PlusData1PlusData3OrderDoesNotMatter()
     {
         var mset = new Setsum();
-        mset = mset.Insert(HashBytes(Data2Bytes));
-        mset = mset.Insert(HashBytes(Data1Bytes));
-        mset = mset.Insert(HashBytes(Data3Bytes));
+        mset = mset.Insert(Data2Bytes);
+        mset = mset.Insert(Data1Bytes);
+        mset = mset.Insert(Data3Bytes);
 
         Assert.Equal(AllDataHash, mset.GetHash());
     }

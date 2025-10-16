@@ -59,6 +59,16 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
     }
 
     /// <summary>
+    /// Inserts a new item hash into the multi-set. If the item was already inserted, it will be inserted again.
+    /// </summary>
+    public Setsum InsertHash(ReadOnlySpan<byte> hash)
+    {
+        var itemState = HashToState(hash);
+        var newState = AddState(_state, itemState);
+        return new Setsum(newState);
+    }
+
+    /// <summary>
     /// Removes an item from the multi-set. It is up to the caller to make sure the item already
     /// existed in the multi-set; otherwise, a "placeholder" will be inserted that will consume
     /// one insert of the item.
