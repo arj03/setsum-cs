@@ -6,7 +6,7 @@ This is somewhat similar to [ECHM] for multiset hashing.
 
 ## Performance
 
-Can do around 6.25 million inserts per second on a 8 year old i7.
+Can do around 33 million inserts per second on a 8 year old i7.
 
 Note it currently uses SHA2 instead of SHA3 because SHA3 is not available on Windows 10. 
 

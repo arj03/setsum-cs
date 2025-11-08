@@ -1,5 +1,7 @@
 ﻿using System.Buffers.Binary;
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 namespace Setsum;
 
@@ -27,23 +29,29 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
     /// <summary>
     /// Each column uses a different prime to construct a field of different size and transformations.
     /// </summary>
-    private static ReadOnlySpan<uint> SetsumPrimes =>
-    [
+    private static readonly Vector256<uint> Primes = Vector256.Create(
         4294967291u, 4294967279u, 4294967231u, 4294967197u,
         4294967189u, 4294967161u, 4294967143u, 4294967111u
-    ];
+    );
 
-    private readonly uint[] _state;
+    /// <summary>
+    /// 2^32 mod each prime, for carry adjustment in modular addition.
+    /// </summary>
+    private static readonly Vector256<uint> Mod2pow32 = Vector256.Create(
+        5u, 17u, 65u, 99u, 107u, 135u, 153u, 185u
+    );
+
+    private readonly Vector256<uint> _state;
 
     /// <summary>
     /// Creates a new empty Setsum.
     /// </summary>
     public Setsum()
     {
-        _state = new uint[SetsumColumns];
+        _state = Vector256<uint>.Zero;
     }
 
-    private Setsum(uint[] state)
+    private Setsum(Vector256<uint> state)
     {
         _state = state;
     }
@@ -87,10 +95,12 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
     public byte[] Digest()
     {
         var digest = new byte[SetsumBytes];
+        Span<uint> uints = stackalloc uint[SetsumColumns];
+        _state.StoreUnsafe(ref uints[0]);
         for (var col = 0; col < SetsumColumns; col++)
         {
             var idx = col * SetsumBytesPerColumn;
-            BinaryPrimitives.WriteUInt32LittleEndian(digest.AsSpan(idx, 4), _state[col]);
+            BinaryPrimitives.WriteUInt32LittleEndian(digest.AsSpan(idx, 4), uints[col]);
         }
         return digest;
     }
@@ -100,56 +110,52 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
     /// </summary>
     public string GetHash()
     {
-        return Convert.ToHexStringLower(Digest());
+        return Convert.ToHexString(Digest()).ToLowerInvariant();
     }
 
     /// <summary>
     /// Adds together two internal representations.
     /// </summary>
-    private static uint[] AddState(uint[] lhs, uint[] rhs)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<uint> AddState(Vector256<uint> lhs, Vector256<uint> rhs)
     {
-        var ret = new uint[SetsumColumns];
-
-        for (var i = 0; i < SetsumColumns; i++)
-            ret[i] = (uint)(((ulong)lhs[i] + (ulong)rhs[i]) % (ulong)SetsumPrimes[i]);
-
-        return ret;
+        var sum = lhs + rhs;
+        var carry = Vector256.LessThan(sum, lhs);
+        var adjustment = carry & Mod2pow32;
+        var trueSum = sum + adjustment;
+        var ge = Vector256.GreaterThanOrEqual(trueSum, Primes);
+        return trueSum - (ge & Primes);
     }
 
     /// <summary>
     /// Converts each column in the provided state to be the inverse of the input.
     /// </summary>
-    private static uint[] InvertState(uint[] state)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<uint> InvertState(Vector256<uint> state)
     {
-        var inverted = new uint[SetsumColumns];
-
-        for (var i = 0; i < SetsumColumns; i++)
-            inverted[i] = SetsumPrimes[i] - state[i];
-
-        return inverted;
+        return Primes - state;
     }
 
     /// <summary>
     /// Translate a single hash into the internal representation of a setsum.
     /// </summary>
-    private static uint[] HashToState(ReadOnlySpan<byte> hash)
+    private static Vector256<uint> HashToState(ReadOnlySpan<byte> hash)
     {
-        var itemState = new uint[SetsumColumns];
-
+        Span<uint> uints = stackalloc uint[SetsumColumns];
         for (var i = 0; i < SetsumColumns; i++)
         {
             var idx = i * SetsumBytesPerColumn;
-            var num = BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(idx, 4));
-            itemState[i] = num % SetsumPrimes[i];
+            uints[i] = BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(idx, 4));
         }
-
-        return itemState;
+        var vec = Vector256.LoadUnsafe(ref uints[0]);
+        var ge = Vector256.GreaterThanOrEqual(vec, Primes);
+        return vec - (ge & Primes);
     }
 
     /// <summary>
     /// Translate an item to a setsum state.
     /// </summary>
-    private static uint[] ItemToState(ReadOnlySpan<byte> item)
+    private static Vector256<uint> ItemToState(ReadOnlySpan<byte> item)
     {
         Span<byte> hash = stackalloc byte[SetsumBytes];
         System.Security.Cryptography.SHA256.HashData(item, hash);
@@ -171,25 +177,14 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
 
     public bool Equals(Setsum other)
     {
-        if (_state is null && other._state is null)
-            return true;
-        if (_state is null || other._state is null)
-            return false;
-
-        return _state.AsSpan().SequenceEqual(other._state);
+        return _state.Equals(other._state);
     }
 
     public override bool Equals(object? obj) => obj is Setsum other && Equals(other);
 
     public override int GetHashCode()
     {
-        if (_state is null)
-            return 0;
-
-        var hash = new HashCode();
-        foreach (var val in _state)
-            hash.Add(val);
-        return hash.ToHashCode();
+        return _state.GetHashCode();
     }
 
     public static bool operator ==(Setsum left, Setsum right) => left.Equals(right);
