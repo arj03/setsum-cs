@@ -43,38 +43,20 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
 
     private readonly Vector256<uint> _state;
 
-    /// <summary>
-    /// Creates a new empty Setsum.
-    /// </summary>
-    public Setsum()
-    {
-        _state = Vector256<uint>.Zero;
-    }
-
-    private Setsum(Vector256<uint> state)
-    {
-        _state = state;
-    }
+    public Setsum() => _state = Vector256<uint>.Zero;
+    private Setsum(Vector256<uint> state) => _state = state;
 
     /// <summary>
     /// Inserts a new item into the multi-set. If the item was already inserted, it will be inserted again.
     /// </summary>
     public Setsum Insert(ReadOnlySpan<byte> item)
-    {
-        var itemState = ItemToState(item);
-        var newState = AddState(_state, itemState);
-        return new Setsum(newState);
-    }
+        => new(AddState(_state, ItemToState(item)));
 
     /// <summary>
     /// Inserts a new item hash into the multi-set. If the item was already inserted, it will be inserted again.
     /// </summary>
     public Setsum InsertHash(ReadOnlySpan<byte> hash)
-    {
-        var itemState = HashToState(hash);
-        var newState = AddState(_state, itemState);
-        return new Setsum(newState);
-    }
+        => new(AddState(_state, HashToState(hash)));
 
     /// <summary>
     /// Removes an item from the multi-set. It is up to the caller to make sure the item already
@@ -82,12 +64,7 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
     /// one insert of the item.
     /// </summary>
     public Setsum Remove(ReadOnlySpan<byte> item)
-    {
-        var itemState = ItemToState(item);
-        var invertedState = InvertState(itemState);
-        var newState = AddState(_state, invertedState);
-        return new Setsum(newState);
-    }
+        => new(AddState(_state, InvertState(ItemToState(item))));
 
     /// <summary>
     /// Computes a byte representation of the setsum for comparison or use in other situations.
