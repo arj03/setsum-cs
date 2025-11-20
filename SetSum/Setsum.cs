@@ -162,33 +162,12 @@ public readonly struct Setsum : IEquatable<Setsum>, IAdditionOperators<Setsum, S
         return HashToState(hash);
     }
 
-    public static Setsum operator +(Setsum left, Setsum right)
-    {
-        var state = AddState(left._state, right._state);
-        return new Setsum(state);
-    }
-
-    public static Setsum operator -(Setsum left, Setsum right)
-    {
-        var rhsState = InvertState(right._state);
-        var state = AddState(left._state, rhsState);
-        return new Setsum(state);
-    }
-
-    public bool Equals(Setsum other)
-    {
-        return _state.Equals(other._state);
-    }
-
-    public override bool Equals(object? obj) => obj is Setsum other && Equals(other);
-
-    public override int GetHashCode()
-    {
-        return _state.GetHashCode();
-    }
-
-    public static bool operator ==(Setsum left, Setsum right) => left.Equals(right);
-    public static bool operator !=(Setsum left, Setsum right) => !left.Equals(right);
-
-    public override string ToString() => GetHash();
+     // Operators
+    public static Setsum operator +(Setsum lhs, Setsum rhs) => new(AddState(lhs._state, rhs._state));
+    public static Setsum operator -(Setsum lhs, Setsum rhs) => new(AddState(lhs._state, InvertState(rhs._state)));
+    public static bool operator ==(Setsum lhs, Setsum rhs) => lhs._state.Equals(rhs._state);
+    public static bool operator !=(Setsum lhs, Setsum rhs) => !lhs._state.Equals(rhs._state);
+    public bool Equals(Setsum other) => _state.Equals(other._state);
+    public override bool Equals(object? obj) => obj is Setsum s && Equals(s);
+    public override int GetHashCode() => _state.GetHashCode();
 }
