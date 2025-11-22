@@ -52,8 +52,7 @@ public class SetsumTests
     [Fact]
     public void Data1()
     {
-        var mset = new Setsum();
-        mset = mset.Insert(Data1Bytes);
+        var mset = SetsumBuilder.InsertSHA256(new Setsum(), Data1Bytes);
 
         Assert.Equal(Data1Hash, mset.GetHash());
     }
@@ -61,8 +60,7 @@ public class SetsumTests
     [Fact]
     public void Data2()
     {
-        var mset = new Setsum();
-        mset = mset.Insert(Data2Bytes);
+        var mset = SetsumBuilder.InsertSHA256(new Setsum(), Data2Bytes);
 
         Assert.Equal(Data2Hash, mset.GetHash());
     }
@@ -70,8 +68,7 @@ public class SetsumTests
     [Fact]
     public void Data3()
     {
-        var mset = new Setsum();
-        mset = mset.Insert(Data3Bytes);
+        var mset = SetsumBuilder.InsertSHA256(new Setsum(), Data3Bytes);
 
         Assert.Equal(Data3Hash, mset.GetHash());
     }
@@ -79,11 +76,8 @@ public class SetsumTests
     [Fact]
     public void Data1MultisetPlusData2Multiset()
     {
-        var mset1 = new Setsum();
-        mset1 = mset1.Insert(Data1Bytes);
-
-        var mset2 = new Setsum();
-        mset2 = mset2.Insert(Data2Bytes);
+        var mset1 = SetsumBuilder.InsertSHA256(new Setsum(), Data1Bytes);
+        var mset2 = SetsumBuilder.InsertSHA256(new Setsum(), Data2Bytes);
 
         var mset12 = mset1 + mset2;
 
@@ -94,8 +88,8 @@ public class SetsumTests
     public void Data1PlusData2()
     {
         var mset = new Setsum();
-        mset = mset.Insert(Data1Bytes);
-        mset = mset.Insert(Data2Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data1Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data2Bytes);
 
         Assert.Equal(Data1AndData2Hash, mset.GetHash());
     }
@@ -103,14 +97,9 @@ public class SetsumTests
     [Fact]
     public void Data1MultisetPlusData2MultisetPlusData3Multiset()
     {
-        var mset1 = new Setsum();
-        mset1 = mset1.Insert(Data1Bytes);
-
-        var mset2 = new Setsum();
-        mset2 = mset2.Insert(Data2Bytes);
-
-        var mset3 = new Setsum();
-        mset3 = mset3.Insert(Data3Bytes);
+        var mset1 = SetsumBuilder.InsertSHA256(new Setsum(), Data1Bytes);
+        var mset2 = SetsumBuilder.InsertSHA256(new Setsum(), Data2Bytes);
+        var mset3 = SetsumBuilder.InsertSHA256(new Setsum(), Data3Bytes);
 
         var allHash = mset1 + mset2 + mset3;
 
@@ -121,9 +110,9 @@ public class SetsumTests
     public void Data1PlusData2PlusData3()
     {
         var mset = new Setsum();
-        mset = mset.Insert(Data1Bytes);
-        mset = mset.Insert(Data2Bytes);
-        mset = mset.Insert(Data3Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data1Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data2Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data3Bytes);
 
         Assert.Equal(AllDataHash, mset.GetHash());
     }
@@ -132,10 +121,10 @@ public class SetsumTests
     public void Data1PlusData2PlusData3MinusData3()
     {
         var mset = new Setsum();
-        mset = mset.Insert(Data1Bytes);
-        mset = mset.Insert(Data2Bytes);
-        mset = mset.Insert(Data3Bytes);
-        mset = mset.Remove(Data3Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data1Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data2Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data3Bytes);
+        mset = SetsumBuilder.RemoveSHA256(mset, Data3Bytes);
 
         Assert.Equal(Data1AndData2Hash, mset.GetHash());
     }
@@ -144,13 +133,13 @@ public class SetsumTests
     public void Data1PlusData2PlusData3MultisetMinusData2PlusData3Multiset()
     {
         var mset = new Setsum();
-        mset = mset.Insert(Data1Bytes);
-        mset = mset.Insert(Data2Bytes);
-        mset = mset.Insert(Data3Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data1Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data2Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data3Bytes);
 
         var mset2 = new Setsum();
-        mset2 = mset2.Insert(Data2Bytes);
-        mset2 = mset2.Insert(Data3Bytes);
+        mset2 = SetsumBuilder.InsertSHA256(mset2, Data2Bytes);
+        mset2 = SetsumBuilder.InsertSHA256(mset2, Data3Bytes);
 
         mset = mset - mset2;
 
@@ -161,9 +150,9 @@ public class SetsumTests
     public void Data2PlusData1PlusData3OrderDoesNotMatter()
     {
         var mset = new Setsum();
-        mset = mset.Insert(Data2Bytes);
-        mset = mset.Insert(Data1Bytes);
-        mset = mset.Insert(Data3Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data2Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data1Bytes);
+        mset = SetsumBuilder.InsertSHA256(mset, Data3Bytes);
 
         Assert.Equal(AllDataHash, mset.GetHash());
     }
@@ -179,5 +168,15 @@ public class SetsumTests
 
         var mset3 = msetAll - mset12;
         Assert.Equal(Data3Hash, mset3.GetHash());
+    }
+
+    [Fact]
+    public void XXHash()
+    {
+        var mset = SetsumBuilder.InsertXxHash3(new Setsum(), Data1Bytes);
+        Assert.Equal("0ee0fe32faa2f177c4bcf0dbc508891cca5c0ee93faa786bd29cef0ec0ab7a94", mset.GetHash());
+
+        var msetEmpty = SetsumBuilder.RemoveXxHash3(mset, Data1Bytes);
+        Assert.Equal(EmptyHash, msetEmpty.GetHash());
     }
 }

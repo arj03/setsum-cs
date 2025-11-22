@@ -3,7 +3,6 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
-using System.Security.Cryptography;
 
 namespace Setsum;
 
@@ -51,16 +50,6 @@ public readonly struct Setsum
     private Setsum(Vector256<uint> state) => _state = state;
 
     /// <summary>
-    /// Inserts a new item into the multi-set. If the item was already inserted, it will be inserted again.
-    /// </summary>
-    public Setsum Insert(ReadOnlySpan<byte> item)
-    {
-        Span<byte> hash = stackalloc byte[DigestSize];
-        SHA256.HashData(item, hash);
-        return new Setsum(Add(_state, LoadAndReduce(hash)));
-    }
-
-    /// <summary>
     /// Inserts a new item hash into the multi-set. If the item was already inserted, it will be inserted again.
     /// </summary>
     public Setsum InsertHash(ReadOnlySpan<byte> hash)
@@ -71,12 +60,8 @@ public readonly struct Setsum
     /// existed in the multi-set; otherwise, a "placeholder" will be inserted that will consume
     /// one insert of the item.
     /// </summary>
-    public Setsum Remove(ReadOnlySpan<byte> item)
-    {
-        Span<byte> hash = stackalloc byte[DigestSize];
-        SHA256.HashData(item, hash);
-        return new Setsum(Add(_state, Negate(LoadAndReduce(hash))));
-    }
+    public Setsum RemoveHash(ReadOnlySpan<byte> hash)
+        => new(Add(_state, Negate(LoadAndReduce(hash))));
 
     public void CopyDigest(Span<byte> destination)
     {
