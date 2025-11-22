@@ -55,6 +55,9 @@ public readonly struct Setsum
     public Setsum InsertHash(ReadOnlySpan<byte> hash)
         => new(Add(_state, LoadAndReduce(hash)));
 
+    public static Setsum Hash(ReadOnlySpan<byte> hash)
+        => new(LoadAndReduce(hash));
+
     /// <summary>
     /// Removes an item from the multi-set. It is up to the caller to make sure the item already
     /// existed in the multi-set; otherwise, a "placeholder" will be inserted that will consume

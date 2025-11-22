@@ -4,18 +4,18 @@ using System.Security.Cryptography;
 
 namespace Setsum;
 
-public static class SetsumBuilder
+public static class SetsumHashing
 {
     // SHA256 (cryptographic, slow)
-    public static Setsum InsertSHA256(Setsum s, ReadOnlySpan<byte> item)
-        => s.InsertHash(SHA256.HashData(item));
+    public static Setsum SHA256Setsum(ReadOnlySpan<byte> item)
+        => Setsum.Hash(SHA256.HashData(item));
 
     public static Setsum RemoveSHA256(Setsum s, ReadOnlySpan<byte> item)
         => s.RemoveHash(SHA256.HashData(item));
 
     // xxHash3 (recommended — best quality/speed)
-    public static Setsum InsertXxHash3(Setsum s, ReadOnlySpan<byte> item)
-        => s.InsertHash(Expand128To256(XxHash128.Hash(item)));
+    public static Setsum XxHash3Setsum(ReadOnlySpan<byte> item)
+        => Setsum.Hash(Expand128To256(XxHash128.Hash(item)));
 
     public static Setsum RemoveXxHash3(Setsum s, ReadOnlySpan<byte> item)
         => s.RemoveHash(Expand128To256(XxHash128.Hash(item)));
