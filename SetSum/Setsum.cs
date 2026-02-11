@@ -1,5 +1,4 @@
-﻿using System.Buffers.Binary;
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -32,17 +31,8 @@ public readonly struct Setsum
         4294967111u  // 8th largest
     );
 
-    /// <summary>
-    /// Precomputed values of 2³² mod p_i for each prime.
-    /// When two uints overflow during addition (a + b < a), exactly one carry of 2³²
-    /// is added to the 64-bit sum. To correct this in the prime field, we must add
-    /// (2³² mod p_i) when a carry occurs — this vector supplies those constants.
-    /// This trick lets us implement correct modular addition using only integer ops
-    /// and no expensive 64-bit multiplication or division.
-    /// </summary>
-    private static readonly Vector256<uint> Adjust = Vector256.Create(
-        5u, 17u, 65u, 99u, 107u, 135u, 153u, 185u
-    );
+    // Precomputed adjustment: 2^32 mod P. 
+    private static readonly Vector256<uint> Adjust = Vector256.Subtract(Vector256<uint>.Zero, Primes);
 
     private readonly Vector256<uint> _state;
 
@@ -68,17 +58,15 @@ public readonly struct Setsum
 
     public void CopyDigest(Span<byte> destination)
     {
-        Span<uint> tmp = stackalloc uint[8];
-        _state.StoreUnsafe(ref MemoryMarshal.GetReference(tmp));
+        if (destination.Length < DigestSize)
+            throw new ArgumentException($"Destination must be at least {DigestSize} bytes.", nameof(destination));
 
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[00..04], tmp[0]);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[04..08], tmp[1]);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[08..12], tmp[2]);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[12..16], tmp[3]);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[16..20], tmp[4]);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[20..24], tmp[5]);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[24..28], tmp[6]);
-        BinaryPrimitives.WriteUInt32LittleEndian(destination[28..32], tmp[7]);
+        // Cast the byte reference to a uint reference to use Vector256 Store.
+        // This works correctly on Little-Endian systems.
+        ref byte pByte = ref MemoryMarshal.GetReference(destination);
+        ref uint pUint = ref Unsafe.As<byte, uint>(ref pByte);
+
+        Vector256.StoreUnsafe(_state, ref pUint);
     }
 
     public string GetHexString()
@@ -94,32 +82,39 @@ public readonly struct Setsum
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<uint> Add(Vector256<uint> lhs, Vector256<uint> rhs)
     {
+        // Step 1: Standard integer addition
         var sum = lhs + rhs;
+
+        // Step 2: Detect carry (overflow of 32-bit addition)
         var carry = Vector256.LessThan(sum, lhs);
-        var adjusted = sum + Vector256.ConditionalSelect(carry, Adjust, Vector256<uint>.Zero);
-        var overflow = Vector256.GreaterThanOrEqual(adjusted, Primes);
-        return adjusted - Vector256.ConditionalSelect(overflow, Primes, Vector256<uint>.Zero);
+
+        // Step 3: Correction
+        // If a carry occurred, we added 2^32. We need to subtract 2^32 and add (2^32 mod P).
+        // (2^32 mod P) is precomputed in Adjust.
+        // Bitwise AND is efficient: mask is -1 if true.
+        sum += (carry & Adjust);
+
+        // Step 4: Modular Reduction
+        // If sum >= Prime, subtract Prime.
+        var overflow = Vector256.GreaterThanOrEqual(sum, Primes);
+        return sum - (overflow & Primes);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector256<uint> Negate(Vector256<uint> x) => Primes - x;
+    private static Vector256<uint> Negate(Vector256<uint> x) => Vector256.Subtract(Primes, x);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<uint> LoadAndReduce(ReadOnlySpan<byte> hash)
     {
-        Vector256<uint> v = Vector256.Create(
-            BinaryPrimitives.ReadUInt32LittleEndian(hash),
-            BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(4)),
-            BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(8)),
-            BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(12)),
-            BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(16)),
-            BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(20)),
-            BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(24)),
-            BinaryPrimitives.ReadUInt32LittleEndian(hash.Slice(28))
-        );
+        // Load 32 bytes (8 uints) directly from memory.
+        ref byte pByte = ref MemoryMarshal.GetReference(hash);
+        ref uint pUint = ref Unsafe.As<byte, uint>(ref pByte);
 
+        var v = Vector256.LoadUnsafe(ref pUint);
+
+        // Reduce if value >= Prime
         var overflow = Vector256.GreaterThanOrEqual(v, Primes);
-        return v - Vector256.ConditionalSelect(overflow, Primes, Vector256<uint>.Zero);
+        return v - (overflow & Primes);
     }
 
     // Operators
