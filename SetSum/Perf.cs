@@ -7,7 +7,7 @@ var start = DateTime.Now;
 for (int i = 0; i < bytes.Count; i++)
     ms = ms.InsertHash(bytes[i]);
 
-// 20ms
+// 15ms
 Console.WriteLine((DateTime.Now - start).TotalMilliseconds);
 
 Console.WriteLine(ms.GetHash());
