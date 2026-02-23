@@ -1,0 +1,87 @@
+﻿namespace Setsum.Sync;
+
+/// <summary>
+/// Represents a bit-level prefix for Merkle trie traversal.
+/// Bits holds the prefix MSB-first in a ulong. Length is the number of significant bits.
+/// At depth 0 (root) all keys match. Max depth is 64 (first 8 bytes of the key).
+/// </summary>
+public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
+{
+    public readonly ulong Bits = bits;
+    public readonly int Length = length;
+
+    public static readonly BitPrefix Root = new(0, 0);
+
+    /// <summary>Appends a 0 or 1 bit, returning the child prefix.</summary>
+    public BitPrefix Extend(int bit)
+    {
+        if (Length >= 64) throw new InvalidOperationException("Prefix too deep.");
+        ulong newBits = Bits;
+        if (bit != 0) newBits |= (1UL << (63 - Length));
+        return new BitPrefix(newBits, Length + 1);
+    }
+
+    /// <summary>Returns the bit at position depth (0 = MSB of first byte).</summary>
+    public static int GetBitOfKey(byte[] key, int depth)
+        => (key[depth / 8] >> (7 - depth % 8)) & 1;
+
+    /// <summary>
+    /// Returns the inclusive [lo, hi] byte-array range that this prefix covers,
+    /// suitable for use with binary search range queries.
+    /// lo = prefix bits followed by all 0s
+    /// hi = prefix bits followed by all 1s
+    /// </summary>
+    public (byte[] Lo, byte[] Hi) KeyRange()
+    {
+        const int KeyBytes = Setsum.DigestSize;
+        var lo = new byte[KeyBytes];
+        var hi = new byte[KeyBytes];
+        Array.Fill(hi, (byte)0xFF);
+
+        int fullBytes = Length / 8;
+        int remainder = Length % 8;
+
+        for (int i = 0; i < fullBytes; i++)
+        {
+            byte b = (byte)((Bits >> (56 - i * 8)) & 0xFF);
+            lo[i] = b;
+            hi[i] = b;
+        }
+
+        if (remainder > 0)
+        {
+            byte prefixByte = (byte)((Bits >> (56 - fullBytes * 8)) & 0xFF);
+            byte mask = (byte)(0xFF << (8 - remainder));
+            byte prefixPart = (byte)(prefixByte & mask);
+            lo[fullBytes] = prefixPart;
+            hi[fullBytes] = (byte)(prefixPart | (~mask & 0xFF));
+        }
+
+        return (lo, hi);
+    }
+
+    /// <summary>Returns true if the key's leading bits match this prefix.</summary>
+    public bool Matches(byte[] key)
+    {
+        if (Length == 0) return true;
+        if (key.Length * 8 < Length) return false;
+        ulong keyBits = 0;
+        int bytesNeeded = (Length + 7) / 8;
+        for (int i = 0; i < bytesNeeded && i < key.Length; i++)
+            keyBits |= ((ulong)key[i]) << (56 - i * 8);
+        ulong mask = Length == 64 ? ulong.MaxValue : ~((1UL << (64 - Length)) - 1);
+        return (keyBits & mask) == (Bits & mask);
+    }
+
+    public override string ToString()
+    {
+        var bits = Convert.ToString((long)Bits, 2).PadLeft(64, '0')[..Math.Min(Length, 64)];
+        return $"Prefix({bits}, {Length} bits)";
+    }
+
+    public bool Equals(BitPrefix other) => Bits == other.Bits && Length == other.Length;
+    public override bool Equals(object? obj) => obj is BitPrefix p && Equals(p);
+    public override int GetHashCode() => HashCode.Combine(Bits, Length);
+    public static bool operator ==(BitPrefix a, BitPrefix b) => a.Equals(b);
+    public static bool operator !=(BitPrefix a, BitPrefix b) => !a.Equals(b);
+}
