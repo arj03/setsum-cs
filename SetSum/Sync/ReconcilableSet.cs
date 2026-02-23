@@ -1,4 +1,6 @@
-﻿namespace Setsum.Sync;
+﻿using System.Diagnostics;
+
+namespace Setsum.Sync;
 
 public class ByteComparer : IComparer<byte[]>
 {
@@ -11,17 +13,6 @@ public class ByteComparer : IComparer<byte[]>
         if (y == null) return 1;
         return ((ReadOnlySpan<byte>)x).SequenceCompareTo(y);
     }
-}
-
-public class ReconcileResult
-{
-    public bool Success { get; init; }
-    public bool NeedsFallback { get; init; }
-    public List<byte[]>? MissingItems { get; init; }
-
-    public static ReconcileResult Identical() => new() { Success = true };
-    public static ReconcileResult Found(List<byte[]> items) => new() { Success = true, MissingItems = items };
-    public static ReconcileResult Fallback() => new() { NeedsFallback = true };
 }
 
 /// <summary>
@@ -89,10 +80,21 @@ public class ReconcilableSet
     public void InsertBulkPresorted(List<byte[]> items)
     {
         if (items.Count == 0) return;
+
+        Debug.Assert(IsSorted(items), "InsertBulkPresorted called with unsorted input — store invariants would be corrupted.");
+
         InsertSortedArray(items.ToArray());
     }
 
     public bool Contains(byte[] key) => _store.Contains(key);
+
+    /// <summary>
+    /// Sorts any pending keys and builds the prefix sum table. Call this once after
+    /// a bulk-insert session (e.g. after inserting the initial dataset) to pay the
+    /// O(N log N) sort cost at a known, explicit moment rather than having it land
+    /// as a hidden spike on the first sync operation.
+    /// </summary>
+    public void Prepare() => _store.Prepare();
 
     // -------------------------------------------------------------------------
     // Merkle prefix queries (delegated to SortedKeyStore)
@@ -222,5 +224,13 @@ public class ReconcilableSet
         }
 
         return false;
+    }
+
+    private static bool IsSorted(List<byte[]> items)
+    {
+        for (int i = 1; i < items.Count; i++)
+            if (ByteComparer.Instance.Compare(items[i - 1], items[i]) > 0)
+                return false;
+        return true;
     }
 }

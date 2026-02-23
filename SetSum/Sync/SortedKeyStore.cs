@@ -11,9 +11,9 @@
 ///   - Prefix sums rebuilt lazily (once after a batch of inserts, not per-insert)
 ///
 /// Complexity:
-///   Add()         O(N) shift — use InsertBulk for large batches
-///   MergeSorted() O(N) merge + O(N) prefix sum rebuild
-///   RangeInfo()   O(log N) binary search + O(1) prefix sum lookup
+///   Add()            O(N) shift — use InsertBulk for large batches
+///   MergeSorted()    O(N) merge + O(N) prefix sum rebuild
+///   RangeInfo()      O(log N) binary search + O(1) prefix sum lookup
 ///   RangeInfoSplit() O(log N) — binary searches for range bounds and split point
 ///   CollectMissing() O(log N + result) — sorted merge of two ranges
 /// </summary>
@@ -29,7 +29,7 @@ public class SortedKeyStore
     private readonly List<byte[]> _pendingKeys = [];
     private readonly List<Setsum> _pendingHashes = [];
 
-    public int Count { get { EnsureSorted(); return _count; } }
+    public int Count { get { EnsureReady(); return _count; } }
 
     public SortedKeyStore()
     {
@@ -40,21 +40,27 @@ public class SortedKeyStore
 
     public bool Contains(byte[] key)
     {
-        EnsureSorted();
+        EnsureReady();
         return BinarySearch(key) >= 0;
     }
 
     /// <summary>
-    /// Appends a key to a pending buffer. The buffer is sorted and merged lazily
-    /// when a read operation requires it — avoiding O(N²) behavior from repeated shifts.
+    /// Appends a key to the pending buffer. The buffer is sorted and merged into the
+    /// main array lazily on the next read, or eagerly by calling <see cref="Prepare"/>.
     /// </summary>
     public void Add(byte[] key, Setsum hash)
     {
-        // Buffer unsorted additions; merge into main array on next read.
         _pendingKeys.Add(key);
         _pendingHashes.Add(hash);
         _prefixSumsDirty = true;
     }
+
+    /// <summary>
+    /// Sorts and merges any pending keys into the main array, then builds the prefix
+    /// sum table. Call this once after a bulk-insert session to pay the O(N log N)
+    /// sort cost at a predictable moment rather than deferring it to the first read.
+    /// </summary>
+    public void Prepare() => EnsureReady();
 
     /// <summary>
     /// Merges a pre-sorted (key, hash) array into the store in O(N).
@@ -86,23 +92,20 @@ public class SortedKeyStore
     /// <summary>Returns (hash, count) for all keys in [lo, hi]. O(log N).</summary>
     public (Setsum Hash, int Count) RangeInfo(byte[] lo, byte[] hi)
     {
-        EnsureSorted();
-        EnsurePrefixSums();
+        EnsureReady();
 
         int start = LowerBound(lo);
         int end = UpperBound(hi);
         int count = end - start;
 
         if (count <= 0) return (new Setsum(), 0);
-        else return (_prefixSums[end] - _prefixSums[start], count);
+        return (_prefixSums[end] - _prefixSums[start], count);
     }
 
     /// <summary>Returns (hash, count) for the entire store. O(1) after prefix sums built.</summary>
     public (Setsum Hash, int Count) TotalInfo()
     {
-        EnsureSorted();
-        EnsurePrefixSums();
-
+        EnsureReady();
         return (_prefixSums[_count], _count);
     }
 
@@ -113,8 +116,7 @@ public class SortedKeyStore
     public (Setsum Hash0, int Count0, Setsum Hash1, int Count1)
         RangeInfoSplit(byte[] lo, byte[] hi, int depth)
     {
-        EnsureSorted();
-        EnsurePrefixSums();
+        EnsureReady();
 
         int start = LowerBound(lo);
         int end = UpperBound(hi);
@@ -133,7 +135,7 @@ public class SortedKeyStore
     /// <summary>Enumerates keys in [lo, hi]. O(log N + result).</summary>
     public IEnumerable<byte[]> Range(byte[] lo, byte[] hi)
     {
-        EnsureSorted();
+        EnsureReady();
 
         int start = LowerBound(lo);
         int end = UpperBound(hi);
@@ -144,7 +146,7 @@ public class SortedKeyStore
     /// <summary>Enumerates all keys.</summary>
     public IEnumerable<byte[]> All()
     {
-        EnsureSorted();
+        EnsureReady();
 
         for (int i = 0; i < _count; i++)
             yield return _keys[i];
@@ -152,12 +154,13 @@ public class SortedKeyStore
 
     /// <summary>
     /// Appends to result all keys in [lo, hi] that are absent from other.
-    /// Uses a sorted merge — O(log N + server range + local range), zero allocations.
+    /// Uses a sorted merge — O(log N + server range + local range), zero allocations
+    /// beyond the result list entries themselves.
     /// </summary>
     public void CollectMissing(byte[] lo, byte[] hi, SortedKeyStore other, List<byte[]> result)
     {
-        EnsureSorted();
-        other.EnsureSorted();
+        EnsureReady();
+        other.EnsureReady();
 
         int sStart = LowerBound(lo), sEnd = UpperBound(hi);
         int lStart = other.LowerBound(lo), lEnd = other.UpperBound(hi);
@@ -170,9 +173,9 @@ public class SortedKeyStore
                 li++;
 
             if (li < lEnd && ((ReadOnlySpan<byte>)other._keys[li]).SequenceCompareTo(sKey) == 0)
-            { 
-                si++; 
-                continue; 
+            {
+                si++;
+                continue;
             }
 
             result.Add(sKey);
@@ -185,30 +188,57 @@ public class SortedKeyStore
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Finds the first index in [start, end) where the key has bit=1 at depth.
-    /// Constructs the split key (prefix bits + target bit set to 1 + trailing zeros)
-    /// and binary searches for it.
+    /// Finds the first index in [start, end) where bit <paramref name="depth"/> of the key is 1.
+    ///
+    /// The split key is constructed purely from the depth position — the high bits are
+    /// copied from the range's lower bound so the key sits exactly on the child boundary,
+    /// with the target bit set to 1 and all lower bits zeroed. This is independent of any
+    /// specific key that happens to be stored in the range.
     /// </summary>
     private int FindSplitPoint(int start, int end, int depth)
     {
         var splitKey = new byte[Setsum.DigestSize];
-        if (start < _count)
-        {
-            int fullBytes = depth / 8;
+
+        int fullBytes = depth / 8;
+        int remainder = depth % 8;
+
+        // Copy the fully-determined prefix bytes from the first key in the range.
+        if (start < _count && fullBytes > 0)
             Array.Copy(_keys[start], splitKey, fullBytes);
-            int bitInByte = 7 - (depth % 8);
-            byte prefixMask = (byte)(0xFF << (bitInByte + 1));
-            byte splitByte = (byte)((_keys[start][fullBytes] & prefixMask) | (1 << bitInByte));
-            splitKey[fullBytes] = splitByte;
+
+        if (remainder == 0)
+        {
+            // Split falls exactly on a byte boundary: the split byte is just the high bit set.
+            splitKey[fullBytes] = (byte)(1 << 7);
         }
+        else
+        {
+            // The split byte contains `remainder` prefix bits followed by the split bit.
+            // Preserve the prefix bits from the first key in the range, mask off everything
+            // at and below the split position, then set the split bit.
+            int bitInByte = 7 - remainder;
+            byte prefixMask = (byte)(0xFF << (bitInByte + 1));
+            byte prefixBits = (byte)((start < _count ? _keys[start][fullBytes] : 0) & prefixMask);
+            splitKey[fullBytes] = (byte)(prefixBits | (1 << bitInByte));
+        }
+
         return LowerBound(splitKey, start, end);
+    }
+
+    /// <summary>
+    /// Ensures the store is sorted and prefix sums are up to date.
+    /// Call this at the top of every public read method.
+    /// </summary>
+    private void EnsureReady()
+    {
+        EnsureSorted();
+        EnsurePrefixSums();
     }
 
     private void EnsureSorted()
     {
         if (_pendingKeys.Count == 0) return;
 
-        // Sort pending, then merge into main array.
         var pKeys = _pendingKeys.ToArray();
         var pHashes = _pendingHashes.ToArray();
         Array.Sort(pKeys, pHashes, ByteComparer.Instance);
