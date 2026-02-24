@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+﻿using Xunit.Abstractions;
 
 namespace Setsum.Sync.Test;
 
@@ -35,7 +35,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     private readonly ReconcilableSet _local = local;
     private readonly ReconcilableSet _remote = remote;
 
-    public bool TrySync()
+    public bool TrySync(ITestOutputHelper _output)
     {
         RoundTrips = 0;
         UsedFallback = false;
@@ -47,6 +47,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         // Server tries to figure out what the client is missing and returns those items.
         RoundTrips++;
         var remoteResult = _remote.TryReconcile(_local.Sum, _local.Count);
+
+        _output.WriteLine($"result of first reconcile: {remoteResult.Outcome}");
 
         switch (remoteResult.Outcome)
         {
@@ -73,20 +75,24 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         // ── Push path: check if the client is the one that's ahead ───────────
         // Server returned Fallback. Maybe *we* have items the server is missing.
         var localResult = _local.TryReconcile(_remote.Sum, _remote.Count);
+        _output.WriteLine($"result of local reconcile: {localResult.Outcome}");
         if (localResult.Outcome == ReconcileOutcome.Found)
         {
-            RoundTrips++;
             foreach (var item in localResult.MissingItems!)
             {
                 if (!_remote.Contains(item))
+                {
                     _remote.Insert(item);
+                    RoundTrips++; // FIXME: bulk insert
+                }
             }
+
             return true;
         }
 
         // ── Merkle fallback ──────────────────────────────────────────────────
         UsedFallback = true;
-        return PerformMerkleSync();
+        return PerformMerkleSync(_output);
     }
 
     /// <summary>
@@ -101,7 +107,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     ///      all prefixes that need item transfers and fetch them in a single batch at the
     ///      end. This collapses O(leaves) trips into 1.
     /// </summary>
-    private bool PerformMerkleSync()
+    private bool PerformMerkleSync(ITestOutputHelper _output)
     {
         var itemsToFetch = new List<BitPrefix>();
 
@@ -114,6 +120,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         RoundTrips++;
         HashChecks++;
 
+        _output.WriteLine($"merkle sync: {rootServerHash} {rootServerCount}, {rootClientHash} {rootClientCount}");
+
         if (rootServerCount == 0) return true;
 
         queue.Enqueue((BitPrefix.Root, 0, rootServerHash, rootServerCount, rootClientCount));
@@ -121,6 +129,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         while (queue.Count > 0)
         {
             var (prefix, depth, serverHash, serverCount, clientCount) = queue.Dequeue();
+
+            //_output.WriteLine($"Queue. Prefix: {prefix}, Depth: {depth}, Server hash: {serverHash}");
 
             if (clientCount == 0)
             {
@@ -134,12 +144,12 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             {
                 if (missingCount == 0)
                 {
-                    RoundTrips++;
                     HashChecks++;
                     var (clientHash, _) = _local.GetMerklePrefixInfo(prefix);
                     if (serverHash == clientHash) continue;
                 }
                 itemsToFetch.Add(prefix);
+                _output.WriteLine($"Found item to fetch: {prefix}");
                 continue;
             }
 
@@ -148,13 +158,21 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             var (c0, sh0, sc0, c1, sh1, sc1) = _remote.GetMerkleChildrenWithHashes(prefix, depth);
             var (_, ch0, cc0, _, ch1, cc1) = _local.GetMerkleChildrenWithHashes(prefix, depth);
 
+            RoundTrips++;
+            //_output.WriteLine($"GetMerkleChildrenWithHashes. sc0: {sc0}, sc1: {sc1}");
+
             if (sc0 > 0) queue.Enqueue((c0, depth + 1, sh0, sc0, cc0));
             if (sc1 > 0) queue.Enqueue((c1, depth + 1, sh1, sc1, cc1));
         }
 
+        _output.WriteLine($"Items to fetch: {itemsToFetch.Count}");
+
         var missingItems = new List<byte[]>();
         foreach (var prefix in itemsToFetch)
+        {
+            RoundTrips++;
             _remote.CollectMissingItemsWithPrefix(prefix, _local, missingItems);
+        }
 
         // Each prefix's items are individually sorted, but BFS visits nodes level by level,
         // not in key order — so a shallow prefix added late can cover keys that sort before
@@ -164,7 +182,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
         if (missingItems.Count > 0)
         {
-            RoundTrips++;
             ItemsTransferred = missingItems.Count;
             _local.InsertBulkPresorted(missingItems);
         }
