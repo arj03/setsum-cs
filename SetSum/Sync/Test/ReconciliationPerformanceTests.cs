@@ -169,6 +169,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         var server = new ReconcilableSet();
         var client = new ReconcilableSet();
 
+        var swInsert = Stopwatch.StartNew();
         for (int i = 0; i < 1_000_000; i++)
         {
             var k = RandomKey();
@@ -180,8 +181,11 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         for (int i = 0; i < newItems; i++) server.Insert(RandomKey());
 
         // Pay the sort + prefix-sum cost now, before the timed sync window.
-        server.Prepare();
         client.Prepare();
+        server.Prepare();
+
+        swInsert.Stop();
+        _output.WriteLine($"Setup time, doing 2 * 1 million inserts: {swInsert.Elapsed.TotalMilliseconds:F2} ms");
 
         var sim = new SyncSimulator(client, server);
 

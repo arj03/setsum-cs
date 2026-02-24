@@ -1,311 +1,340 @@
 ﻿namespace Setsum.Sync;
 
 /// <summary>
-/// A sorted array of (key, hash) pairs with O(1) range-hash queries via prefix sums.
+/// A sorted store of fixed-size (32-byte) keys with O(1) range-hash queries via prefix sums.
 ///
-/// Core properties:
-///   - Keys kept in lexicographic (= bit-prefix) order at all times
-///   - Precomputed hash of each key stored alongside it — never recomputed
-///   - Prefix sum array: _prefixSums[i] = sum of _hashes[0..i-1]
-///     → any range hash is O(1): prefixSums[end] - prefixSums[start]
-///   - Prefix sums rebuilt lazily (once after a batch of inserts, not per-insert)
+/// Layout: keys in a flat byte[] (_data), hashes in a parallel Setsum[] (_hashes).
+/// Both arrays are indexed the same way: record i has key at _data[i*32..(i+1)*32]
+/// and hash at _hashes[i].
 ///
-/// Complexity:
-///   Add()            O(N) shift — use InsertBulk for large batches
-///   MergeSorted()    O(N) merge + O(N) prefix sum rebuild
-///   RangeInfo()      O(log N) binary search + O(1) prefix sum lookup
-///   RangeInfoSplit() O(log N) — binary searches for range bounds and split point
-///   CollectMissing() O(log N + result) — sorted merge of two ranges
+/// Sorting uses a two-pass LSB radix sort on bytes 0–1 of the key, producing a
+/// permutation in _scratch (int[]) that is applied in one gather pass to both arrays.
+/// This gives O(N) sort with sequential memory access during the counting passes —
+/// the dominant cost over Array.Sort's O(N log N) with random cache misses.
 /// </summary>
 public class SortedKeyStore
 {
-    private byte[][] _keys;
-    private Setsum[] _hashes;
-    private Setsum[] _prefixSums; // _prefixSums[i] = sum of _hashes[0..i-1]
-    private bool _prefixSumsDirty = true;
+    private const int KeySize = Setsum.DigestSize; // 32
+
+    // Main sorted store
+    private byte[] _data = new byte[16 * KeySize];
+    private Setsum[] _hashes = new Setsum[16];
     private int _count;
 
-    // Unsorted additions buffered here and merged lazily before any read.
-    private readonly List<byte[]> _pendingKeys = [];
-    private readonly List<Setsum> _pendingHashes = [];
+    // Prefix sums: _prefixSums[i] = sum of _hashes[0..i-1]
+    private Setsum[] _prefixSums = new Setsum[17];
+    private bool _prefixSumsDirty = true;
 
-    public int Count { get { EnsureReady(); return _count; } }
+    // Pending unsorted additions
+    private byte[] _pending = new byte[16 * KeySize];
+    private Setsum[] _pendingHashes = new Setsum[16];
+    private int _pendingCount;
 
-    public SortedKeyStore()
-    {
-        _keys = new byte[16][];
-        _hashes = new Setsum[16];
-        _prefixSums = new Setsum[17];
-    }
+    // Reusable scratch buffers — never reallocated unless they need to grow
+    private byte[] _scratchData = new byte[16 * KeySize];
+    private Setsum[] _scratchHashes = new Setsum[16];
+
+    private readonly int[] _counts = new int[256];
+    private readonly int[] _offsets = new int[256];
+
+    public int Count { get { EnsureSorted(); return _count; } }
+
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
 
     public bool Contains(byte[] key)
     {
-        EnsureReady();
+        EnsureSorted();
         return BinarySearch(key) >= 0;
     }
 
-    /// <summary>
-    /// Appends a key to the pending buffer. The buffer is sorted and merged into the
-    /// main array lazily on the next read, or eagerly by calling <see cref="Prepare"/>.
-    /// </summary>
     public void Add(byte[] key, Setsum hash)
     {
-        _pendingKeys.Add(key);
-        _pendingHashes.Add(hash);
+        if (_pendingCount * KeySize >= _pending.Length)
+        {
+            GrowFlat(ref _pending, _pendingCount);
+            Grow(ref _pendingHashes, _pendingCount);
+        }
+        key.CopyTo(_pending, _pendingCount * KeySize);
+        _pendingHashes[_pendingCount++] = hash;
         _prefixSumsDirty = true;
     }
 
-    /// <summary>
-    /// Sorts and merges any pending keys into the main array, then builds the prefix
-    /// sum table. Call this once after a bulk-insert session to pay the O(N log N)
-    /// sort cost at a predictable moment rather than deferring it to the first read.
-    /// </summary>
-    public void Prepare() => EnsureReady();
-
-    /// <summary>
-    /// Merges a pre-sorted (key, hash) array into the store in O(N).
-    /// Rebuilds the prefix sum array once at the end.
-    /// </summary>
-    public void MergeSorted(byte[][] keys, Setsum[] hashes, int newCount)
-    {
-        int total = _count + newCount;
-        var mergedKeys = new byte[total][];
-        var mergedHashes = new Setsum[total];
-
-        int i = 0, j = 0, k = 0;
-        while (i < _count && j < newCount)
-        {
-            int cmp = ((ReadOnlySpan<byte>)_keys[i]).SequenceCompareTo(keys[j]);
-            if (cmp <= 0) { mergedKeys[k] = _keys[i]; mergedHashes[k] = _hashes[i]; i++; }
-            else { mergedKeys[k] = keys[j]; mergedHashes[k] = hashes[j]; j++; }
-            k++;
-        }
-        while (i < _count) { mergedKeys[k] = _keys[i]; mergedHashes[k] = _hashes[i]; i++; k++; }
-        while (j < newCount) { mergedKeys[k] = keys[j]; mergedHashes[k] = hashes[j]; j++; k++; }
-
-        _keys = mergedKeys;
-        _hashes = mergedHashes;
-        _count = total;
-        _prefixSumsDirty = true;
-    }
-
-    /// <summary>Returns (hash, count) for all keys in [lo, hi]. O(log N).</summary>
-    public (Setsum Hash, int Count) RangeInfo(byte[] lo, byte[] hi)
-    {
-        EnsureReady();
-
-        int start = LowerBound(lo);
-        int end = UpperBound(hi);
-        int count = end - start;
-
-        if (count <= 0) return (new Setsum(), 0);
-        return (_prefixSums[end] - _prefixSums[start], count);
-    }
-
-    /// <summary>Returns (hash, count) for the entire store. O(1) after prefix sums built.</summary>
-    public (Setsum Hash, int Count) TotalInfo()
-    {
-        EnsureReady();
-        return (_prefixSums[_count], _count);
-    }
-
-    /// <summary>
-    /// Splits the range [lo, hi] at the given bit depth into two child ranges.
-    /// Uses binary search for the split point — O(log N) total, no linear scan.
-    /// </summary>
-    public (Setsum Hash0, int Count0, Setsum Hash1, int Count1)
-        RangeInfoSplit(byte[] lo, byte[] hi, int depth)
-    {
-        EnsureReady();
-
-        int start = LowerBound(lo);
-        int end = UpperBound(hi);
-        if (start >= end) return (new Setsum(), 0, new Setsum(), 0);
-
-        int splitIdx = FindSplitPoint(start, end, depth);
-
-        int c0 = splitIdx - start;
-        int c1 = end - splitIdx;
-        Setsum h0 = c0 > 0 ? _prefixSums[splitIdx] - _prefixSums[start] : new Setsum();
-        Setsum h1 = c1 > 0 ? _prefixSums[end] - _prefixSums[splitIdx] : new Setsum();
-
-        return (h0, c0, h1, c1);
-    }
-
-    /// <summary>Enumerates keys in [lo, hi]. O(log N + result).</summary>
-    public IEnumerable<byte[]> Range(byte[] lo, byte[] hi)
-    {
-        EnsureReady();
-
-        int start = LowerBound(lo);
-        int end = UpperBound(hi);
-        for (int i = start; i < end; i++)
-            yield return _keys[i];
-    }
-
-    /// <summary>Enumerates all keys.</summary>
-    public IEnumerable<byte[]> All()
-    {
-        EnsureReady();
-
-        for (int i = 0; i < _count; i++)
-            yield return _keys[i];
-    }
-
-    /// <summary>
-    /// Appends to result all keys in [lo, hi] that are absent from other.
-    /// Uses a sorted merge — O(log N + server range + local range), zero allocations
-    /// beyond the result list entries themselves.
-    /// </summary>
-    public void CollectMissing(byte[] lo, byte[] hi, SortedKeyStore other, List<byte[]> result)
-    {
-        EnsureReady();
-        other.EnsureReady();
-
-        int sStart = LowerBound(lo), sEnd = UpperBound(hi);
-        int lStart = other.LowerBound(lo), lEnd = other.UpperBound(hi);
-
-        int si = sStart, li = lStart;
-        while (si < sEnd)
-        {
-            var sKey = _keys[si];
-            while (li < lEnd && ((ReadOnlySpan<byte>)other._keys[li]).SequenceCompareTo(sKey) < 0)
-                li++;
-
-            if (li < lEnd && ((ReadOnlySpan<byte>)other._keys[li]).SequenceCompareTo(sKey) == 0)
-            {
-                si++;
-                continue;
-            }
-
-            result.Add(sKey);
-            si++;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
-
-    /// <summary>
-    /// Finds the first index in [start, end) where bit <paramref name="depth"/> of the key is 1.
-    ///
-    /// The split key is constructed purely from the depth position — the high bits are
-    /// copied from the range's lower bound so the key sits exactly on the child boundary,
-    /// with the target bit set to 1 and all lower bits zeroed. This is independent of any
-    /// specific key that happens to be stored in the range.
-    /// </summary>
-    private int FindSplitPoint(int start, int end, int depth)
-    {
-        var splitKey = new byte[Setsum.DigestSize];
-
-        int fullBytes = depth / 8;
-        int remainder = depth % 8;
-
-        // Copy the fully-determined prefix bytes from the first key in the range.
-        if (start < _count && fullBytes > 0)
-            Array.Copy(_keys[start], splitKey, fullBytes);
-
-        if (remainder == 0)
-        {
-            // Split falls exactly on a byte boundary: the split byte is just the high bit set.
-            splitKey[fullBytes] = (byte)(1 << 7);
-        }
-        else
-        {
-            // The split byte contains `remainder` prefix bits followed by the split bit.
-            // Preserve the prefix bits from the first key in the range, mask off everything
-            // at and below the split position, then set the split bit.
-            int bitInByte = 7 - remainder;
-            byte prefixMask = (byte)(0xFF << (bitInByte + 1));
-            byte prefixBits = (byte)((start < _count ? _keys[start][fullBytes] : 0) & prefixMask);
-            splitKey[fullBytes] = (byte)(prefixBits | (1 << bitInByte));
-        }
-
-        return LowerBound(splitKey, start, end);
-    }
-
-    /// <summary>
-    /// Ensures the store is sorted and prefix sums are up to date.
-    /// Call this at the top of every public read method.
-    /// </summary>
-    private void EnsureReady()
+    public void Prepare()
     {
         EnsureSorted();
         EnsurePrefixSums();
     }
 
+    /// <summary>Merges a pre-sorted flat key buffer + hash array into the store.</summary>
+    public void MergeSorted(byte[] keys, Setsum[] hashes, int newCount)
+    {
+        int total = _count + newCount;
+        GrowFlatTo(ref _scratchData, total * KeySize);
+        GrowTo(ref _scratchHashes, total);
+
+        int i = 0, j = 0, k = 0;
+        while (i < _count && j < newCount)
+        {
+            if (KeyAt(_data, i).SequenceCompareTo(KeyAt(keys, j)) <= 0)
+            {
+                CopyKey(_data, i, _scratchData, k);
+                _scratchHashes[k++] = _hashes[i++];
+            }
+            else
+            {
+                CopyKey(keys, j, _scratchData, k);
+                _scratchHashes[k++] = hashes[j++];
+            }
+        }
+        while (i < _count) { CopyKey(_data, i, _scratchData, k); _scratchHashes[k++] = _hashes[i++]; }
+        while (j < newCount) { CopyKey(keys, j, _scratchData, k); _scratchHashes[k++] = hashes[j++]; }
+
+        (_data, _scratchData) = (_scratchData, _data);
+        (_hashes, _scratchHashes) = (_scratchHashes, _hashes);
+        _count = total;
+        _prefixSumsDirty = true;
+    }
+
+    /// <summary>Overload for callers with jagged byte[][] keys.</summary>
+    public void MergeSorted(byte[][] keys, Setsum[] hashes, int newCount)
+    {
+        var flat = new byte[newCount * KeySize];
+        for (int i = 0; i < newCount; i++) keys[i].CopyTo(flat, i * KeySize);
+        MergeSorted(flat, hashes, newCount);
+    }
+
+    public (Setsum Hash, int Count) RangeInfo(byte[] lo, byte[] hi)
+    {
+        EnsureSorted(); EnsurePrefixSums();
+        int start = LowerBound(lo), end = UpperBound(hi), count = end - start;
+        return count <= 0 ? (new Setsum(), 0) : (_prefixSums[end] - _prefixSums[start], count);
+    }
+
+    public (Setsum Hash, int Count) TotalInfo()
+    {
+        EnsureSorted(); EnsurePrefixSums();
+        return (_prefixSums[_count], _count);
+    }
+
+    public (Setsum Hash0, int Count0, Setsum Hash1, int Count1)
+        RangeInfoSplit(byte[] lo, byte[] hi, int depth)
+    {
+        EnsureSorted(); EnsurePrefixSums();
+        int start = LowerBound(lo), end = UpperBound(hi);
+        if (start >= end) return (new Setsum(), 0, new Setsum(), 0);
+        int split = FindSplitPoint(start, end, depth);
+        int c0 = split - start, c1 = end - split;
+        return (c0 > 0 ? _prefixSums[split] - _prefixSums[start] : new Setsum(), c0,
+                c1 > 0 ? _prefixSums[end] - _prefixSums[split] : new Setsum(), c1);
+    }
+
+    public IEnumerable<byte[]> Range(byte[] lo, byte[] hi)
+    {
+        EnsureSorted();
+        int start = LowerBound(lo), end = UpperBound(hi);
+        for (int i = start; i < end; i++) yield return KeyAt(_data, i).ToArray();
+    }
+
+    public IEnumerable<byte[]> All()
+    {
+        EnsureSorted();
+        for (int i = 0; i < _count; i++) yield return KeyAt(_data, i).ToArray();
+    }
+
+    public void CollectMissing(byte[] lo, byte[] hi, SortedKeyStore other, List<byte[]> result)
+    {
+        EnsureSorted(); other.EnsureSorted();
+        int si = LowerBound(lo), sEnd = UpperBound(hi);
+        int li = other.LowerBound(lo), lEnd = other.UpperBound(hi);
+        while (si < sEnd)
+        {
+            var sKey = KeyAt(_data, si);
+            while (li < lEnd && KeyAt(other._data, li).SequenceCompareTo(sKey) < 0) li++;
+            if (li < lEnd && KeyAt(other._data, li).SequenceCompareTo(sKey) == 0) { si++; continue; }
+            result.Add(sKey.ToArray());
+            si++;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Private — sort and merge
+    // -------------------------------------------------------------------------
+
     private void EnsureSorted()
     {
-        if (_pendingKeys.Count == 0) return;
+        if (_pendingCount == 0) return;
 
-        var pKeys = _pendingKeys.ToArray();
-        var pHashes = _pendingHashes.ToArray();
-        Array.Sort(pKeys, pHashes, ByteComparer.Instance);
+        int n = _pendingCount;
+        _pendingCount = 0;
 
-        _pendingKeys.Clear();
-        _pendingHashes.Clear();
+        // Two-pass LSB radix sort. Each pass moves actual key+hash data (not indices)
+        // sequentially into a scratch buffer — no random-access gather step.
+        //
+        // Pass 1: scatter by key byte 1 → _scratchData/_scratchHashes
+        // Pass 2: scatter by key byte 0 → _pending/_pendingHashes  (reused as second scratch)
+        // Result lands back in _pending/_pendingHashes, sorted by bytes 0–1.
+        GrowFlatTo(ref _scratchData, n * KeySize);
+        GrowTo(ref _scratchHashes, n);
 
-        MergeSorted(pKeys, pHashes, pKeys.Length);
+        RadixPassData(_pending, _pendingHashes, n, byteIndex: 1, _scratchData, _scratchHashes);
+        RadixPassData(_scratchData, _scratchHashes, n, byteIndex: 0, _pending, _pendingHashes);
+
+        // Finish: insertion sort within same-prefix buckets (~15 items, all in L1).
+        FinishSort(_pending, _pendingHashes, n);
+
+        // Merge sorted pending into main store.
+        MergeSorted(_pending, _pendingHashes, n);
     }
+
+    /// <summary>
+    /// Radix pass that moves key+hash records directly.
+    /// Counts src keys by key[byteIndex], then scatters complete (key, hash) pairs
+    /// into dst. One sequential read of src, one sequential write to dst — no random access.
+    /// </summary>
+    private void RadixPassData(byte[] srcKeys, Setsum[] srcHashes, int n, int byteIndex,
+                                byte[] dstKeys, Setsum[] dstHashes)
+    {
+        Array.Clear(_counts, 0, 256);
+        for (int i = 0; i < n; i++)
+            _counts[srcKeys[i * KeySize + byteIndex]]++;
+
+        _offsets[0] = 0;
+        for (int b = 1; b < 256; b++)
+            _offsets[b] = _offsets[b - 1] + _counts[b - 1];
+
+        for (int i = 0; i < n; i++)
+        {
+            byte b = srcKeys[i * KeySize + byteIndex];
+            int dst = _offsets[b]++;
+            CopyKey(srcKeys, i, dstKeys, dst);
+            dstHashes[dst] = srcHashes[i];
+        }
+    }
+
+    /// <summary>
+    /// Insertion sort within buckets of keys sharing the same first two bytes.
+    /// After two radix passes each bucket is ~15 items — small enough for L1.
+    /// </summary>
+    private static void FinishSort(byte[] keys, Setsum[] hashes, int n)
+    {
+        // Allocate the temp buffer once outside all loops — stackalloc inside a loop
+        // consumes stack on every iteration and will overflow for large N.
+        Span<byte> tmp = stackalloc byte[KeySize];
+
+        int start = 0;
+        while (start < n)
+        {
+            byte b0 = keys[start * KeySize], b1 = keys[start * KeySize + 1];
+            int end = start + 1;
+            while (end < n && keys[end * KeySize] == b0 && keys[end * KeySize + 1] == b1)
+                end++;
+
+            // Insertion sort [start, end) by bytes 2..31
+            for (int i = start + 1; i < end; i++)
+            {
+                keys.AsSpan(i * KeySize, KeySize).CopyTo(tmp);
+                Setsum hashI = hashes[i];
+
+                int j = i - 1;
+                while (j >= start && keys.AsSpan(j * KeySize, KeySize).SequenceCompareTo(tmp) > 0)
+                {
+                    CopyKey(keys, j, keys, j + 1);
+                    hashes[j + 1] = hashes[j];
+                    j--;
+                }
+                tmp.CopyTo(keys.AsSpan((j + 1) * KeySize));
+                hashes[j + 1] = hashI;
+            }
+
+            start = end;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Private — queries
+    // -------------------------------------------------------------------------
 
     private void EnsurePrefixSums()
     {
         if (!_prefixSumsDirty) return;
-        if (_prefixSums.Length < _count + 1)
-            _prefixSums = new Setsum[_count + 1];
+        if (_prefixSums.Length < _count + 1) _prefixSums = new Setsum[_count + 1];
         _prefixSums[0] = new Setsum();
-        for (int i = 0; i < _count; i++)
-            _prefixSums[i + 1] = _prefixSums[i] + _hashes[i];
+        for (int i = 0; i < _count; i++) _prefixSums[i + 1] = _prefixSums[i] + _hashes[i];
         _prefixSumsDirty = false;
     }
 
     private int BinarySearch(byte[] key)
     {
+        var t = (ReadOnlySpan<byte>)key;
         int lo = 0, hi = _count - 1;
         while (lo <= hi)
         {
             int mid = (lo + hi) >> 1;
-            int cmp = ((ReadOnlySpan<byte>)_keys[mid]).SequenceCompareTo(key);
+            int cmp = KeyAt(_data, mid).SequenceCompareTo(t);
             if (cmp == 0) return mid;
             if (cmp < 0) lo = mid + 1; else hi = mid - 1;
         }
         return ~lo;
     }
 
-    private int LowerBound(byte[] target)
+    private int LowerBound(byte[] t) => LowerBound((ReadOnlySpan<byte>)t, 0, _count);
+    private int LowerBound(byte[] t, int lo, int hi) => LowerBound((ReadOnlySpan<byte>)t, lo, hi);
+    private int LowerBound(ReadOnlySpan<byte> t, int lo, int hi)
     {
-        int lo = 0, hi = _count;
-        while (lo < hi)
-        {
-            int mid = (lo + hi) >> 1;
-            if (((ReadOnlySpan<byte>)_keys[mid]).SequenceCompareTo(target) < 0) lo = mid + 1;
-            else hi = mid;
-        }
+        while (lo < hi) { int mid = (lo + hi) >> 1; if (KeyAt(_data, mid).SequenceCompareTo(t) < 0) lo = mid + 1; else hi = mid; }
         return lo;
     }
 
-    private int LowerBound(byte[] target, int rangeStart, int rangeEnd)
+    private int UpperBound(byte[] t)
     {
-        int lo = rangeStart, hi = rangeEnd;
-        while (lo < hi)
-        {
-            int mid = (lo + hi) >> 1;
-            if (((ReadOnlySpan<byte>)_keys[mid]).SequenceCompareTo(target) < 0) lo = mid + 1;
-            else hi = mid;
-        }
+        var s = (ReadOnlySpan<byte>)t; int lo = 0, hi = _count;
+        while (lo < hi) { int mid = (lo + hi) >> 1; if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0) lo = mid + 1; else hi = mid; }
         return lo;
     }
 
-    private int UpperBound(byte[] target)
+    private int FindSplitPoint(int start, int end, int depth)
     {
-        int lo = 0, hi = _count;
-        while (lo < hi)
+        Span<byte> splitKey = stackalloc byte[KeySize];
+        int fullBytes = depth / 8, rem = depth % 8;
+        if (start < _count && fullBytes > 0) KeyAt(_data, start).Slice(0, fullBytes).CopyTo(splitKey);
+        if (rem == 0) splitKey[fullBytes] = 0x80;
+        else
         {
-            int mid = (lo + hi) >> 1;
-            if (((ReadOnlySpan<byte>)_keys[mid]).SequenceCompareTo(target) <= 0) lo = mid + 1;
-            else hi = mid;
+            int bit = 7 - rem;
+            byte mask = (byte)(0xFF << (bit + 1));
+            splitKey[fullBytes] = (byte)(((start < _count ? KeyAt(_data, start)[fullBytes] : 0) & mask) | (1 << bit));
         }
-        return lo;
+        return LowerBound(splitKey.ToArray(), start, end);
+    }
+
+    // -------------------------------------------------------------------------
+    // Inline helpers
+    // -------------------------------------------------------------------------
+
+    private static ReadOnlySpan<byte> KeyAt(byte[] buf, int i) => buf.AsSpan(i * KeySize, KeySize);
+    private static void CopyKey(byte[] src, int si, byte[] dst, int di)
+        => src.AsSpan(si * KeySize, KeySize).CopyTo(dst.AsSpan(di * KeySize));
+
+    private static void GrowFlat(ref byte[] buf, int count)
+    {
+        var next = new byte[Math.Max(count * KeySize * 2, buf.Length * 2)];
+        buf.AsSpan().CopyTo(next); buf = next;
+    }
+    private static void GrowFlatTo(ref byte[] buf, int needed)
+    {
+        if (buf.Length >= needed) return;
+        buf = new byte[Math.Max(needed, buf.Length * 2)];
+    }
+    private static void Grow<T>(ref T[] arr, int count)
+    {
+        var next = new T[Math.Max(count * 2, arr.Length * 2)];
+        arr.AsSpan().CopyTo(next); arr = next;
+    }
+    private static void GrowTo<T>(ref T[] arr, int needed)
+    {
+        if (arr.Length >= needed) return;
+        arr = new T[Math.Max(needed, arr.Length * 2)];
     }
 }
