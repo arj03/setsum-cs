@@ -44,8 +44,8 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(3, sim.ItemsTransferred);
 
-        Assert.Equal(server.Count, client.Count);
-        Assert.Equal(server.Sum, client.Sum);
+        Assert.Equal(server.Count(), client.Count());
+        Assert.Equal(server.Sum(), client.Sum());
 
         _output.WriteLine($"Small Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Transferred: {sim.ItemsTransferred}");
     }
@@ -77,8 +77,8 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(8, sim.ItemsTransferred);
 
-        Assert.Equal(server.Count, client.Count);
-        Assert.Equal(server.Sum, client.Sum);
+        Assert.Equal(server.Count(), client.Count());
+        Assert.Equal(server.Sum(), client.Sum());
 
         _output.WriteLine($"Medium Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Transferred: {sim.ItemsTransferred}");
         Assert.True(sw.ElapsedMilliseconds < 100);
@@ -105,7 +105,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         // Use a simulator that stops after the fast-path check so we can time just that.
         // (TrySync will go on to Merkle; we want to time TryReconcile directly.)
         var sw = Stopwatch.StartNew();
-        var result = server.TryReconcile(client.Sum, client.Count);
+        var result = server.TryReconcile(client.Sum(), client.Count());
         sw.Stop();
 
         Assert.True(result.NeedsFallback, "Large diff should immediately signal Fallback");
@@ -158,8 +158,8 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         Assert.True(success);
         Assert.Equal(4, sim.RoundTrips);
 
-        Assert.Equal(server.Count, client.Count);
-        Assert.Equal(server.Sum, client.Sum);
+        Assert.Equal(server.Count(), client.Count());
+        Assert.Equal(server.Sum(), client.Sum());
     }
 
     [Fact]
@@ -195,8 +195,8 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         Assert.True(success, "Merkle sync should succeed");
         Assert.True(sim.UsedFallback, "Should have used Merkle fallback");
 
-        Assert.Equal(server.Count, client.Count);
-        Assert.Equal(server.Sum, client.Sum);
+        Assert.Equal(server.Count(), client.Count());
+        Assert.Equal(server.Sum(), client.Sum());
 
         Assert.Equal(newItems, sim.ItemsTransferred);
 
@@ -217,8 +217,8 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         bool success = sim.TrySync(_output);
 
         Assert.True(success);
-        Assert.Equal(server.Count, client.Count);
-        Assert.Equal(server.Sum, client.Sum);
+        Assert.Equal(server.Count(), client.Count());
+        Assert.Equal(server.Sum(), client.Sum());
         Assert.Equal(items, sim.ItemsTransferred);
 
         // Trips: 1 (fast-path check) + 1 (root hash check → short-circuit) + 1 (batch fetch) = 3.

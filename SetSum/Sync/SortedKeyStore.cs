@@ -48,7 +48,11 @@ public class SortedKeyStore
     private readonly int[] _counts = new int[256];
     private readonly int[] _offsets = new int[256];
 
-    public int Count { get { EnsureSorted(); return _count; } }
+    public int Count() 
+    { 
+        EnsureSorted(); 
+        return _count; 
+    }
 
     /// <summary>
     /// The Setsum over all items in the store — equivalent to the old
@@ -58,7 +62,11 @@ public class SortedKeyStore
     /// Calling this triggers EnsureSorted() + EnsurePrefixSums() if dirty, which
     /// is correct: we want the true total after any pending inserts are merged.
     /// </summary>
-    public Setsum TotalHash { get { EnsureSorted(); EnsurePrefixSums(); return _prefixSums[_count]; } }
+    public Setsum TotalHash() 
+    {
+        Prepare();
+        return _prefixSums[_count]; 
+    }
 
     // -------------------------------------------------------------------------
     // Public API
@@ -144,8 +152,7 @@ public class SortedKeyStore
         return (_prefixSums[_count], _count);
     }
 
-    public (Setsum Hash0, int Count0, Setsum Hash1, int Count1)
-        RangeInfoSplit(byte[] lo, byte[] hi, int depth)
+    public (Setsum Hash0, int Count0, Setsum Hash1, int Count1) RangeInfoSplit(byte[] lo, byte[] hi, int depth)
     {
         EnsureSorted(); EnsurePrefixSums();
         int start = LowerBound(lo), end = UpperBound(hi);
@@ -285,9 +292,14 @@ public class SortedKeyStore
     private void EnsurePrefixSums()
     {
         if (!_prefixSumsDirty) return;
-        if (_prefixSums.Length < _count + 1) _prefixSums = new Setsum[_count + 1];
+        
+        if (_prefixSums.Length < _count + 1) 
+            _prefixSums = new Setsum[_count + 1];
         _prefixSums[0] = new Setsum();
-        for (int i = 0; i < _count; i++) _prefixSums[i + 1] = _prefixSums[i] + _hashes[i];
+        
+        for (int i = 0; i < _count; i++) 
+            _prefixSums[i + 1] = _prefixSums[i] + _hashes[i];
+        
         _prefixSumsDirty = false;
     }
 
@@ -299,8 +311,13 @@ public class SortedKeyStore
         {
             int mid = (lo + hi) >> 1;
             int cmp = KeyAt(_data, mid).SequenceCompareTo(t);
-            if (cmp == 0) return mid;
-            if (cmp < 0) lo = mid + 1; else hi = mid - 1;
+            
+            if (cmp == 0) 
+                return mid;
+            else if (cmp < 0) 
+                lo = mid + 1; 
+            else 
+                hi = mid - 1;
         }
         return ~lo;
     }
@@ -309,14 +326,24 @@ public class SortedKeyStore
     private int LowerBound(byte[] t, int lo, int hi) => LowerBound((ReadOnlySpan<byte>)t, lo, hi);
     private int LowerBound(ReadOnlySpan<byte> t, int lo, int hi)
     {
-        while (lo < hi) { int mid = (lo + hi) >> 1; if (KeyAt(_data, mid).SequenceCompareTo(t) < 0) lo = mid + 1; else hi = mid; }
+        while (lo < hi) { 
+            int mid = (lo + hi) >> 1; 
+            if (KeyAt(_data, mid).SequenceCompareTo(t) < 0) 
+                lo = mid + 1; 
+            else hi = mid; 
+        }
         return lo;
     }
 
     private int UpperBound(byte[] t)
     {
         var s = (ReadOnlySpan<byte>)t; int lo = 0, hi = _count;
-        while (lo < hi) { int mid = (lo + hi) >> 1; if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0) lo = mid + 1; else hi = mid; }
+        while (lo < hi) { 
+            int mid = (lo + hi) >> 1; 
+            if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0) 
+                lo = mid + 1; 
+            else hi = mid; 
+        }
         return lo;
     }
 
@@ -324,14 +351,20 @@ public class SortedKeyStore
     {
         Span<byte> splitKey = stackalloc byte[KeySize];
         int fullBytes = depth / 8, rem = depth % 8;
-        if (start < _count && fullBytes > 0) KeyAt(_data, start).Slice(0, fullBytes).CopyTo(splitKey);
-        if (rem == 0) splitKey[fullBytes] = 0x80;
+        if (start < _count && fullBytes > 0) 
+            KeyAt(_data, start).Slice(0, fullBytes).CopyTo(splitKey);
+
+        if (rem == 0)
+        {
+            splitKey[fullBytes] = 0x80;
+        }
         else
         {
             int bit = 7 - rem;
             byte mask = (byte)(0xFF << (bit + 1));
             splitKey[fullBytes] = (byte)(((start < _count ? KeyAt(_data, start)[fullBytes] : 0) & mask) | (1 << bit));
         }
+
         return LowerBound(splitKey.ToArray(), start, end);
     }
 
@@ -348,16 +381,19 @@ public class SortedKeyStore
         var next = new byte[Math.Max(count * KeySize * 2, buf.Length * 2)];
         buf.AsSpan().CopyTo(next); buf = next;
     }
+
     private static void GrowFlatTo(ref byte[] buf, int needed)
     {
         if (buf.Length >= needed) return;
         buf = new byte[Math.Max(needed, buf.Length * 2)];
     }
+
     private static void Grow<T>(ref T[] arr, int count)
     {
         var next = new T[Math.Max(count * 2, arr.Length * 2)];
         arr.AsSpan().CopyTo(next); arr = next;
     }
+
     private static void GrowTo<T>(ref T[] arr, int needed)
     {
         if (arr.Length >= needed) return;

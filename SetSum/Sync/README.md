@@ -41,9 +41,9 @@ sequenceDiagram
 
     C->>S: (Sum, Count)
     Note over S: diff = ServerSum - ClientSum<br/>missingCount = ServerCount - ClientCount
-    Note over S: Try to peel: find items whose<br/>hashes sum to diff
     alt Identical (diff == 0)
         S-->>C: Identical ✓
+    Note over S: Try to peel: find items whose<br/>hashes sum to diff
     else Found (diff peeled successfully)
         S-->>C: [missing items]
         C->>C: Insert missing items
@@ -83,12 +83,12 @@ sequenceDiagram
 
 ### Path 3: Merkle Fallback
 
-A binary-prefix trie traversal. Keys are compared bit-by-bit from the MSB. Each tree node covers all keys sharing a common bit-prefix. The client and server exchange hash+count information for subtrees, recursing only into subtrees that differ.
+A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each tree node covers all keys sharing a common bit-prefix. The client and server exchange hash+count information for subtrees, recursing only into subtrees that differ.
 
 ```mermaid
 flowchart TD
-    A["Root\n(all keys)"] --> B["Prefix 0\n(keys starting with 0)"]
-    A --> C["Prefix 1\n(keys starting with 1)"]
+    A["Root (all keys)"] --> B["Prefix 0"]
+    A --> C["Prefix 1"]
     B --> D["Prefix 00"]
     B --> E["Prefix 01"]
     C --> F["Prefix 10"]
@@ -99,7 +99,7 @@ flowchart TD
     G --> K["..."]
 ```
 
-The traversal uses a BFS queue. For each node the server provides `(Hash, Count)` for both children in a single call. Two optimisations short-circuit expensive subtrees:
+The traversal uses a breadth-first search (BFS) queue. For each node the server provides `(Hash, Count)` for both children in a single call. Two optimisations short-circuit expensive subtrees:
 
 - **Count-aware short-circuit**: if the client count is 0 and the server count is N, skip the hash check and go straight to fetching items.
 - **Leaf threshold**: if `serverCount - clientCount ≤ 16`, treat the node as a leaf and schedule a direct item transfer rather than recursing further.
@@ -134,15 +134,15 @@ sequenceDiagram
 
 ## Storage: `SortedKeyStore`
 
-Keys are stored in a flat `byte[]` array sorted by lexicographic key order. A parallel `Setsum[]` array holds the corresponding hash for each key, enabling O(1) range-hash queries via prefix sums.
+Keys are stored in a flat `byte[]` array sorted by lexicographic key order. A `Setsum[]` array holds the corresponding hash for each key, enabling O(1) range-hash queries via prefix sums.
 
 ```mermaid
 graph LR
     subgraph SortedKeyStore
         direction TB
-        D["_data\n[ key0 | key1 | key2 | ... | keyN ]\n(flat byte array, sorted)"]
-        H["_hashes\n[ h0 | h1 | h2 | ... | hN ]"]
-        P["_prefixSums\n[ 0 | h0 | h0+h1 | ... | Σhashes ]"]
+        D["_data [ key0 | key1 | ... | keyN ] (flat byte array, sorted)"]
+        H["_hashes [ h0 | h1 | h2 | ... | hN ]"]
+        P["_prefixSums [ 0 | h0 | h0+h1 | ... | Σhashes ]"]
     end
 
     D -- "index i" --> H
@@ -154,63 +154,6 @@ graph LR
 **Pending buffer**: New insertions go into an unsorted `_pending` buffer. It is radix-sorted and merged into the main store lazily on the next query — avoiding repeated O(N log N) sorts during bulk inserts.
 
 **Radix sort**: Two-pass LSB radix sort on key bytes 0–1, followed by insertion sort within same-prefix buckets (~15 items each, all in L1 cache). This achieves O(N) sort with sequential memory access.
-
----
-
-## `BitPrefix`
-
-`BitPrefix` is a `readonly struct` representing a path through the Merkle trie — a sequence of up to 64 bits (the first 8 bytes of a key), stored MSB-first in a `ulong`.
-
-```mermaid
-graph LR
-    R["Root (0 bits)"]
-    R -->|"Extend(0)"| A["0 (1 bit)"]
-    R -->|"Extend(1)"| B["1 (1 bit)"]
-    A -->|"Extend(0)"| C["00 (2 bits)"]
-    A -->|"Extend(1)"| D["01 (2 bits)"]
-    B -->|"Extend(0)"| E["10 (2 bits)"]
-    B -->|"Extend(1)"| F["11 (2 bits)"]
-```
-
-`KeyRange()` converts a prefix into an inclusive `[lo, hi]` byte-array range:
-- `lo` = prefix bits followed by all `0` bits
-- `hi` = prefix bits followed by all `1` bits
-
-This range is used directly with `SortedKeyStore`'s binary search methods.
-
----
-
-## Full Sync Flow
-
-```mermaid
-flowchart TD
-    Start([Start Sync]) --> RT1
-
-    RT1["Round trip 1\nClient sends Sum + Count to Server"]
-    RT1 --> R1{Server result?}
-
-    R1 -->|Identical| Done([✓ Already in sync])
-    R1 -->|Found| Apply["Client inserts missing items"]
-    Apply --> Done
-
-    R1 -->|Fallback| Push["Client tries reverse peel\n(is client ahead?)"]
-    Push --> R2{Local peel result?}
-
-    R2 -->|Found| PushItems["Client pushes items to server"]
-    PushItems --> Done
-
-    R2 -->|Fallback| Merkle["Merkle BFS traversal"]
-
-    Merkle --> BFS["BFS: exchange child Hash + Count\nfor each differing subtree"]
-    BFS --> Leaf{Subtree diff\n≤ 16 items or\nclient count == 0?}
-    Leaf -->|Yes| Collect["Add prefix to fetch list"]
-    Leaf -->|No| BFS
-    Collect --> MoreBFS{More nodes\nin queue?}
-    MoreBFS -->|Yes| BFS
-    MoreBFS -->|No| Batch["Batch-fetch all leaf prefixes"]
-    Batch --> Insert["Sort + InsertBulkPresorted"]
-    Insert --> Done
-```
 
 ---
 
@@ -238,39 +181,17 @@ graph TD
     end
 
     subgraph "Fast path (ReconcilableSet)"
-        GS["Sum = h_0 + h_1 + ... + h_N\n= prefixSums[N]"]
+        GS["Sum = h_0 + h_1 + ... + h_N = prefixSums[N]"]
     end
 
     subgraph "Merkle node hash"
-        MN["RangeHash(start, end)\n= prefixSums[end] - prefixSums[start]"]
+        MN["RangeHash(start, end) = prefixSums[end] - prefixSums[start]"]
     end
 
     HK --> PS
     PS -->|"prefixSums[N]"| GS
     PS -->|"subtraction"| MN
 ```
-
-### Single source of truth: `_prefixSums[_count]`
-
-`ReconcilableSet.Sum` is not a stored field — it is a computed property that reads directly from the store:
-
-```csharp
-public Setsum Sum => _store.TotalInfo().Hash;  // == _prefixSums[_count]
-```
-
-There is no separate running accumulator. `Insert` and `InsertSortedArray` no longer do `Sum += h_k`; they only place `h_k` into `_store` and `_historyHashes`. The prefix sum table is the single authoritative source for both the global Setsum (fast-path peeling) and every Merkle subtree hash. This eliminates the dual update paths that previously had to be kept in sync and removes the window in which the two values could temporarily diverge between an insert and the next `EnsurePrefixSums()` call.
-
-### The history buffer uses the same hashes too
-
-The circular history buffer in `ReconcilableSet` stores both `_historyKeys` and `_historyHashes`. The `_historyHashes[i]` values are exactly the same `Setsum.Hash(key)` values that end up in `SortedKeyStore._hashes`. They are computed once in `Insert` and then copied into both places:
-
-```csharp
-var itemHash = Setsum.Hash(itemKey);   // computed once
-_historyHashes[_head] = itemHash;       // → history buffer for peeling
-_store.Add(itemKey, itemHash);          // → SortedKeyStore._hashes[i]
-```
-
-So the hash is shared at the value level (computed once, stored in two places), but there is no structural sharing — the history buffer and the sorted store both hold their own copy of each `h_k`.
 
 ### What this means for the Merkle tree conceptually
 
@@ -280,7 +201,7 @@ Because Setsum is additive and invertible, the full Merkle trie is implicitly en
 graph LR
     subgraph "Traditional Merkle tree"
         direction TB
-        R2["Root hash\nh(h01, h23)"]
+        R2["Root hash h(h01, h23)"]
         N01["h(h0, h1)"]
         N23["h(h2, h3)"]
         L0["h0"] 
@@ -297,34 +218,13 @@ graph LR
 
     subgraph "This implementation"
         direction TB
-        PA["prefixSums array\n[0, h0, h0+h1, h0+h1+h2, h0+h1+h2+h3]"]
-        Q1["Any node hash = prefixSums[end] - prefixSums[start]\nO(log N) with binary search"]
+        PA["prefixSums array [0, h0, h0+h1, h0+h1+h2, h0+h1+h2+h3]"]
+        Q1["Any node hash = prefixSums[end] - prefixSums[start] O(log N) with binary search"]
         PA --> Q1
     end
 ```
 
 A traditional Merkle tree must store every internal node hash explicitly (O(N) space for a balanced tree, O(N log N) for a naive implementation). This design stores only the leaf hashes and their prefix sums — the same O(N) space — while computing any internal node hash on demand. The trade-off is that verifying a single leaf requires two binary searches rather than a direct pointer walk, but for the sync use-case (where you always query ranges, not individual leaves) this is strictly better.
-
-### Summary of hash relationships
-
-```mermaid
-graph TD
-    Key["key_k (32-byte value)"]
-    HK["h_k = Setsum.Hash(key_k)\n(computed once on insert)"]
-
-    Key --> HK
-
-    HK -->|"stored at index i"| Store["SortedKeyStore._hashes[i]"]
-    HK -->|"stored at index head"| Hist["_historyHashes[head]\n(for peeling backtrack)"]
-
-    Store -->|"prefix sum rebuild"| PS["_prefixSums[0..N]"]
-    PS -->|"_prefixSums[N]\n(computed property)"| GS["ReconcilableSet.Sum\n(global fast-path hash)"]
-    PS -->|"range subtraction"| MH["Any Merkle node hash\nin O(log N)"]
-```
-
-`ReconcilableSet.Sum` is now a thin computed property over `_prefixSums[N]` — the single authoritative source for both uses. The history buffer remains a necessary separate copy because it needs recency-ordered random access, which the key-sorted store cannot provide.
-
----
 
 ## Complexity Summary
 

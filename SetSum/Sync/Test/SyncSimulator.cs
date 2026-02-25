@@ -46,7 +46,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         // Client sends its (Sum, Count) to the server.
         // Server tries to figure out what the client is missing and returns those items.
         RoundTrips++;
-        var remoteResult = _remote.TryReconcile(_local.Sum, _local.Count);
+        var remoteResult = _remote.TryReconcile(_local.Sum(), _local.Count());
 
         _output.WriteLine($"result of first reconcile: {remoteResult.Outcome}");
 
@@ -74,7 +74,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
         // ── Push path: check if the client is the one that's ahead ───────────
         // Server returned Fallback. Maybe *we* have items the server is missing.
-        var localResult = _local.TryReconcile(_remote.Sum, _remote.Count);
+        var localResult = _local.TryReconcile(_remote.Sum(), _remote.Count());
         _output.WriteLine($"result of local reconcile: {localResult.Outcome}");
         if (localResult.Outcome == ReconcileOutcome.Found)
         {

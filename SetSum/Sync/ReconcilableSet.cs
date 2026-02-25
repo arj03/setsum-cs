@@ -44,9 +44,9 @@ public class ReconcilableSet
     /// than maintained as a separate accumulator — the two are always equal, so we
     /// keep only the single authoritative source inside SortedKeyStore.
     /// </summary>
-    public Setsum Sum => _store.TotalInfo().Hash;
+    public Setsum Sum() => _store.TotalInfo().Hash;
 
-    public long Count => _store.Count;
+    public long Count() => _store.Count();
 
     // Circular buffer of recent insertions for fast-path peeling.
     // Stores (key, hash) pairs so the peeling backtracker can verify candidates
@@ -190,10 +190,10 @@ public class ReconcilableSet
     public ReconcileResult TryReconcile(Setsum remoteSum, long remoteCount)
     {
         // Sum property calls _store.TotalInfo() — single source of truth.
-        var localSum = Sum;
+        var localSum = Sum();
         if (localSum == remoteSum) return ReconcileResult.Identical();
 
-        long countDiff = Count - remoteCount;
+        long countDiff = Count() - remoteCount;
         if (countDiff < 0) return ReconcileResult.Fallback(); // remote is ahead
 
         int missingCount = (int)countDiff;
