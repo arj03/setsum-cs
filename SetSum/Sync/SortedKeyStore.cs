@@ -11,6 +11,16 @@
 /// permutation in _scratch (int[]) that is applied in one gather pass to both arrays.
 /// This gives O(N) sort with sequential memory access during the counting passes —
 /// the dominant cost over Array.Sort's O(N log N) with random cache misses.
+///
+/// PREFIX SUM = GLOBAL SETSUM
+/// --------------------------
+/// _prefixSums[i] = h_0 + h_1 + ... + h_(i-1)  (Setsum addition)
+/// _prefixSums[Count] is therefore the sum of ALL item hashes — identical to what
+/// ReconcilableSet previously maintained as a separate `Sum` field. There is only
+/// one authoritative copy of the global Setsum: _prefixSums[Count], exposed via
+/// TotalInfo().Hash (or the zero-allocation TotalHash property).
+/// ReconcilableSet.Sum is now a thin property that reads from here, eliminating
+/// the dual update paths that previously had to be kept in sync.
 /// </summary>
 public class SortedKeyStore
 {
@@ -22,6 +32,7 @@ public class SortedKeyStore
     private int _count;
 
     // Prefix sums: _prefixSums[i] = sum of _hashes[0..i-1]
+    // _prefixSums[_count] IS the global Setsum over all items in this store.
     private Setsum[] _prefixSums = new Setsum[17];
     private bool _prefixSumsDirty = true;
 
@@ -38,6 +49,16 @@ public class SortedKeyStore
     private readonly int[] _offsets = new int[256];
 
     public int Count { get { EnsureSorted(); return _count; } }
+
+    /// <summary>
+    /// The Setsum over all items in the store — equivalent to the old
+    /// ReconcilableSet.Sum accumulator but derived from the single authoritative
+    /// prefix sum table rather than maintained as a separate field.
+    ///
+    /// Calling this triggers EnsureSorted() + EnsurePrefixSums() if dirty, which
+    /// is correct: we want the true total after any pending inserts are merged.
+    /// </summary>
+    public Setsum TotalHash { get { EnsureSorted(); EnsurePrefixSums(); return _prefixSums[_count]; } }
 
     // -------------------------------------------------------------------------
     // Public API
@@ -112,6 +133,11 @@ public class SortedKeyStore
         return count <= 0 ? (new Setsum(), 0) : (_prefixSums[end] - _prefixSums[start], count);
     }
 
+    /// <summary>
+    /// Returns the hash and count for the entire store.
+    /// Hash == _prefixSums[_count] == the global Setsum over all items.
+    /// This is the single source of truth consumed by ReconcilableSet.Sum.
+    /// </summary>
     public (Setsum Hash, int Count) TotalInfo()
     {
         EnsureSorted(); EnsurePrefixSums();

@@ -19,6 +19,18 @@ public class ByteComparer : IComparer<byte[]>
 /// A set of fixed-size (32-byte) keys supporting:
 ///   - Fast-path reconciliation via Setsum peeling for small diffs
 ///   - Merkle trie sync for large diffs, using SortedKeyStore for O(log N) prefix queries
+///
+/// The global Setsum (used for fast-path peeling) is no longer maintained as a
+/// separate running accumulator. Instead it is derived directly from
+/// SortedKeyStore._prefixSums[Count], which already holds the identical value.
+/// This eliminates a redundant field and the dual update paths that could diverge.
+///
+/// The per-item hash h_k = Setsum.Hash(key) is computed once on insertion and
+/// flows into three consumers:
+///   1. SortedKeyStore._hashes[i]       — sorted store, source of prefix sums
+///   2. _historyHashes[head]             — circular buffer for fast-path peeling
+///
+/// The global Sum is now consumer #1's output: _store.TotalInfo().Hash.
 /// </summary>
 public class ReconcilableSet
 {
@@ -27,10 +39,19 @@ public class ReconcilableSet
     private const int MaxDiffForRecentScan = 10;
     private const int RecentScanLimit = 20;
 
-    public Setsum Sum { get; private set; } = new();
+    /// <summary>
+    /// The global Setsum over all items. Derived from the prefix sum table rather
+    /// than maintained as a separate accumulator — the two are always equal, so we
+    /// keep only the single authoritative source inside SortedKeyStore.
+    /// </summary>
+    public Setsum Sum => _store.TotalInfo().Hash;
+
     public long Count => _store.Count;
 
-    // Circular buffer of recent insertions for fast-path peeling
+    // Circular buffer of recent insertions for fast-path peeling.
+    // Stores (key, hash) pairs so the peeling backtracker can verify candidates
+    // without re-hashing. The hash values here are the same h_k that live in
+    // SortedKeyStore._hashes — computed once in Insert, copied to both places.
     private readonly byte[][] _historyKeys;
     private readonly Setsum[] _historyHashes;
     private int _head = 0;
@@ -55,7 +76,6 @@ public class ReconcilableSet
             throw new ArgumentException($"Item key must be {Setsum.DigestSize} bytes.");
 
         var itemHash = Setsum.Hash(itemKey);
-        Sum += itemHash;
 
         _historyKeys[_head] = itemKey;
         _historyHashes[_head] = itemHash;
@@ -162,10 +182,16 @@ public class ReconcilableSet
     /// <summary>
     /// Called by the server: given the client's (Sum, Count), return what it's missing.
     /// Uses Setsum peeling — works for small diffs only, otherwise returns Fallback.
+    ///
+    /// Reading Sum here triggers EnsureSorted + EnsurePrefixSums inside the store,
+    /// which is correct: we want the authoritative total after any pending inserts
+    /// have been merged.
     /// </summary>
     public ReconcileResult TryReconcile(Setsum remoteSum, long remoteCount)
     {
-        if (Sum == remoteSum) return ReconcileResult.Identical();
+        // Sum property calls _store.TotalInfo() — single source of truth.
+        var localSum = Sum;
+        if (localSum == remoteSum) return ReconcileResult.Identical();
 
         long countDiff = Count - remoteCount;
         if (countDiff < 0) return ReconcileResult.Fallback(); // remote is ahead
@@ -174,7 +200,7 @@ public class ReconcilableSet
         if (missingCount is <= 0 or > MaxDiffForRecentScan)
             return ReconcileResult.Fallback();
 
-        var diff = Sum - remoteSum;
+        var diff = localSum - remoteSum;
         var found = TryPeel(diff, missingCount,
             missingCount <= MaxDiffForFullScan ? HistorySize : RecentScanLimit);
         return found != null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
@@ -190,7 +216,6 @@ public class ReconcilableSet
         for (int i = 0; i < keys.Length; i++)
         {
             hashes[i] = Setsum.Hash(keys[i]);
-            Sum += hashes[i];
             _historyKeys[_head] = keys[i];
             _historyHashes[_head] = hashes[i];
             _head = (_head + 1) % HistorySize;
