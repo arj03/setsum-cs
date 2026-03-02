@@ -69,10 +69,12 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
     {
         if (Length == 0) return true;
         if (key.Length * 8 < Length) return false;
-        ulong keyBits = 0;
+
         int bytesNeeded = (Length + 7) / 8;
-        for (int i = 0; i < bytesNeeded && i < key.Length; i++)
-            keyBits |= ((ulong)key[i]) << (56 - i * 8);
+        ulong keyBits = 0;
+        for (int i = 0; i < bytesNeeded; i++)
+            keyBits |= (ulong)key[i] << (56 - i * 8);
+
         ulong mask = Length == 64 ? ulong.MaxValue : ~((1UL << (64 - Length)) - 1);
         return (keyBits & mask) == (Bits & mask);
     }
