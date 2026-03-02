@@ -6,11 +6,6 @@ namespace Setsum.Sync;
 /// A set of fixed-size (32-byte) keys supporting:
 ///   - Fast-path reconciliation via Setsum peeling for small diffs
 ///   - Merkle trie sync for large diffs, using SortedKeyStore for O(log N) prefix queries
-///
-/// The per-item hash h_k = Setsum.Hash(key) is computed once on insertion and flows into 
-/// three consumers:
-///   1. SortedKeyStore._hashes[i]       — sorted store, source of prefix sums
-///   2. _historyHashes[head]            — circular buffer for fast-path peeling
 /// </summary>
 public class ReconcilableSet
 {
