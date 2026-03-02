@@ -72,6 +72,17 @@ public class ReconcilableSet
         InsertSortedArray(items.ToArray());
     }
 
+    /// <summary>
+    /// Push path receiver. Accepts a batch of items the sender believes we are missing,
+    /// inserting only those we do not already have. Returns the count actually inserted.
+    /// </summary>
+    public int AcceptPushedItems(IReadOnlyList<byte[]> items)
+    {
+        var missing = items.Where(item => !_store.Contains(item)).ToList();
+        if (missing.Count > 0) InsertBulk(missing);
+        return missing.Count;
+    }
+
     public bool Contains(byte[] key) => _store.Contains(key);
 
     /// <summary>

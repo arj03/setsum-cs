@@ -78,15 +78,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         _output.WriteLine($"result of local reconcile: {localResult.Outcome}");
         if (localResult.Outcome == ReconcileOutcome.Found)
         {
-            foreach (var item in localResult.MissingItems!)
-            {
-                if (!_remote.Contains(item))
-                {
-                    _remote.Insert(item);
-                    RoundTrips++; // FIXME: bulk insert
-                }
-            }
-
+            _remote.AcceptPushedItems(localResult.MissingItems!);
+            RoundTrips++;
             return true;
         }
 
@@ -130,8 +123,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         {
             var (prefix, depth, serverHash, serverCount, clientCount) = queue.Dequeue();
 
-            //_output.WriteLine($"Queue. Prefix: {prefix}, Depth: {depth}, Server hash: {serverHash}");
-
             if (clientCount == 0)
             {
                 itemsToFetch.Add(prefix);
@@ -159,7 +150,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             var (_, ch0, cc0, _, ch1, cc1) = _local.GetMerkleChildrenWithHashes(prefix, depth);
 
             RoundTrips++;
-            //_output.WriteLine($"GetMerkleChildrenWithHashes. sc0: {sc0}, sc1: {sc1}");
 
             if (sc0 > 0) queue.Enqueue((c0, depth + 1, sh0, sc0, cc0));
             if (sc1 > 0) queue.Enqueue((c1, depth + 1, sh1, sc1, cc1));

@@ -70,9 +70,8 @@ sequenceDiagram
     Note over C: Server returned Fallback.<br/>Maybe we're the ones ahead.
     C->>C: localResult = TryReconcile(Server.Sum, Server.Count)
     alt Found
-        loop For each missing item
-            C->>S: Insert item
-        end
+        C->>S: AcceptPushedItems(missing items)
+        Note over S: Filters to items not already held
         Note over C,S: Sync complete ✓
     else Not Found
         Note over C,S: Proceed to Merkle fallback
@@ -224,7 +223,7 @@ graph LR
     end
 ```
 
-A traditional Merkle tree must store every internal node hash explicitly (O(N) space for a balanced tree, O(N log N) for a naive implementation). This design stores only the leaf hashes and their prefix sums — the same O(N) space — while computing any internal node hash on demand. The trade-off is that verifying a single leaf requires two binary searches rather than a direct pointer walk, but for the sync use-case (where you always query ranges, not individual leaves) this is strictly better.
+A traditional Merkle tree must store every internal node hash explicitly — O(N) space for a balanced tree. This design stores only the leaf hashes and their prefix sums — the same O(N) space — while computing any internal node hash on demand. The trade-off is that verifying a single leaf requires two binary searches rather than a direct pointer walk, but for the sync use-case (where you always query ranges, not individual leaves) this is strictly better.
 
 ## Complexity Summary
 
@@ -233,7 +232,7 @@ A traditional Merkle tree must store every internal node hash explicitly (O(N) s
 | Sets are identical | 1 | Setsum comparison |
 | Client missing ≤ 3 items | 1 | Full history peel |
 | Client missing 4–10 items | 1 | Recent history peel |
-| Client ahead by ≤ 10 items | 1–N | Push path (one trip per item currently) |
+| Client ahead by ≤ 10 items | 1 | Bulk push in a single round trip |
 | Large diff | O(log N) | Merkle BFS + 1 batch fetch |
 
 > **Leaf threshold** (`LeafThreshold = 16`) and **max depth** (`MaxPrefixDepth = 64`) are the two main tuning parameters controlling the trade-off between round-trips and data over-transfer in the Merkle path.

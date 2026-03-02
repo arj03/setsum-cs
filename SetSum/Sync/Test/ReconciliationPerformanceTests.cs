@@ -157,7 +157,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         bool success = sim.TrySync(_output);
 
         Assert.True(success);
-        Assert.Equal(4, sim.RoundTrips);
+        Assert.Equal(2, sim.RoundTrips);
 
         Assert.Equal(server.Count(), client.Count());
         Assert.Equal(server.Sum(), client.Sum());
