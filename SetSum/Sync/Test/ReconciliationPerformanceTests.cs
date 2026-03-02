@@ -2,6 +2,7 @@
 using System.Security.Cryptography;
 using Xunit;
 using Xunit.Abstractions;
+using static Setsum.Sync.ReconcileResult;
 
 namespace Setsum.Sync.Test;
 
@@ -108,7 +109,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         var result = server.TryReconcile(client.Sum(), client.Count());
         sw.Stop();
 
-        Assert.True(result.NeedsFallback, "Large diff should immediately signal Fallback");
+        Assert.True(result.Outcome == ReconcileOutcome.Fallback, "Large diff should immediately signal Fallback");
 
         _output.WriteLine($"Fast-path bailout – Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
