@@ -37,19 +37,19 @@ public class SortedKeyStore
     private readonly int[] _counts = new int[256];
     private readonly int[] _offsets = new int[256];
 
-    public int Count() 
-    { 
-        EnsureSorted(); 
-        return _count; 
+    public int Count()
+    {
+        EnsureSorted();
+        return _count;
     }
 
     /// <summary>
     /// The Setsum over all items in the store
     /// </summary>
-    public Setsum TotalHash() 
+    public Setsum TotalHash()
     {
         Prepare();
-        return _prefixSums[_count]; 
+        return _prefixSums[_count];
     }
 
     // -------------------------------------------------------------------------
@@ -103,15 +103,15 @@ public class SortedKeyStore
                 _scratchHashes[k++] = hashes[j++];
             }
         }
-        while (i < _count) 
-        { 
+        while (i < _count)
+        {
             CopyKey(_data, i, _scratchData, k);
             _scratchHashes[k++] = _hashes[i++];
         }
-        while (j < newCount) 
-        { 
+        while (j < newCount)
+        {
             CopyKey(keys, j, _scratchData, k);
-            _scratchHashes[k++] = hashes[j++]; 
+            _scratchHashes[k++] = hashes[j++];
         }
 
         (_data, _scratchData) = (_scratchData, _data);
@@ -126,7 +126,7 @@ public class SortedKeyStore
     public void MergeSorted(byte[][] keys, Setsum[] hashes, int newCount)
     {
         var flat = new byte[newCount * KeySize];
-        for (int i = 0; i < newCount; i++) 
+        for (int i = 0; i < newCount; i++)
             keys[i].CopyTo(flat, i * KeySize);
         MergeSorted(flat, hashes, newCount);
     }
@@ -150,7 +150,7 @@ public class SortedKeyStore
     public (Setsum Hash, int Count) TotalInfo()
     {
         Prepare();
-        
+
         return (_prefixSums[_count], _count);
     }
 
@@ -160,10 +160,10 @@ public class SortedKeyStore
 
         int start = LowerBound(lo), end = UpperBound(hi);
         if (start >= end) return (new Setsum(), 0, new Setsum(), 0);
-        
+
         int split = FindSplitPoint(start, end, depth);
         int c0 = split - start, c1 = end - split;
-        
+
         return (c0 > 0 ? _prefixSums[split] - _prefixSums[start] : new Setsum(), c0,
                 c1 > 0 ? _prefixSums[end] - _prefixSums[split] : new Setsum(), c1);
     }
@@ -173,7 +173,7 @@ public class SortedKeyStore
         EnsureSorted();
 
         int start = LowerBound(lo), end = UpperBound(hi);
-        for (int i = start; i < end; ++i) 
+        for (int i = start; i < end; ++i)
             yield return KeyAt(_data, i).ToArray();
     }
 
@@ -181,24 +181,33 @@ public class SortedKeyStore
     {
         EnsureSorted();
 
-        for (int i = 0; i < _count; i++) 
+        for (int i = 0; i < _count; i++)
             yield return KeyAt(_data, i).ToArray();
     }
 
     public void CollectMissing(byte[] lo, byte[] hi, SortedKeyStore other, List<byte[]> result)
     {
-        EnsureSorted(); 
+        EnsureSorted();
         other.EnsureSorted();
 
         int si = LowerBound(lo), sEnd = UpperBound(hi);
         int li = other.LowerBound(lo), lEnd = other.UpperBound(hi);
+
         while (si < sEnd)
         {
             var sKey = KeyAt(_data, si);
-            while (li < lEnd && KeyAt(other._data, li).SequenceCompareTo(sKey) < 0) li++;
-            if (li < lEnd && KeyAt(other._data, li).SequenceCompareTo(sKey) == 0) { si++; continue; }
+
+            // Advance other past keys that are strictly less than sKey
+            while (li < lEnd)
+            {
+                int cmp = KeyAt(other._data, li).SequenceCompareTo(sKey);
+                if (cmp > 0) break;        // other is ahead — sKey is missing
+                if (cmp == 0) { li++; goto found; }
+                li++;
+            }
+
             result.Add(sKey.ToArray());
-            si++;
+        found: si++;
         }
     }
 
@@ -301,14 +310,15 @@ public class SortedKeyStore
     private void EnsurePrefixSums()
     {
         if (!_prefixSumsDirty) return;
-        
-        if (_prefixSums.Length < _count + 1) 
-            _prefixSums = new Setsum[_count + 1];
+
+        // Double capacity on growth to avoid repeated reallocations
+        if (_prefixSums.Length < _count + 1)
+            _prefixSums = new Setsum[Math.Max(_count + 1, _prefixSums.Length * 2)];
+
         _prefixSums[0] = new Setsum();
-        
-        for (int i = 0; i < _count; i++) 
+        for (int i = 0; i < _count; i++)
             _prefixSums[i + 1] = _prefixSums[i] + _hashes[i];
-        
+
         _prefixSumsDirty = false;
     }
 
@@ -320,38 +330,43 @@ public class SortedKeyStore
         {
             int mid = (lo + hi) >> 1;
             int cmp = KeyAt(_data, mid).SequenceCompareTo(t);
-            
-            if (cmp == 0) 
+
+            if (cmp == 0)
                 return mid;
-            else if (cmp < 0) 
-                lo = mid + 1; 
-            else 
+            else if (cmp < 0)
+                lo = mid + 1;
+            else
                 hi = mid - 1;
         }
         return ~lo;
     }
 
     private int LowerBound(byte[] t) => LowerBound((ReadOnlySpan<byte>)t, 0, _count);
-    private int LowerBound(byte[] t, int lo, int hi) => LowerBound((ReadOnlySpan<byte>)t, lo, hi);
+
     private int LowerBound(ReadOnlySpan<byte> t, int lo, int hi)
     {
-        while (lo < hi) { 
-            int mid = (lo + hi) >> 1; 
-            if (KeyAt(_data, mid).SequenceCompareTo(t) < 0) 
-                lo = mid + 1; 
-            else hi = mid; 
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (KeyAt(_data, mid).SequenceCompareTo(t) < 0)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
         return lo;
     }
 
     private int UpperBound(byte[] t)
     {
-        var s = (ReadOnlySpan<byte>)t; int lo = 0, hi = _count;
-        while (lo < hi) { 
-            int mid = (lo + hi) >> 1; 
-            if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0) 
-                lo = mid + 1; 
-            else hi = mid; 
+        var s = (ReadOnlySpan<byte>)t;
+        int lo = 0, hi = _count;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
         return lo;
     }
@@ -360,7 +375,7 @@ public class SortedKeyStore
     {
         Span<byte> splitKey = stackalloc byte[KeySize];
         int fullBytes = depth / 8, rem = depth % 8;
-        if (start < _count && fullBytes > 0) 
+        if (start < _count && fullBytes > 0)
             KeyAt(_data, start).Slice(0, fullBytes).CopyTo(splitKey);
 
         if (rem == 0)
@@ -374,24 +389,27 @@ public class SortedKeyStore
             splitKey[fullBytes] = (byte)(((start < _count ? KeyAt(_data, start)[fullBytes] : 0) & mask) | (1 << bit));
         }
 
-        return LowerBound(splitKey.ToArray(), start, end);
+        return LowerBound(splitKey, start, end);
     }
 
     // -------------------------------------------------------------------------
     // Inline helpers
     // -------------------------------------------------------------------------
 
-    private static ReadOnlySpan<byte> KeyAt(byte[] buf, int i) 
+    private static ReadOnlySpan<byte> KeyAt(byte[] buf, int i)
         => buf.AsSpan(i * KeySize, KeySize);
+
     private static void CopyKey(byte[] src, int si, byte[] dst, int di)
         => src.AsSpan(si * KeySize, KeySize).CopyTo(dst.AsSpan(di * KeySize));
 
     private static void GrowFlat(ref byte[] buf, int count)
     {
         var next = new byte[Math.Max(count * KeySize * 2, buf.Length * 2)];
-        buf.AsSpan().CopyTo(next); buf = next;
+        buf.AsSpan().CopyTo(next);
+        buf = next;
     }
 
+    // Scratch buffer — contents are NOT preserved; callers always write before reading.
     private static void GrowFlatTo(ref byte[] buf, int needed)
     {
         if (buf.Length >= needed) return;
@@ -401,9 +419,11 @@ public class SortedKeyStore
     private static void Grow<T>(ref T[] arr, int count)
     {
         var next = new T[Math.Max(count * 2, arr.Length * 2)];
-        arr.AsSpan().CopyTo(next); arr = next;
+        arr.AsSpan().CopyTo(next);
+        arr = next;
     }
 
+    // Scratch buffer — contents are NOT preserved; callers always write before reading.
     private static void GrowTo<T>(ref T[] arr, int needed)
     {
         if (arr.Length >= needed) return;
