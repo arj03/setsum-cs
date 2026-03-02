@@ -46,12 +46,7 @@ public class ReconcilableSet
             throw new ArgumentException($"Item key must be {Setsum.DigestSize} bytes.");
 
         var itemHash = Setsum.Hash(itemKey);
-
-        _historyKeys[_head] = itemKey;
-        _historyHashes[_head] = itemHash;
-        _head = (_head + 1) % HistorySize;
-        _historyCount = Math.Min(_historyCount + 1, HistorySize);
-
+        RecordHistory(itemKey, itemHash);
         _store.Add(itemKey, itemHash);
     }
 
@@ -66,7 +61,7 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Inserts multiple items that are already in order
+    /// Inserts multiple items that are already in order.
     /// </summary>
     public void InsertBulkPresorted(List<byte[]> items)
     {
@@ -97,22 +92,8 @@ public class ReconcilableSet
 
     public (BitPrefix Child0, Setsum Hash0, int Count0, BitPrefix Child1, Setsum Hash1, int Count1) GetMerkleChildrenWithHashes(BitPrefix prefix, int depth)
     {
-        Setsum h0, h1;
-        int c0, c1;
-
-        if (prefix.Length == 0)
-        {
-            var lo = new byte[Setsum.DigestSize];
-            var hi = new byte[Setsum.DigestSize];
-            Array.Fill(hi, (byte)0xFF);
-            (h0, c0, h1, c1) = _store.RangeInfoSplit(lo, hi, depth);
-        }
-        else
-        {
-            var (lo, hi) = prefix.KeyRange();
-            (h0, c0, h1, c1) = _store.RangeInfoSplit(lo, hi, depth);
-        }
-
+        var (lo, hi) = prefix.KeyRange();
+        var (h0, c0, h1, c1) = _store.RangeInfoSplit(lo, hi, depth);
         return (prefix.Extend(0), h0, c0, prefix.Extend(1), h1, c1);
     }
 
@@ -129,17 +110,7 @@ public class ReconcilableSet
     /// </summary>
     public void CollectMissingItemsWithPrefix(BitPrefix prefix, ReconcilableSet other, List<byte[]> result)
     {
-        byte[] lo, hi;
-        if (prefix.Length == 0)
-        {
-            lo = new byte[Setsum.DigestSize];
-            hi = new byte[Setsum.DigestSize];
-            Array.Fill(hi, (byte)0xFF);
-        }
-        else
-        {
-            (lo, hi) = prefix.KeyRange();
-        }
+        var (lo, hi) = prefix.KeyRange();
         _store.CollectMissing(lo, hi, other._store, result);
     }
 
@@ -163,15 +134,29 @@ public class ReconcilableSet
         if (missingCount is <= 0 or > MaxDiffForRecentScan)
             return ReconcileResult.Fallback();
 
+        int searchLimit = Math.Min(
+            missingCount <= MaxDiffForFullScan ? HistorySize : RecentScanLimit,
+            _historyCount);
+
         var diff = localSum - remoteSum;
-        var found = TryPeel(diff, missingCount,
-            missingCount <= MaxDiffForFullScan ? HistorySize : RecentScanLimit);
-        return found != null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
+        var result = new List<byte[]>(missingCount);
+        var found = SolveRecursive(diff, missingCount, searchLimit, result,
+            new HashSet<byte[]>(ReferenceEqualityComparer.Instance));
+
+        return found ? ReconcileResult.Found(result) : ReconcileResult.Fallback();
     }
 
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    private void RecordHistory(byte[] key, Setsum hash)
+    {
+        _historyKeys[_head] = key;
+        _historyHashes[_head] = hash;
+        _head = (_head + 1) % HistorySize;
+        _historyCount = Math.Min(_historyCount + 1, HistorySize);
+    }
 
     private void InsertSortedArray(byte[][] keys)
     {
@@ -179,22 +164,13 @@ public class ReconcilableSet
         for (int i = 0; i < keys.Length; i++)
         {
             hashes[i] = Setsum.Hash(keys[i]);
-            _historyKeys[_head] = keys[i];
-            _historyHashes[_head] = hashes[i];
-            _head = (_head + 1) % HistorySize;
-            _historyCount = Math.Min(_historyCount + 1, HistorySize);
+            RecordHistory(keys[i], hashes[i]);
         }
         _store.MergeSorted(keys, hashes, keys.Length);
     }
 
-    private List<byte[]>? TryPeel(Setsum target, int k, int searchLimit)
-    {
-        int limit = Math.Min(searchLimit, _historyCount);
-        var result = new List<byte[]>(k);
-        return SolveRecursive(target, k, limit, result) ? result : null;
-    }
-
-    private bool SolveRecursive(Setsum target, int k, int maxOffset, List<byte[]> result)
+    private bool SolveRecursive(Setsum target, int k, int maxOffset, List<byte[]> result,
+        HashSet<byte[]> seen)
     {
         if (k == 0) return target == new Setsum();
 
@@ -203,12 +179,13 @@ public class ReconcilableSet
             int idx = ((_head - 1 - offset) % HistorySize + HistorySize) % HistorySize;
             var key = _historyKeys[idx];
             if (key == null) break;
-            if (result.Any(r => ReferenceEquals(r, key))) continue;
+            if (!seen.Add(key)) continue;
 
             var h = _historyHashes[idx];
             result.Add(key);
-            if (SolveRecursive(target - h, k - 1, maxOffset, result)) return true;
+            if (SolveRecursive(target - h, k - 1, maxOffset, result, seen)) return true;
             result.RemoveAt(result.Count - 1);
+            seen.Remove(key);
         }
 
         return false;
