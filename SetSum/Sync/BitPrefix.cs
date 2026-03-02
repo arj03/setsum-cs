@@ -1,9 +1,7 @@
 ﻿namespace Setsum.Sync;
 
 /// <summary>
-/// Represents a bit-level prefix for Merkle trie traversal.
-/// Bits holds the prefix MSB-first in a ulong. Length is the number of significant bits.
-/// At depth 0 (root) all keys match. Max depth is 64 (first 8 bytes of the key).
+/// Represents a bit-level MSB-first prefix for Merkle trie traversal.
 /// </summary>
 public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
 {
@@ -12,7 +10,9 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
 
     public static readonly BitPrefix Root = new(0, 0);
 
-    /// <summary>Appends a 0 or 1 bit, returning the child prefix.</summary>
+    /// <summary>
+    /// Returns a new extended bit prefix
+    /// </summary>
     public BitPrefix Extend(int bit)
     {
         if (Length >= 64) throw new InvalidOperationException("Prefix too deep.");
@@ -21,7 +21,9 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
         return new BitPrefix(newBits, Length + 1);
     }
 
-    /// <summary>Returns the bit at position depth (0 = MSB of first byte).</summary>
+    /// <summary>
+    /// Returns the MSB at position depth
+    /// </summary>
     public static int GetBitOfKey(byte[] key, int depth)
         => (key[depth / 8] >> (7 - depth % 8)) & 1;
 
@@ -60,7 +62,9 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
         return (lo, hi);
     }
 
-    /// <summary>Returns true if the key's leading bits match this prefix.</summary>
+    /// <summary>
+    /// Returns true if the key's leading bits match this prefix.
+    /// </summary>
     public bool Matches(byte[] key)
     {
         if (Length == 0) return true;

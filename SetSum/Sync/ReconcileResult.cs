@@ -16,7 +16,9 @@ public readonly struct ReconcileResult
 {
     public ReconcileOutcome Outcome { get; }
 
-    /// <summary>Non-null only when Outcome is Found.</summary>
+    /// <summary>
+    /// Non-null only when Outcome is Found.
+    /// </summary>
     public IReadOnlyList<byte[]>? MissingItems { get; }
 
     private ReconcileResult(ReconcileOutcome outcome, List<byte[]>? items = null)

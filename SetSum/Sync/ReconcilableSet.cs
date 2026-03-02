@@ -2,35 +2,15 @@
 
 namespace Setsum.Sync;
 
-public class ByteComparer : IComparer<byte[]>
-{
-    public static readonly ByteComparer Instance = new();
-
-    public int Compare(byte[]? x, byte[]? y)
-    {
-        if (x == null && y == null) return 0;
-        if (x == null) return -1;
-        if (y == null) return 1;
-        return ((ReadOnlySpan<byte>)x).SequenceCompareTo(y);
-    }
-}
-
 /// <summary>
 /// A set of fixed-size (32-byte) keys supporting:
 ///   - Fast-path reconciliation via Setsum peeling for small diffs
 ///   - Merkle trie sync for large diffs, using SortedKeyStore for O(log N) prefix queries
 ///
-/// The global Setsum (used for fast-path peeling) is no longer maintained as a
-/// separate running accumulator. Instead it is derived directly from
-/// SortedKeyStore._prefixSums[Count], which already holds the identical value.
-/// This eliminates a redundant field and the dual update paths that could diverge.
-///
-/// The per-item hash h_k = Setsum.Hash(key) is computed once on insertion and
-/// flows into three consumers:
+/// The per-item hash h_k = Setsum.Hash(key) is computed once on insertion and flows into 
+/// three consumers:
 ///   1. SortedKeyStore._hashes[i]       — sorted store, source of prefix sums
-///   2. _historyHashes[head]             — circular buffer for fast-path peeling
-///
-/// The global Sum is now consumer #1's output: _store.TotalInfo().Hash.
+///   2. _historyHashes[head]            — circular buffer for fast-path peeling
 /// </summary>
 public class ReconcilableSet
 {
@@ -39,11 +19,6 @@ public class ReconcilableSet
     private const int MaxDiffForRecentScan = 10;
     private const int RecentScanLimit = 20;
 
-    /// <summary>
-    /// The global Setsum over all items. Derived from the prefix sum table rather
-    /// than maintained as a separate accumulator — the two are always equal, so we
-    /// keep only the single authoritative source inside SortedKeyStore.
-    /// </summary>
     public Setsum Sum() => _store.TotalInfo().Hash;
 
     public long Count() => _store.Count();
@@ -85,7 +60,9 @@ public class ReconcilableSet
         _store.Add(itemKey, itemHash);
     }
 
-    /// <summary>Inserts multiple items, sorting first. Use InsertBulkPresorted if already sorted.</summary>
+    /// <summary>
+    /// Inserts multiple items, sorting first. Use InsertBulkPresorted if already sorted.
+    /// </summary>
     public void InsertBulk(List<byte[]> items)
     {
         if (items.Count == 0) return;
@@ -94,8 +71,7 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Inserts multiple items that are already in ByteComparer order — skips the O(N log N) sort.
-    /// CollectMissingItemsWithPrefix always yields items in sorted order, so use this after a sync.
+    /// Inserts multiple items that are already in order
     /// </summary>
     public void InsertBulkPresorted(List<byte[]> items)
     {
@@ -109,10 +85,7 @@ public class ReconcilableSet
     public bool Contains(byte[] key) => _store.Contains(key);
 
     /// <summary>
-    /// Sorts any pending keys and builds the prefix sum table. Call this once after
-    /// a bulk-insert session (e.g. after inserting the initial dataset) to pay the
-    /// O(N log N) sort cost at a known, explicit moment rather than having it land
-    /// as a hidden spike on the first sync operation.
+    /// Sorts any pending keys and builds the prefix sum table.
     /// </summary>
     public void Prepare() => _store.Prepare();
 
@@ -182,14 +155,9 @@ public class ReconcilableSet
     /// <summary>
     /// Called by the server: given the client's (Sum, Count), return what it's missing.
     /// Uses Setsum peeling — works for small diffs only, otherwise returns Fallback.
-    ///
-    /// Reading Sum here triggers EnsureSorted + EnsurePrefixSums inside the store,
-    /// which is correct: we want the authoritative total after any pending inserts
-    /// have been merged.
     /// </summary>
     public ReconcileResult TryReconcile(Setsum remoteSum, long remoteCount)
     {
-        // Sum property calls _store.TotalInfo() — single source of truth.
         var localSum = Sum();
         if (localSum == remoteSum) return ReconcileResult.Identical();
 

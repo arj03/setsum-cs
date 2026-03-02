@@ -11,16 +11,6 @@
 /// permutation in _scratch (int[]) that is applied in one gather pass to both arrays.
 /// This gives O(N) sort with sequential memory access during the counting passes —
 /// the dominant cost over Array.Sort's O(N log N) with random cache misses.
-///
-/// PREFIX SUM = GLOBAL SETSUM
-/// --------------------------
-/// _prefixSums[i] = h_0 + h_1 + ... + h_(i-1)  (Setsum addition)
-/// _prefixSums[Count] is therefore the sum of ALL item hashes — identical to what
-/// ReconcilableSet previously maintained as a separate `Sum` field. There is only
-/// one authoritative copy of the global Setsum: _prefixSums[Count], exposed via
-/// TotalInfo().Hash (or the zero-allocation TotalHash property).
-/// ReconcilableSet.Sum is now a thin property that reads from here, eliminating
-/// the dual update paths that previously had to be kept in sync.
 /// </summary>
 public class SortedKeyStore
 {
@@ -31,8 +21,7 @@ public class SortedKeyStore
     private Setsum[] _hashes = new Setsum[16];
     private int _count;
 
-    // Prefix sums: _prefixSums[i] = sum of _hashes[0..i-1]
-    // _prefixSums[_count] IS the global Setsum over all items in this store.
+    // _prefixSums[i] = sum of _hashes[0..i-1]
     private Setsum[] _prefixSums = new Setsum[17];
     private bool _prefixSumsDirty = true;
 
@@ -55,12 +44,7 @@ public class SortedKeyStore
     }
 
     /// <summary>
-    /// The Setsum over all items in the store — equivalent to the old
-    /// ReconcilableSet.Sum accumulator but derived from the single authoritative
-    /// prefix sum table rather than maintained as a separate field.
-    ///
-    /// Calling this triggers EnsureSorted() + EnsurePrefixSums() if dirty, which
-    /// is correct: we want the true total after any pending inserts are merged.
+    /// The Setsum over all items in the store
     /// </summary>
     public Setsum TotalHash() 
     {
@@ -96,7 +80,9 @@ public class SortedKeyStore
         EnsurePrefixSums();
     }
 
-    /// <summary>Merges a pre-sorted flat key buffer + hash array into the store.</summary>
+    /// <summary>
+    /// Merges a pre-sorted flat key buffer + hash array into the store.
+    /// </summary>
     public void MergeSorted(byte[] keys, Setsum[] hashes, int newCount)
     {
         int total = _count + newCount;
@@ -117,8 +103,16 @@ public class SortedKeyStore
                 _scratchHashes[k++] = hashes[j++];
             }
         }
-        while (i < _count) { CopyKey(_data, i, _scratchData, k); _scratchHashes[k++] = _hashes[i++]; }
-        while (j < newCount) { CopyKey(keys, j, _scratchData, k); _scratchHashes[k++] = hashes[j++]; }
+        while (i < _count) 
+        { 
+            CopyKey(_data, i, _scratchData, k);
+            _scratchHashes[k++] = _hashes[i++];
+        }
+        while (j < newCount) 
+        { 
+            CopyKey(keys, j, _scratchData, k);
+            _scratchHashes[k++] = hashes[j++]; 
+        }
 
         (_data, _scratchData) = (_scratchData, _data);
         (_hashes, _scratchHashes) = (_scratchHashes, _hashes);
@@ -126,19 +120,26 @@ public class SortedKeyStore
         _prefixSumsDirty = true;
     }
 
-    /// <summary>Overload for callers with jagged byte[][] keys.</summary>
+    /// <summary>
+    /// Overload for callers with jagged byte[][] keys.
+    /// </summary>
     public void MergeSorted(byte[][] keys, Setsum[] hashes, int newCount)
     {
         var flat = new byte[newCount * KeySize];
-        for (int i = 0; i < newCount; i++) keys[i].CopyTo(flat, i * KeySize);
+        for (int i = 0; i < newCount; i++) 
+            keys[i].CopyTo(flat, i * KeySize);
         MergeSorted(flat, hashes, newCount);
     }
 
     public (Setsum Hash, int Count) RangeInfo(byte[] lo, byte[] hi)
     {
-        EnsureSorted(); EnsurePrefixSums();
+        Prepare();
+
         int start = LowerBound(lo), end = UpperBound(hi), count = end - start;
-        return count <= 0 ? (new Setsum(), 0) : (_prefixSums[end] - _prefixSums[start], count);
+        if (count <= 0)
+            return (new Setsum(), 0);
+        else
+            return (_prefixSums[end] - _prefixSums[start], count);
     }
 
     /// <summary>
@@ -148,17 +149,21 @@ public class SortedKeyStore
     /// </summary>
     public (Setsum Hash, int Count) TotalInfo()
     {
-        EnsureSorted(); EnsurePrefixSums();
+        Prepare();
+        
         return (_prefixSums[_count], _count);
     }
 
     public (Setsum Hash0, int Count0, Setsum Hash1, int Count1) RangeInfoSplit(byte[] lo, byte[] hi, int depth)
     {
-        EnsureSorted(); EnsurePrefixSums();
+        Prepare();
+
         int start = LowerBound(lo), end = UpperBound(hi);
         if (start >= end) return (new Setsum(), 0, new Setsum(), 0);
+        
         int split = FindSplitPoint(start, end, depth);
         int c0 = split - start, c1 = end - split;
+        
         return (c0 > 0 ? _prefixSums[split] - _prefixSums[start] : new Setsum(), c0,
                 c1 > 0 ? _prefixSums[end] - _prefixSums[split] : new Setsum(), c1);
     }
@@ -166,19 +171,25 @@ public class SortedKeyStore
     public IEnumerable<byte[]> Range(byte[] lo, byte[] hi)
     {
         EnsureSorted();
+
         int start = LowerBound(lo), end = UpperBound(hi);
-        for (int i = start; i < end; i++) yield return KeyAt(_data, i).ToArray();
+        for (int i = start; i < end; ++i) 
+            yield return KeyAt(_data, i).ToArray();
     }
 
     public IEnumerable<byte[]> All()
     {
         EnsureSorted();
-        for (int i = 0; i < _count; i++) yield return KeyAt(_data, i).ToArray();
+
+        for (int i = 0; i < _count; i++) 
+            yield return KeyAt(_data, i).ToArray();
     }
 
     public void CollectMissing(byte[] lo, byte[] hi, SortedKeyStore other, List<byte[]> result)
     {
-        EnsureSorted(); other.EnsureSorted();
+        EnsureSorted(); 
+        other.EnsureSorted();
+
         int si = LowerBound(lo), sEnd = UpperBound(hi);
         int li = other.LowerBound(lo), lEnd = other.UpperBound(hi);
         while (si < sEnd)
@@ -252,8 +263,6 @@ public class SortedKeyStore
     /// </summary>
     private static void FinishSort(byte[] keys, Setsum[] hashes, int n)
     {
-        // Allocate the temp buffer once outside all loops — stackalloc inside a loop
-        // consumes stack on every iteration and will overflow for large N.
         Span<byte> tmp = stackalloc byte[KeySize];
 
         int start = 0;
@@ -372,7 +381,8 @@ public class SortedKeyStore
     // Inline helpers
     // -------------------------------------------------------------------------
 
-    private static ReadOnlySpan<byte> KeyAt(byte[] buf, int i) => buf.AsSpan(i * KeySize, KeySize);
+    private static ReadOnlySpan<byte> KeyAt(byte[] buf, int i) 
+        => buf.AsSpan(i * KeySize, KeySize);
     private static void CopyKey(byte[] src, int si, byte[] dst, int di)
         => src.AsSpan(si * KeySize, KeySize).CopyTo(dst.AsSpan(di * KeySize));
 
