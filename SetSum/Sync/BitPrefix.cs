@@ -2,6 +2,11 @@
 
 /// <summary>
 /// Represents a bit-level MSB-first prefix for Merkle trie traversal.
+///
+/// Wire format (1–9 bytes, variable):
+///   Byte 0       : Length (0–64)
+///   Bytes 1..N   : The significant bytes of Bits, MSB first.
+///                  N = (Length + 7) / 8  — only bytes that carry prefix bits are sent.
 /// </summary>
 public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
 {
@@ -10,6 +15,34 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
 
     public static readonly BitPrefix Root = new(0, 0);
 
+    public int NetworkSize => 1 + (Length + 7) / 8;
+
+    /// <summary>
+    /// Serializes the prefix into <paramref name="dest"/> starting at <paramref name="offset"/>.
+    /// Writes exactly <see cref="NetworkSize"/> bytes.
+    /// </summary>
+    public void Serialize(byte[] dest, int offset = 0)
+    {
+        dest[offset] = (byte)Length;
+        int sigBytes = (Length + 7) / 8;
+        for (int i = 0; i < sigBytes; i++)
+            dest[offset + 1 + i] = (byte)(Bits >> (56 - i * 8));
+    }
+
+    /// <summary>
+    /// Deserializes a <see cref="BitPrefix"/> from <paramref name="src"/> starting at
+    /// <paramref name="offset"/>. Advances <paramref name="offset"/> past the bytes consumed.
+    /// </summary>
+    public static BitPrefix Deserialize(byte[] src, ref int offset)
+    {
+        int length = src[offset++];
+        int sigBytes = (length + 7) / 8;
+        ulong bits = 0;
+        for (int i = 0; i < sigBytes; i++)
+            bits |= (ulong)src[offset++] << (56 - i * 8);
+        return new BitPrefix(bits, length);
+    }
+
     /// <summary>
     /// Returns a new extended bit prefix
     /// </summary>
@@ -17,7 +50,7 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
     {
         if (Length >= 64) throw new InvalidOperationException("Prefix too deep.");
         ulong newBits = Bits;
-        if (bit != 0) newBits |= (1UL << (63 - Length));
+        if (bit != 0) newBits |= 1UL << (63 - Length);
         return new BitPrefix(newBits, Length + 1);
     }
 
@@ -45,14 +78,14 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
 
         for (int i = 0; i < fullBytes; i++)
         {
-            byte b = (byte)((Bits >> (56 - i * 8)) & 0xFF);
+            byte b = (byte)(Bits >> (56 - i * 8));
             lo[i] = b;
             hi[i] = b;
         }
 
         if (remainder > 0)
         {
-            byte prefixByte = (byte)((Bits >> (56 - fullBytes * 8)) & 0xFF);
+            byte prefixByte = (byte)(Bits >> (56 - fullBytes * 8));
             byte mask = (byte)(0xFF << (8 - remainder));
             byte prefixPart = (byte)(prefixByte & mask);
             lo[fullBytes] = prefixPart;

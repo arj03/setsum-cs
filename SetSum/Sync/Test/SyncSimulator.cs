@@ -19,10 +19,9 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     // Maximum prefix depth before we force a leaf transfer (64 bits = 8 bytes of the key).
     private const int MaxPrefixDepth = 64;
 
-    private const int KeySize = Setsum.DigestSize;              // 32 bytes per key
-    private const int SetsumSize = Setsum.DigestSize;           // 32 bytes per Setsum
-    private const int CountSize = sizeof(int);                  // 4 bytes per count
-    private const int PrefixSize = sizeof(ulong) + sizeof(int); // 12 bytes: bits + length
+    private const int KeySize = Setsum.DigestSize;    // 32 bytes per key
+    private const int SetsumSize = Setsum.DigestSize; // 32 bytes per Setsum
+    private const int CountSize = sizeof(int);         // 4 bytes per count
 
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }
@@ -131,10 +130,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         var (rootClientHash, rootClientCount) = _local.GetMerklePrefixInfo(BitPrefix.Root);
         RoundTrips++;
         HashChecks++;
-        BytesSent += PrefixSize;
+        BytesSent += BitPrefix.Root.NetworkSize;
         BytesReceived += SetsumSize + CountSize;
-
-        //_output.WriteLine($"merkle sync: {rootServerHash} {rootServerCount}, {rootClientHash} {rootClientCount}");
 
         if (rootServerCount == 0) return true;
 
@@ -161,7 +158,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                     if (serverHash == clientHash) continue;
                 }
                 itemsToFetch.Add(prefix);
-                //_output.WriteLine($"Found item to fetch: {prefix}");
                 continue;
             }
 
@@ -171,8 +167,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             var (_, ch0, cc0, _, ch1, cc1) = _local.GetMerkleChildrenWithHashes(prefix, depth);
 
             RoundTrips++;
-            BytesSent += PrefixSize + sizeof(int);      // prefix + depth
-            BytesReceived += 2 * (SetsumSize + CountSize);  // two (Hash, Count) pairs
+            BytesSent += prefix.NetworkSize + sizeof(int);      // prefix + depth
+            BytesReceived += 2 * (SetsumSize + CountSize);      // two (Hash, Count) pairs
 
             if (sc0 > 0) queue.Enqueue((c0, depth + 1, sh0, sc0, cc0));
             if (sc1 > 0) queue.Enqueue((c1, depth + 1, sh1, sc1, cc1));
@@ -184,7 +180,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         foreach (var prefix in itemsToFetch)
         {
             RoundTrips++;
-            BytesSent += PrefixSize; // prefix request
+            BytesSent += prefix.NetworkSize; // prefix request
             _remote.CollectMissingItemsWithPrefix(prefix, _local, missingItems);
         }
 
