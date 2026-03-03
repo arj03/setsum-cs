@@ -40,6 +40,11 @@ public readonly struct Setsum
     private Setsum(Vector256<uint> state) => _state = state;
 
     /// <summary>
+    /// Returns true if this Setsum represents the empty set (all field values are zero).
+    /// </summary>
+    public bool IsEmpty() => _state == Vector256<uint>.Zero;
+
+    /// <summary>
     /// Inserts a new item hash into the multi-set. If the item was already inserted, it will be inserted again.
     /// </summary>
     public Setsum InsertHash(ReadOnlySpan<byte> hash)

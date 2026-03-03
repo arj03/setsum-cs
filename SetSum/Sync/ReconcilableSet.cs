@@ -183,7 +183,7 @@ public class ReconcilableSet
     private bool SolveRecursive(Setsum target, int k, int maxOffset, List<byte[]> result,
         HashSet<byte[]> seen)
     {
-        if (k == 0) return target == new Setsum();
+        if (k == 0) return target.IsEmpty();
 
         for (int offset = 0; offset < maxOffset; offset++)
         {

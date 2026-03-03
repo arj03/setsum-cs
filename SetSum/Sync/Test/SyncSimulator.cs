@@ -56,12 +56,10 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         BytesSent = 0;
         BytesReceived = 0;
 
-        // ── Round trip 1: fast path ──────────────────────────────────────────
-        // Client sends its (Sum, Count) to the server.
-        // Server tries to figure out what the client is missing and returns those items.
+        // Fast path
+        var remoteResult = _remote.TryReconcile(_local.Sum(), _local.Count());
         RoundTrips++;
         BytesSent += SetsumSize + CountSize; // (Sum, Count)
-        var remoteResult = _remote.TryReconcile(_local.Sum(), _local.Count());
 
         _output.WriteLine($"result of first reconcile: {remoteResult.Outcome}");
 
@@ -74,8 +72,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 foreach (var item in remoteResult.MissingItems!)
                 {
                     BytesReceived += KeySize;
-                    // Guard against double-counting in edge cases where local somehow
-                    // already has the item (shouldn't happen in clean tests).
                     if (!_local.Contains(item))
                     {
                         _local.Insert(item);
@@ -88,8 +84,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 break; // fall through
         }
 
-        // ── Push path: check if the client is the one that's ahead ───────────
-        // Server returned Fallback. Maybe *we* have items the server is missing.
+        // Push path: check if the client is ahead
         var localResult = _local.TryReconcile(_remote.Sum(), _remote.Count());
         _output.WriteLine($"result of local reconcile: {localResult.Outcome}");
         if (localResult.Outcome == ReconcileOutcome.Found)
@@ -100,6 +95,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             return true;
         }
 
+        // Trie fallback
         UsedFallback = true;
         return PerformTrieSync(_output);
     }
@@ -118,13 +114,11 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     /// </summary>
     private bool PerformTrieSync(ITestOutputHelper _output)
     {
-        var itemsToFetch = new List<BitPrefix>();
+        var prefixesToFetch = new List<BitPrefix>();
 
-        // Queue carries hash and count for both sides — computed once when a node
-        // is discovered via parent split, never rescanned.
+        // Queue carries hash and count for both sides
         var queue = new Queue<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
 
-        // Request root info: send prefix, receive (Hash, Count)
         var (rootServerHash, rootServerCount) = _remote.GetPrefixInfo(BitPrefix.Root);
         var (rootClientHash, rootClientCount) = _local.GetPrefixInfo(BitPrefix.Root);
         RoundTrips++;
@@ -142,7 +136,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
             if (clientCount == 0)
             {
-                itemsToFetch.Add(prefix);
+                prefixesToFetch.Add(prefix);
                 continue;
             }
 
@@ -156,37 +150,34 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                     var (clientHash, _) = _local.GetPrefixInfo(prefix);
                     if (serverHash == clientHash) continue;
                 }
-                itemsToFetch.Add(prefix);
+                prefixesToFetch.Add(prefix);
                 continue;
             }
 
-            // Single-pass split: scan parent range once on each side, accumulating
-            // into two child buckets. Replaces two separate GetViewBetween calls.
+            // Check children
             var (c0, sh0, sc0, c1, sh1, sc1) = _remote.GetChildrenWithHashes(prefix, depth);
-            var (_, ch0, cc0, _, ch1, cc1) = _local.GetChildrenWithHashes(prefix, depth);
+            var (_, _, cc0, _, _, cc1) = _local.GetChildrenWithHashes(prefix, depth);
 
             RoundTrips++;
-            BytesSent += prefix.NetworkSize + sizeof(int);      // prefix + depth
-            BytesReceived += 2 * (SetsumSize + CountSize);      // two (Hash, Count) pairs
+            BytesSent += prefix.NetworkSize + sizeof(int);     // prefix + depth
+            BytesReceived += 2 * (SetsumSize + CountSize);     // two (Hash, Count) pairs
 
             if (sc0 > 0) queue.Enqueue((c0, depth + 1, sh0, sc0, cc0));
             if (sc1 > 0) queue.Enqueue((c1, depth + 1, sh1, sc1, cc1));
         }
 
-        _output.WriteLine($"Items to fetch: {itemsToFetch.Count}");
+        _output.WriteLine($"Prefixes to fetch: {prefixesToFetch.Count}");
 
         var missingItems = new List<byte[]>();
-        foreach (var prefix in itemsToFetch)
+        foreach (var prefix in prefixesToFetch)
         {
             RoundTrips++;
             BytesSent += prefix.NetworkSize; // prefix request
+            // FIXME: this is cheating
             _remote.CollectMissingItemsWithPrefix(prefix, _local, missingItems);
         }
 
-        // Each prefix's items are individually sorted, but BFS visits nodes level by level,
-        // not in key order — so a shallow prefix added late can cover keys that sort before
-        // those from a deeper prefix added earlier. One sort over the full result set
-        // restores the globally sorted order that InsertBulkPresorted requires.
+        // Ensure globally sorted order that InsertBulkPresorted requires.
         missingItems.Sort(ByteComparer.Instance);
 
         if (missingItems.Count > 0)
