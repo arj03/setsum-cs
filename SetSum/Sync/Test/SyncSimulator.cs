@@ -9,7 +9,7 @@ namespace Setsum.Sync.Test;
 ///   Fast path  – The remote (server) tries to identify and return items the client is missing
 ///                in a single round trip using set-difference peeling on recent history.
 ///   Push path  – If the client is ahead of the server, the client sends its extra items.
-///   Merkle     – Full binary-prefix traversal when the diff is too large for the fast path.
+///   Trie path  – Full binary-prefix traversal when the diff is too large for the fast path.
 /// </summary>
 public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 {
@@ -32,7 +32,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     /// </summary>
     public int ItemsTransferred { get; private set; }
 
-    /// <summary>Number of prefix-hash comparisons made during Merkle traversal.</summary>
+    /// <summary>Number of prefix-hash comparisons made during trie traversal.</summary>
     public int HashChecks { get; private set; }
 
     /// <summary>Bytes sent from local (client) to remote (server).</summary>
@@ -100,13 +100,12 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             return true;
         }
 
-        // ── Merkle fallback ──────────────────────────────────────────────────
         UsedFallback = true;
-        return PerformMerkleSync(_output);
+        return PerformTrieSync(_output);
     }
 
     /// <summary>
-    /// Binary-prefix Merkle sync with two key optimizations:
+    /// Binary-prefix trie sync with two key optimizations:
     ///
     ///   1. Count-aware short-circuit — every server response includes the item count
     ///      under that prefix. If the client has 0 and server has N, we skip the hash
@@ -117,7 +116,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     ///      all prefixes that need item transfers and fetch them in a single batch at the
     ///      end. This collapses O(leaves) trips into 1.
     /// </summary>
-    private bool PerformMerkleSync(ITestOutputHelper _output)
+    private bool PerformTrieSync(ITestOutputHelper _output)
     {
         var itemsToFetch = new List<BitPrefix>();
 
@@ -126,8 +125,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         var queue = new Queue<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
 
         // Request root info: send prefix, receive (Hash, Count)
-        var (rootServerHash, rootServerCount) = _remote.GetMerklePrefixInfo(BitPrefix.Root);
-        var (rootClientHash, rootClientCount) = _local.GetMerklePrefixInfo(BitPrefix.Root);
+        var (rootServerHash, rootServerCount) = _remote.GetPrefixInfo(BitPrefix.Root);
+        var (rootClientHash, rootClientCount) = _local.GetPrefixInfo(BitPrefix.Root);
         RoundTrips++;
         HashChecks++;
         BytesSent += BitPrefix.Root.NetworkSize;
@@ -154,7 +153,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 if (missingCount == 0)
                 {
                     HashChecks++;
-                    var (clientHash, _) = _local.GetMerklePrefixInfo(prefix);
+                    var (clientHash, _) = _local.GetPrefixInfo(prefix);
                     if (serverHash == clientHash) continue;
                 }
                 itemsToFetch.Add(prefix);
@@ -163,8 +162,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
             // Single-pass split: scan parent range once on each side, accumulating
             // into two child buckets. Replaces two separate GetViewBetween calls.
-            var (c0, sh0, sc0, c1, sh1, sc1) = _remote.GetMerkleChildrenWithHashes(prefix, depth);
-            var (_, ch0, cc0, _, ch1, cc1) = _local.GetMerkleChildrenWithHashes(prefix, depth);
+            var (c0, sh0, sc0, c1, sh1, sc1) = _remote.GetChildrenWithHashes(prefix, depth);
+            var (_, ch0, cc0, _, ch1, cc1) = _local.GetChildrenWithHashes(prefix, depth);
 
             RoundTrips++;
             BytesSent += prefix.NetworkSize + sizeof(int);      // prefix + depth

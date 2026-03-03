@@ -1,6 +1,6 @@
 # Setsum Sync
 
-A set-reconciliation library for efficiently synchronising two sets of 32-byte keys across a network. The protocol minimises round-trips by trying fast heuristic paths before falling back to a full Merkle traversal.
+A set-reconciliation library for efficiently synchronising two sets of 32-byte keys across a network. The protocol minimises round-trips by trying fast heuristic paths before falling back to a full binary-prefix trie traversal.
 
 ---
 
@@ -12,7 +12,7 @@ The library solves this in three escalating strategies:
 
 1. **Fast Path** — Setsum peeling (1 round-trip, works for tiny diffs)
 2. **Push Path** — if the *client* is ahead, push its extras to the server (0–1 round-trips)
-3. **Merkle Fallback** — binary-prefix trie traversal for large diffs (O(log N) round-trips)
+3. **Trie Fallback** — binary-prefix trie traversal for large diffs (O(log N) round-trips)
 
 ---
 
@@ -74,13 +74,13 @@ sequenceDiagram
         Note over S: Filters to items not already held
         Note over C,S: Sync complete ✓
     else Not Found
-        Note over C,S: Proceed to Merkle fallback
+        Note over C,S: Proceed to trie fallback
     end
 ```
 
 ---
 
-### Path 3: Merkle Fallback
+### Path 3: Trie Fallback
 
 A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each tree node covers all keys sharing a common bit-prefix. The client and server exchange hash+count information for subtrees, recursing only into subtrees that differ.
 
@@ -109,11 +109,11 @@ sequenceDiagram
     participant C as Client
     participant S as Server
 
-    C->>S: GetMerklePrefixInfo(Root)
+    C->>S: GetPrefixInfo(Root)
     S-->>C: (rootHash, rootCount)
 
     loop BFS over differing subtrees
-        C->>S: GetMerkleChildrenWithHashes(prefix, depth)
+        C->>S: GetChildrenWithHashes(prefix, depth)
         S-->>C: (child0Hash, child0Count, child1Hash, child1Count)
         Note over C: Enqueue children where<br/>server count > 0
         Note over C: Mark as leaf if diff ≤ 16<br/>or client count == 0
@@ -156,18 +156,18 @@ graph LR
 
 ---
 
-## Relationship Between the Setsum and the Merkle Hashes
+## Relationship Between the Setsum and the Trie Node Hashes
 
-This is a subtle but important design point. The Setsums used for fast-path peeling and the Setsums used as Merkle node hashes are **not independent** — they are the same mathematical object computed over different subsets of the data. Understanding the overlap shows both why the design is elegant and how the implementation exploits it to eliminate redundancy.
+This is a subtle but important design point. The Setsums used for fast-path peeling and the Setsums used as trie node hashes are **not independent** — they are the same mathematical object computed over different subsets of the data. Understanding the overlap shows both why the design is elegant and how the implementation exploits it to eliminate redundancy.
 
 ### They share the same hash function
 
 Every key `k` has exactly one per-item hash: `h_k = Setsum.Hash(k)`. This hash is computed once on insertion and stored in `SortedKeyStore._hashes[i]`. The same `h_k` is used for **both** purposes:
 
 - **Fast-path peeling**: `ReconcilableSet.Sum` is a computed property that reads `_store.TotalInfo().Hash`, giving the global Setsum used in round-trip 1.
-- **Merkle node hashes**: `RangeInfo(lo, hi)` returns `_prefixSums[end] - _prefixSums[start]`, which is the sum of `h_k` for all keys in that key-range — exactly a Merkle subtree hash.
+- **Trie node hashes**: `RangeInfo(lo, hi)` returns `_prefixSums[end] - _prefixSums[start]`, which is the sum of `h_k` for all keys in that key-range — exactly a trie subtree hash.
 
-A Merkle node hash is simply the global Setsum restricted to one prefix bucket. The root Merkle hash (over all keys) and the fast-path global `Sum` are the **same value** from the **same algebraic structure**.
+A trie node hash is simply the global Setsum restricted to one prefix bucket. The root trie hash (over all keys) and the fast-path global `Sum` are the **same value** from the **same algebraic structure**.
 
 ```mermaid
 graph TD
@@ -183,7 +183,7 @@ graph TD
         GS["Sum = h_0 + h_1 + ... + h_N = prefixSums[N]"]
     end
 
-    subgraph "Merkle node hash"
+    subgraph "Trie node hash"
         MN["RangeHash(start, end) = prefixSums[end] - prefixSums[start]"]
     end
 
@@ -192,9 +192,9 @@ graph TD
     PS -->|"subtraction"| MN
 ```
 
-### What this means for the Merkle tree conceptually
+### What this means for the trie conceptually
 
-Because Setsum is additive and invertible, the full Merkle trie is implicitly encoded in `_prefixSums` — no tree nodes are materialised. Any subtree hash can be recovered in O(log N) (two binary searches + one subtraction). This is the key insight that makes the design work:
+Because Setsum is additive and invertible, the full binary-prefix trie is implicitly encoded in `_prefixSums` — no tree nodes are materialised. Any subtree hash can be recovered in O(log N) (two binary searches + one subtraction). This is the key insight that makes the design work:
 
 ```mermaid
 graph LR
@@ -233,9 +233,9 @@ A traditional Merkle tree must store every internal node hash explicitly — O(N
 | Client missing ≤ 3 items | 1 | Full history peel |
 | Client missing 4–10 items | 1 | Recent history peel |
 | Client ahead by ≤ 10 items | 1 | Bulk push in a single round trip |
-| Large diff | O(log N) | Merkle BFS + 1 batch fetch |
+| Large diff | O(log N) | Binary-prefix trie BFS + 1 batch fetch |
 
-> **Leaf threshold** (`LeafThreshold = 16`) and **max depth** (`MaxPrefixDepth = 64`) are the two main tuning parameters controlling the trade-off between round-trips and data over-transfer in the Merkle path.
+> **Leaf threshold** (`LeafThreshold = 16`) and **max depth** (`MaxPrefixDepth = 64`) are the two main tuning parameters controlling the trade-off between round-trips and data over-transfer in the trie fallback path.
 
 ---
 
@@ -243,8 +243,8 @@ A traditional Merkle tree must store every internal node hash explicitly — O(N
 
 | File | Purpose |
 |---|---|
-| `ReconcilableSet.cs` | High-level set with fast-path peeling and Merkle delegation |
+| `ReconcilableSet.cs` | High-level set with fast-path peeling and trie delegation |
 | `SortedKeyStore.cs` | Flat sorted array store with O(1) range-hash via prefix sums |
-| `BitPrefix.cs` | Bit-level trie prefix for Merkle traversal |
+| `BitPrefix.cs` | Bit-level trie prefix for binary-prefix traversal |
 | `ReconcileResult.cs` | Discriminated union result type (`Identical / Found / Fallback`) |
 | `SyncSimulator.cs` | Test harness simulating two-node sync, counting round-trips |

@@ -89,8 +89,8 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
     public void Perf_LargeDiff_Fallback_SavesComputeTime()
     {
         // Diff is way beyond MaxDiffForRecentScan so fast-path should bail immediately.
-        // We want to confirm the simulator reports failure fast (before Merkle kicks in).
-        // This test deliberately stops at the fast-path stage; it doesn't exercise Merkle.
+        // We want to confirm the simulator reports failure fast (before fallback kicks in).
+        // This test deliberately stops at the fast-path stage; it doesn't exercise Trie fallback.
         var server = new ReconcilableSet();
         var client = new ReconcilableSet();
 
@@ -104,7 +104,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         for (int i = 0; i < 50_000; i++) server.Insert(RandomKey());
 
         // Use a simulator that stops after the fast-path check so we can time just that.
-        // (TrySync will go on to Merkle; we want to time TryReconcile directly.)
+        // (TrySync will go on to Trie; we want to time TryReconcile directly.)
         var sw = Stopwatch.StartNew();
         var result = server.TryReconcile(client.Sum(), client.Count());
         sw.Stop();
@@ -164,7 +164,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void Perf_LargeDiff_MerkleFallback_RecoversEfficiently()
+    public void Perf_LargeDiff_TrieFallback_RecoversEfficiently()
     {
         var server = new ReconcilableSet();
         var client = new ReconcilableSet();
@@ -193,19 +193,19 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         bool success = sim.TrySync(_output);
         sw.Stop();
 
-        Assert.True(success, "Merkle sync should succeed");
-        Assert.True(sim.UsedFallback, "Should have used Merkle fallback");
+        Assert.True(success, "Trie sync should succeed");
+        Assert.True(sim.UsedFallback, "Should have used Trie fallback");
 
         Assert.Equal(server.Count(), client.Count());
         Assert.Equal(server.Sum(), client.Sum());
 
         Assert.Equal(newItems, sim.ItemsTransferred);
 
-        _output.WriteLine($"Merkle – Trips: {sim.RoundTrips}, Hash checks: {sim.HashChecks}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+        _output.WriteLine($"Trie – Trips: {sim.RoundTrips}, Hash checks: {sim.HashChecks}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     [Fact]
-    public void Perf_MerkleSync_EmptyClient_FullTransfer()
+    public void Perf_TrieSync_EmptyClient_FullTransfer()
     {
         var server = new ReconcilableSet();
         var client = new ReconcilableSet();

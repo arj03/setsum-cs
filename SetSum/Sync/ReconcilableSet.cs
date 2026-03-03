@@ -5,7 +5,7 @@ namespace Setsum.Sync;
 /// <summary>
 /// A set of fixed-size (32-byte) keys supporting:
 ///   - Fast-path reconciliation via Setsum peeling for small diffs
-///   - Merkle trie sync for large diffs, using SortedKeyStore for O(log N) prefix queries
+///   - Binary-prefix trie sync for large diffs, using SortedKeyStore for O(log N) prefix queries
 /// </summary>
 public class ReconcilableSet
 {
@@ -91,17 +91,17 @@ public class ReconcilableSet
     public void Prepare() => _store.Prepare();
 
     // -------------------------------------------------------------------------
-    // Merkle prefix queries (delegated to SortedKeyStore)
+    // Trie prefix queries (delegated to SortedKeyStore)
     // -------------------------------------------------------------------------
 
-    public (Setsum Hash, int Count) GetMerklePrefixInfo(BitPrefix prefix)
+    public (Setsum Hash, int Count) GetPrefixInfo(BitPrefix prefix)
     {
         if (prefix.Length == 0) return _store.TotalInfo();
         var (lo, hi) = prefix.KeyRange();
         return _store.RangeInfo(lo, hi);
     }
 
-    public (BitPrefix Child0, Setsum Hash0, int Count0, BitPrefix Child1, Setsum Hash1, int Count1) GetMerkleChildrenWithHashes(BitPrefix prefix, int depth)
+    public (BitPrefix Child0, Setsum Hash0, int Count0, BitPrefix Child1, Setsum Hash1, int Count1) GetChildrenWithHashes(BitPrefix prefix, int depth)
     {
         var (lo, hi) = prefix.KeyRange();
         var (h0, c0, h1, c1) = _store.RangeInfoSplit(lo, hi, depth);

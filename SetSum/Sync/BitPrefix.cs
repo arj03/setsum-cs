@@ -1,7 +1,7 @@
 ﻿namespace Setsum.Sync;
 
 /// <summary>
-/// Represents a bit-level MSB-first prefix for Merkle trie traversal.
+/// Represents a bit-level MSB-first prefix for Binary-prefix trie traversal.
 ///
 /// Wire format (1–9 bytes, variable):
 ///   Byte 0       : Length (0–64)
