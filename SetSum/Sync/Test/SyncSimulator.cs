@@ -3,7 +3,7 @@
 namespace Setsum.Sync.Test;
 
 /// <summary>
-/// Simulates a two-node sync protocol over a network, counting round trips and items transferred.
+/// Simulates a two-node sync protocol over a network, counting round trips, items, and bytes transferred.
 ///
 /// Protocol overview:
 ///   Fast path  – The remote (server) tries to identify and return items the client is missing
@@ -19,6 +19,11 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     // Maximum prefix depth before we force a leaf transfer (64 bits = 8 bytes of the key).
     private const int MaxPrefixDepth = 64;
 
+    private const int KeySize = Setsum.DigestSize;              // 32 bytes per key
+    private const int SetsumSize = Setsum.DigestSize;           // 32 bytes per Setsum
+    private const int CountSize = sizeof(int);                  // 4 bytes per count
+    private const int PrefixSize = sizeof(ulong) + sizeof(int); // 12 bytes: bits + length
+
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }
 
@@ -31,6 +36,14 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     /// <summary>Number of prefix-hash comparisons made during Merkle traversal.</summary>
     public int HashChecks { get; private set; }
 
+    /// <summary>Bytes sent from local (client) to remote (server).</summary>
+    public int BytesSent { get; private set; }
+
+    /// <summary>Bytes received by local (client) from remote (server).</summary>
+    public int BytesReceived { get; private set; }
+
+    /// <summary>Total bytes exchanged in both directions.</summary>
+    public int TotalBytes => BytesSent + BytesReceived;
 
     private readonly ReconcilableSet _local = local;
     private readonly ReconcilableSet _remote = remote;
@@ -41,11 +54,14 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         UsedFallback = false;
         ItemsTransferred = 0;
         HashChecks = 0;
+        BytesSent = 0;
+        BytesReceived = 0;
 
         // ── Round trip 1: fast path ──────────────────────────────────────────
         // Client sends its (Sum, Count) to the server.
         // Server tries to figure out what the client is missing and returns those items.
         RoundTrips++;
+        BytesSent += SetsumSize + CountSize; // (Sum, Count)
         var remoteResult = _remote.TryReconcile(_local.Sum(), _local.Count());
 
         _output.WriteLine($"result of first reconcile: {remoteResult.Outcome}");
@@ -58,6 +74,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             case ReconcileOutcome.Found:
                 foreach (var item in remoteResult.MissingItems!)
                 {
+                    BytesReceived += KeySize;
                     // Guard against double-counting in edge cases where local somehow
                     // already has the item (shouldn't happen in clean tests).
                     if (!_local.Contains(item))
@@ -78,6 +95,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         _output.WriteLine($"result of local reconcile: {localResult.Outcome}");
         if (localResult.Outcome == ReconcileOutcome.Found)
         {
+            BytesSent += localResult.MissingItems!.Count * KeySize;
             _remote.AcceptPushedItems(localResult.MissingItems!);
             RoundTrips++;
             return true;
@@ -108,12 +126,15 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         // is discovered via parent split, never rescanned.
         var queue = new Queue<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
 
+        // Request root info: send prefix, receive (Hash, Count)
         var (rootServerHash, rootServerCount) = _remote.GetMerklePrefixInfo(BitPrefix.Root);
         var (rootClientHash, rootClientCount) = _local.GetMerklePrefixInfo(BitPrefix.Root);
         RoundTrips++;
         HashChecks++;
+        BytesSent += PrefixSize;
+        BytesReceived += SetsumSize + CountSize;
 
-        _output.WriteLine($"merkle sync: {rootServerHash} {rootServerCount}, {rootClientHash} {rootClientCount}");
+        //_output.WriteLine($"merkle sync: {rootServerHash} {rootServerCount}, {rootClientHash} {rootClientCount}");
 
         if (rootServerCount == 0) return true;
 
@@ -140,7 +161,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                     if (serverHash == clientHash) continue;
                 }
                 itemsToFetch.Add(prefix);
-                _output.WriteLine($"Found item to fetch: {prefix}");
+                //_output.WriteLine($"Found item to fetch: {prefix}");
                 continue;
             }
 
@@ -150,6 +171,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             var (_, ch0, cc0, _, ch1, cc1) = _local.GetMerkleChildrenWithHashes(prefix, depth);
 
             RoundTrips++;
+            BytesSent += PrefixSize + sizeof(int);      // prefix + depth
+            BytesReceived += 2 * (SetsumSize + CountSize);  // two (Hash, Count) pairs
 
             if (sc0 > 0) queue.Enqueue((c0, depth + 1, sh0, sc0, cc0));
             if (sc1 > 0) queue.Enqueue((c1, depth + 1, sh1, sc1, cc1));
@@ -161,6 +184,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         foreach (var prefix in itemsToFetch)
         {
             RoundTrips++;
+            BytesSent += PrefixSize; // prefix request
             _remote.CollectMissingItemsWithPrefix(prefix, _local, missingItems);
         }
 
@@ -173,6 +197,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         if (missingItems.Count > 0)
         {
             ItemsTransferred = missingItems.Count;
+            BytesReceived += missingItems.Count * KeySize;
             _local.InsertBulkPresorted(missingItems);
         }
 

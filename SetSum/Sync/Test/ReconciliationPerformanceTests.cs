@@ -48,7 +48,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         Assert.Equal(server.Count(), client.Count());
         Assert.Equal(server.Sum(), client.Sum());
 
-        _output.WriteLine($"Small Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Transferred: {sim.ItemsTransferred}");
+        _output.WriteLine($"Small Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}");
     }
 
     [Fact]
@@ -81,7 +81,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         Assert.Equal(server.Count(), client.Count());
         Assert.Equal(server.Sum(), client.Sum());
 
-        _output.WriteLine($"Medium Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Transferred: {sim.ItemsTransferred}");
+        _output.WriteLine($"Medium Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}");
         Assert.True(sw.ElapsedMilliseconds < 100);
     }
 
@@ -201,7 +201,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(newItems, sim.ItemsTransferred);
 
-        _output.WriteLine($"Merkle – Trips: {sim.RoundTrips}, Hash Checks: {sim.HashChecks}, Items Transferred: {sim.ItemsTransferred}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+        _output.WriteLine($"Merkle – Trips: {sim.RoundTrips}, Hash checks: {sim.HashChecks}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     [Fact]
@@ -226,6 +226,6 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         // Crucially this is a constant regardless of how many items the server has.
         Assert.Equal(3, sim.RoundTrips);
 
-        _output.WriteLine($"Empty Client – Trips: {sim.RoundTrips}, Transferred: {sim.ItemsTransferred}");
+        _output.WriteLine($"Empty Client – Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}");
     }
 }
