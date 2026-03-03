@@ -158,38 +158,37 @@ graph LR
 
 ## Relationship Between the Setsum and the Trie Node Hashes
 
-This is a subtle but important design point. The Setsums used for fast-path peeling and the Setsums used as trie node hashes are **not independent** — they are the same mathematical object computed over different subsets of the data. Understanding the overlap shows both why the design is elegant and how the implementation exploits it to eliminate redundancy.
+This is a subtle but important design point. The Setsums used for fast-path peeling and the Setsums used as trie node hashes are **not independent** — they are just computed over different subsets of the data.
 
-### They share the same hash function
+### Pre-computed item hashes serve both peeling and trie queries
 
-Every key `k` has exactly one per-item hash: `h_k = Setsum.Hash(k)`. This hash is computed once on insertion and stored in `SortedKeyStore._hashes[i]`. The same `h_k` is used for **both** purposes:
+Peeling works because Setsum is invertible: subtracting the client's sum from the server's sum isolates exactly the diff, and the backtracker then searches history for a combination of items whose `h_k` values sum to that diff. Every key `k` has exactly one per-item hash `h_k = Setsum.Hash(k)`, computed once on insertion and stored in two places:
 
-- **Fast-path peeling**: `ReconcilableSet.Sum` is a computed property that reads `_store.TotalInfo().Hash`, giving the global Setsum used in round-trip 1.
-- **Trie node hashes**: `RangeInfo(lo, hi)` returns `_prefixSums[end] - _prefixSums[start]`, which is the sum of `h_k` for all keys in that key-range — exactly a trie subtree hash.
+- `SortedKeyStore._hashes[i]` — used to maintain the prefix-sum table for trie node queries.
+- `ReconcilableSet._historyHashes[i]` — stored alongside the key in the circular history buffer, so the peeling backtracker can evaluate candidates without re-hashing.
 
-A trie node hash is simply the global Setsum restricted to one prefix bucket. The root trie hash (over all keys) and the fast-path global `Sum` are the **same value** from the **same algebraic structure**.
+The backtracker never touches the keys themselves, only the pre-computed hashes — so candidate evaluation is just integer addition and comparison.
 
 ```mermaid
 graph TD
-    subgraph "Per-item hash (computed once)"
-        HK["h_k = Setsum.Hash(key_k)"]
+    subgraph "Insert(key)"
+        HK["h_k = Setsum.Hash(key) — computed once"]
     end
 
-    subgraph "SortedKeyStore._prefixSums"
-        PS["prefixSums[i] = h_0 + h_1 + ... + h_(i-1)"]
+    subgraph "Fast-path peeling"
+        HH["_historyHashes[i] = h_k"]
+        PE["Backtracker sums candidate h_k values<br/>and checks against diff — no re-hashing"]
+        HH --> PE
     end
 
-    subgraph "Fast path (ReconcilableSet)"
-        GS["Sum = h_0 + h_1 + ... + h_N = prefixSums[N]"]
+    subgraph "Trie node queries"
+        PS["_prefixSums: cumulative sum of h_k values"]
+        RH["RangeHash(start, end) = prefixSums[end] - prefixSums[start]"]
+        PS --> RH
     end
 
-    subgraph "Trie node hash"
-        MN["RangeHash(start, end) = prefixSums[end] - prefixSums[start]"]
-    end
-
+    HK --> HH
     HK --> PS
-    PS -->|"prefixSums[N]"| GS
-    PS -->|"subtraction"| MN
 ```
 
 ### What this means for the trie conceptually
@@ -223,7 +222,7 @@ graph LR
     end
 ```
 
-A traditional Merkle tree must store every internal node hash explicitly — O(N) space for a balanced tree. This design stores only the leaf hashes and their prefix sums — the same O(N) space — while computing any internal node hash on demand. The trade-off is that verifying a single leaf requires two binary searches rather than a direct pointer walk, but for the sync use-case (where you always query ranges, not individual leaves) this is strictly better.
+A traditional Merkle tree must store every internal node hash explicitly and rebalance the tree as keys are inserted or deleted — both O(N) in space and non-trivial in implementation. This design stores only the leaf hashes and their prefix sums — the same O(N) space — and requires no rebalancing at all: the trie structure is defined entirely by key ordering, so inserting or deleting a key is just a sorted merge, with all subtree hashes updating implicitly via the prefix-sum array. The trade-off is that verifying a single leaf requires two binary searches rather than a direct pointer walk, but for the sync use-case (where you always query ranges, not individual leaves) this is strictly better.
 
 ## Complexity Summary
 
