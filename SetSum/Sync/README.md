@@ -24,7 +24,7 @@ A `Setsum` is a commutative, invertible hash over a set of items. Its key proper
 - **Invertible**: `sum(A) - sum(B) = sum(A \ B)` when B ⊆ A
 - **Order-independent**: inserting items in any order gives the same sum
 
-This allows the server to compute what a client is missing by subtraction alone, without scanning the entire dataset — as long as the diff is small enough to "peel" apart.
+This allows the server to compute what a client is missing by subtraction alone — and at trie leaves, to identify the single missing item with one linear scan rather than a key exchange.
 
 ---
 
@@ -82,7 +82,7 @@ sequenceDiagram
 
 ### Path 3: Trie Fallback
 
-A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each tree node covers all keys sharing a common bit-prefix. The client and server exchange hash+count information for subtrees, recursing only into subtrees that differ.
+A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each trie node covers all keys sharing a common bit-prefix. The client and server exchange `(Hash, Count)` for subtrees, recursing only into subtrees that differ, until each differing subtree contains exactly one missing item.
 
 ```mermaid
 flowchart TD
@@ -93,16 +93,21 @@ flowchart TD
     C --> F["Prefix 10"]
     C --> G["Prefix 11"]
     D --> H["..."]
-    E --> I["Leaf: transfer items"]
+    E --> I["Leaf: Setsum lookup"]
     F --> J["Hashes match — skip ✓"]
     G --> K["..."]
 ```
 
-The traversal uses a breadth-first search (BFS) queue. For each node the server provides `(Hash, Count)` for both children in a single call. Two optimisations short-circuit expensive subtrees:
+#### BFS traversal
 
-- **Count-aware short-circuit**: if the client count is 0 and the server count is N, skip the hash check and go straight to fetching items.
-- **Leaf threshold**: if `serverCount - clientCount ≤ 16`, treat the node as a leaf and schedule a direct item transfer rather than recursing further.
-- **Batched leaf transfers**: all leaf prefixes are collected during the BFS, then fetched in a single batch — collapsing O(leaves) round-trips into one.
+The BFS processes one full depth level per round trip (level-batched). For each node, the server returns `(Hash, Count)` for both children. Children are enqueued only if the server and client hashes differ — identical subtrees are skipped immediately.
+
+A node becomes a leaf when:
+- `clientCount == 0` — client has nothing here; server sends all its items directly, or
+- `missingCount == 1` — exactly one item is missing; resolved with a Setsum lookup (see below), or
+- `prefix.Length >= MaxPrefixDepth` — maximum trie depth reached.
+
+All leaf resolutions are batched into a single final round trip.
 
 ```mermaid
 sequenceDiagram
@@ -112,28 +117,40 @@ sequenceDiagram
     C->>S: GetPrefixInfo(Root)
     S-->>C: (rootHash, rootCount)
 
-    loop BFS over differing subtrees
-        C->>S: GetChildrenWithHashes(prefix, depth)
-        S-->>C: (child0Hash, child0Count, child1Hash, child1Count)
-        Note over C: Enqueue children where<br/>server count > 0
-        Note over C: Mark as leaf if diff ≤ 16<br/>or client count == 0
+    loop BFS — one round trip per depth level
+        C->>S: GetChildrenWithHashes(prefix1, prefix2, ...) [batched]
+        S-->>C: (hash0, count0, hash1, count1) per prefix
+        Note over C: Skip children where hashes match
+        Note over C: Mark as leaf if clientCount==0<br/>or missingCount==1
     end
 
-    Note over C: Batch all leaf prefixes
-    loop For each leaf prefix
-        C->>S: CollectMissingItemsWithPrefix(prefix)
-        S-->>C: [items in this prefix range]
+    Note over C: One final round trip for all leaves
+    loop For each leaf prefix [batched]
+        C->>S: (prefixSum, prefixCount)
+        Note over S: diff = serverSum - clientSum<br/>scan items: find key where Hash(key) == diff
+        S-->>C: [the one missing item]
     end
 
-    C->>C: Sort all received items
-    C->>C: InsertBulkPresorted(items)
+    C->>C: Sort and insert received items
 ```
+
+#### Leaf resolution via Setsum
+
+At each leaf the client sends only `(prefixSum, prefixCount)` — 36 bytes. The server computes:
+
+```
+diff = serverPrefixSum - clientPrefixSum
+```
+
+Since `missingCount == 1`, `diff` equals exactly one item's hash. The server does one linear scan over its items under that prefix and returns the key whose hash matches `diff`. No key list is exchanged in either direction — only the 36-byte summary goes up and the 32-byte answer comes back.
+
+For `clientCount == 0` the server simply returns all its items under the prefix directly, since there is no client sum to subtract from.
 
 ---
 
 ## Storage: `SortedKeyStore`
 
-Keys are stored in a flat `byte[]` array sorted by lexicographic key order. A `Setsum[]` array holds the corresponding hash for each key, enabling O(1) range-hash queries via prefix sums.
+Keys are stored in a flat `byte[]` array sorted by lexicographic key order. A `Setsum[]` array holds the corresponding hash for each key, enabling O(log N) range-hash queries via prefix sums.
 
 ```mermaid
 graph LR
@@ -156,18 +173,19 @@ graph LR
 
 ---
 
-## Relationship Between the Setsum and the Trie Node Hashes
+## Why Setsum Works for Trie Leaves
 
-This is a subtle but important design point. The Setsums used for fast-path peeling and the Setsums used as trie node hashes are **not independent** — they are just computed over different subsets of the data.
+The Setsums used for fast-path peeling and the Setsums used as trie node hashes are **not independent** — they are just computed over different subsets of the data.
 
-### Pre-computed item hashes serve both peeling and trie queries
+Every key `k` has exactly one per-item hash `h_k = Setsum.Hash(k)`, computed once on insertion. The trie node hash for any prefix is simply the sum of `h_k` over all keys under that prefix — recoverable in O(log N) from the prefix-sum array.
 
-Peeling works because Setsum is invertible: subtracting the client's sum from the server's sum isolates exactly the diff, and the backtracker then searches history for a combination of items whose `h_k` values sum to that diff. Every key `k` has exactly one per-item hash `h_k = Setsum.Hash(k)`, computed once on insertion and stored in two places:
+At a trie leaf where `missingCount == 1`:
 
-- `SortedKeyStore._hashes[i]` — used to maintain the prefix-sum table for trie node queries.
-- `ReconcilableSet._historyHashes[i]` — stored alongside the key in the circular history buffer, so the peeling backtracker can evaluate candidates without re-hashing.
+```
+diff = serverPrefixSum - clientPrefixSum = h_missing
+```
 
-The backtracker never touches the keys themselves, only the pre-computed hashes — so candidate evaluation is just integer addition and comparison.
+The missing item's hash is isolated exactly. The server scans its prefix items and finds the key whose `Setsum.Hash(key) == diff` — no guessing, no backtracking, one pass.
 
 ```mermaid
 graph TD
@@ -177,23 +195,24 @@ graph TD
 
     subgraph "Fast-path peeling"
         HH["_historyHashes[i] = h_k"]
-        PE["Backtracker sums candidate h_k values<br/>and checks against diff — no re-hashing"]
+        PE["Backtracker sums candidate h_k values<br/>and checks against diff"]
         HH --> PE
     end
 
-    subgraph "Trie node queries"
+    subgraph "Trie leaf resolution"
         PS["_prefixSums: cumulative sum of h_k values"]
-        RH["RangeHash(start, end) = prefixSums[end] - prefixSums[start]"]
-        PS --> RH
+        RH["diff = serverPrefixSum - clientPrefixSum = h_missing"]
+        SC["Linear scan: find key where Hash(key) == diff"]
+        PS --> RH --> SC
     end
 
     HK --> HH
     HK --> PS
 ```
 
-### What this means for the trie conceptually
+### Implicit trie from a flat array
 
-Because Setsum is additive and invertible, the full binary-prefix trie is implicitly encoded in `_prefixSums` — no tree nodes are materialised. Any subtree hash can be recovered in O(log N) (two binary searches + one subtraction). This is the key insight that makes the design work:
+Because Setsum is additive and invertible, the full binary-prefix trie is implicitly encoded in `_prefixSums` — no tree nodes are materialised. Any subtree hash is recovered in O(log N) via two binary searches and one subtraction:
 
 ```mermaid
 graph LR
@@ -202,7 +221,7 @@ graph LR
         R2["Root hash h(h01, h23)"]
         N01["h(h0, h1)"]
         N23["h(h2, h3)"]
-        L0["h0"] 
+        L0["h0"]
         L1["h1"]
         L2["h2"]
         L3["h3"]
@@ -217,24 +236,28 @@ graph LR
     subgraph "This implementation"
         direction TB
         PA["prefixSums array [0, h0, h0+h1, h0+h1+h2, h0+h1+h2+h3]"]
-        Q1["Any node hash = prefixSums[end] - prefixSums[start] O(log N) with binary search"]
+        Q1["Any node hash = prefixSums[end] - prefixSums[start]  O(log N) with binary search"]
         PA --> Q1
     end
 ```
 
-A traditional Merkle tree must store every internal node hash explicitly and rebalance the tree as keys are inserted or deleted — both O(N) in space and non-trivial in implementation. This design stores only the leaf hashes and their prefix sums — the same O(N) space — and requires no rebalancing at all: the trie structure is defined entirely by key ordering, so inserting or deleting a key is just a sorted merge, with all subtree hashes updating implicitly via the prefix-sum array. The trade-off is that verifying a single leaf requires two binary searches rather than a direct pointer walk, but for the sync use-case (where you always query ranges, not individual leaves) this is strictly better.
+A traditional Merkle tree must store every internal node hash explicitly and rebalance on insert or delete. This design stores only the leaf hashes and their prefix sums — the same O(N) space — with no rebalancing: the trie structure is defined entirely by key ordering, so insertions are sorted merges and all subtree hashes update implicitly.
+
+---
 
 ## Complexity Summary
 
-| Scenario | Round Trips | Notes |
-|---|---|---|
-| Sets are identical | 1 | Setsum comparison |
-| Client missing ≤ 3 items | 1 | Full history peel |
-| Client missing 4–10 items | 1 | Recent history peel |
-| Client ahead by ≤ 10 items | 1 | Bulk push in a single round trip |
-| Large diff | O(log N) | Binary-prefix trie BFS + 1 batch fetch |
+| Scenario | Round Trips | Bytes | Notes |
+|---|---|---|---|
+| Sets are identical | 1 | 36 | Setsum comparison |
+| Client missing ≤ 3 items | 1 | ~100 | Full history peel |
+| Client missing 4–10 items | 1 | ~350 | Recent history peel |
+| Client ahead by ≤ 10 items | 1 | ~350 | Bulk push |
+| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) × 72 + D × 68) | Trie BFS + Setsum leaf lookup |
 
-> **Leaf threshold** (`LeafThreshold = 16`) and **max depth** (`MaxPrefixDepth = 64`) are the two main tuning parameters controlling the trade-off between round-trips and data over-transfer in the trie fallback path.
+For the typical case of D=1,000 missing items in N=1,000,000 total: ~20 round trips and ~180KB transferred, vs 32KB of actual data. The overhead is the BFS traversal cost — irreducible for any protocol that must locate D differences in an N-item set.
+
+> **`LeafThreshold = 1`** — the BFS descends until exactly one item is missing per prefix, then uses a 36-byte Setsum exchange to identify it. **`MaxPrefixDepth = 64`** caps descent at 64 bits.
 
 ---
 
@@ -242,8 +265,8 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 
 | File | Purpose |
 |---|---|
-| `ReconcilableSet.cs` | High-level set with fast-path peeling and trie delegation |
-| `SortedKeyStore.cs` | Flat sorted array store with O(1) range-hash via prefix sums |
+| `ReconcilableSet.cs` | High-level set with fast-path peeling, trie delegation, and leaf resolution |
+| `SortedKeyStore.cs` | Flat sorted array store with O(log N) range-hash via prefix sums |
 | `BitPrefix.cs` | Bit-level trie prefix for binary-prefix traversal |
 | `ReconcileResult.cs` | Discriminated union result type (`Identical / Found / Fallback`) |
-| `SyncSimulator.cs` | Test harness simulating two-node sync, counting round-trips |
+| `SyncSimulator.cs` | Test harness simulating two-node sync, counting round-trips and bytes |
