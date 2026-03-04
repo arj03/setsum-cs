@@ -177,7 +177,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
             client.Insert(k);
         }
 
-        int newItems = 1_000;
+        int newItems = 10_000;
         for (int i = 0; i < newItems; i++) server.Insert(RandomKey());
 
         // Pay the sort + prefix-sum cost now, before the timed sync window.

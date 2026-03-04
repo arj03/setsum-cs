@@ -139,19 +139,16 @@ public class ReconcilableSet
     /// - missingCount == 1: server does one linear scan; the missing item's hash == diff.
     /// - missingCount > 1: returns Fallback (caller should have descended further).
     /// </summary>
-    public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum clientPrefixSum, int clientPrefixCount)
+    public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum clientPrefixSum)
     {
-        var (serverPrefixSum, serverPrefixCount) = GetPrefixInfo(prefix);
+        var (serverPrefixSum, _) = GetPrefixInfo(prefix);
         if (serverPrefixSum == clientPrefixSum) return ReconcileResult.Identical();
 
-        int missingCount = serverPrefixCount - clientPrefixCount;
-        if (missingCount <= 0) return ReconcileResult.Fallback();
-
-        // clientCount == 0: no sum to diff against, just send everything.
-        if (clientPrefixCount == 0)
+        // clientPrefixSum == Zero means the client has nothing here — send everything.
+        if (clientPrefixSum.IsEmpty())
             return ReconcileResult.Found(GetItemsWithPrefix(prefix).ToList());
 
-        // missingCount == 1: the single missing item's hash equals diff exactly.
+        // Otherwise missingCount == 1: diff is the single missing item's hash.
         var diff = serverPrefixSum - clientPrefixSum;
         foreach (var key in GetItemsWithPrefix(prefix))
             if (Setsum.Hash(key) == diff)
@@ -159,7 +156,6 @@ public class ReconcilableSet
 
         return ReconcileResult.Fallback();
     }
-
 
     // -------------------------------------------------------------------------
     // Fast-path reconciliation

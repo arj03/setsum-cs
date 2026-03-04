@@ -136,13 +136,13 @@ sequenceDiagram
 
 #### Leaf resolution via Setsum
 
-At each leaf the client sends only `(prefixSum, prefixCount)` — 36 bytes. The server computes:
+At each leaf the client sends only `prefixSum` — 32 bytes. The server computes:
 
 ```
 diff = serverPrefixSum - clientPrefixSum
 ```
 
-Since `missingCount == 1`, `diff` equals exactly one item's hash. The server does one linear scan over its items under that prefix and returns the key whose hash matches `diff`. No key list is exchanged in either direction — only the 36-byte summary goes up and the 32-byte answer comes back.
+Since `missingCount == 1`, `diff` equals exactly one item's hash. The server does one linear scan over its items under that prefix and returns the key whose hash matches `diff`. No key list is exchanged in either direction — only the 32-byte summary goes up and the 32-byte answer comes back.
 
 For `clientCount == 0` the server simply returns all its items under the prefix directly, since there is no client sum to subtract from.
 
@@ -249,15 +249,13 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 
 | Scenario | Round Trips | Bytes | Notes |
 |---|---|---|---|
-| Sets are identical | 1 | 36 | Setsum comparison |
+| Sets are identical | 1 | 32 | Setsum comparison |
 | Client missing ≤ 3 items | 1 | ~100 | Full history peel |
 | Client missing 4–10 items | 1 | ~350 | Recent history peel |
 | Client ahead by ≤ 10 items | 1 | ~350 | Bulk push |
-| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) × 72 + D × 68) | Trie BFS + Setsum leaf lookup |
+| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) × 64 + D × 68) | Trie BFS + Setsum leaf lookup |
 
 For the typical case of D=1,000 missing items in N=1,000,000 total: ~20 round trips and ~180KB transferred, vs 32KB of actual data. The overhead is the BFS traversal cost — irreducible for any protocol that must locate D differences in an N-item set.
-
-> **`LeafThreshold = 1`** — the BFS descends until exactly one item is missing per prefix, then uses a 36-byte Setsum exchange to identify it. **`MaxPrefixDepth = 64`** caps descent at 64 bits.
 
 ---
 

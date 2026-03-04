@@ -15,8 +15,8 @@ namespace Setsum.Sync.Test;
 ///   1. Level-batched BFS  — All nodes at the same BFS depth are queried in one round trip,
 ///      reducing traversal cost from O(nodes) trips to O(depth) trips.
 ///   2. Prefix Setsum peeling at leaves — Instead of uploading all client keys under a
-///      leaf prefix (O(N/leaves) bytes), the client sends only (PrefixSum, PrefixCount)
-///      (36 bytes). The server peels the exact missing items from its data under that prefix.
+///      leaf prefix (O(N/leaves) bytes), the client sends only PrefixSum (32 bytes). 
+///      The server peels the exact missing items from its data under that prefix.
 ///      Falls back to key-list exchange only when clientCount == 0 (nothing to peel from).
 /// </summary>
 public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
@@ -115,14 +115,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     /// BFS descends until missingCount == 1 per prefix (LeafThreshold=1), pruning
     /// identical subtrees via hash comparison. All nodes at the same depth are
     /// queried in one batched round trip — O(depth) trips total.
-    ///
-    /// At each leaf the client sends (prefixSum, prefixCount) — 36 bytes. The server
-    /// does one linear scan: the missing item's hash equals diff = serverSum - clientSum.
-    /// All leaf requests are batched into a single final round trip.
-    ///
-    /// Total bytes: O(D × 72) for BFS + O(missing × 68) for leaves, where D is the
-    /// number of trie nodes on differing paths (~1000 × log2(N/missing) / 2).
-    /// For N=1M, missing=1000: ~150KB theoretical minimum, ~180KB in practice.
     /// </summary>
     private bool PerformTrieSync(ITestOutputHelper _output)
     {
@@ -203,10 +195,10 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             RoundTrips++;
             foreach (var prefix in prefixesToSync)
             {
-                var (clientPrefixSum, clientPrefixCount) = _local.GetPrefixInfo(prefix);
-                BytesSent += prefix.NetworkSize + SetsumSize + CountSize;
+                var (clientPrefixSum, _) = _local.GetPrefixInfo(prefix);
+                BytesSent += prefix.NetworkSize + SetsumSize;
 
-                var result = _remote.TryReconcilePrefix(prefix, clientPrefixSum, clientPrefixCount);
+                var result = _remote.TryReconcilePrefix(prefix, clientPrefixSum);
                 if (result.Outcome == ReconcileOutcome.Found)
                 {
                     BytesReceived += result.MissingItems!.Count * KeySize;
