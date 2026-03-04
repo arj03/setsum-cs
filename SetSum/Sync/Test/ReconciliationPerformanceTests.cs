@@ -173,7 +173,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(newItems, sim.ItemsTransferred);
 
-        _output.WriteLine($"Trie – Trips: {sim.RoundTrips}, Hash checks: {sim.HashChecks}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+        _output.WriteLine($"Trie – Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     [Fact]

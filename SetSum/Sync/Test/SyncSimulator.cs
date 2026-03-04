@@ -41,9 +41,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     /// </summary>
     public int ItemsTransferred { get; private set; }
 
-    /// <summary>Number of prefix-hash comparisons made during trie traversal.</summary>
-    public int HashChecks { get; private set; }
-
     /// <summary>Bytes sent from local (client) to remote (server).</summary>
     public int BytesSent { get; private set; }
 
@@ -61,7 +58,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         RoundTrips = 0;
         UsedFallback = false;
         ItemsTransferred = 0;
-        HashChecks = 0;
         BytesSent = 0;
         BytesReceived = 0;
 
@@ -120,7 +116,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         var (rootServerHash, rootServerCount) = _remote.GetPrefixInfo(BitPrefix.Root);
         var (rootClientHash, rootClientCount) = _local.GetPrefixInfo(BitPrefix.Root);
         RoundTrips++;
-        HashChecks++;
         BytesSent += BitPrefix.Root.NetworkSize;
         BytesReceived += SetsumSize + CountSize;
 
@@ -142,7 +137,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 {
                     if (missingCount == 0)
                     {
-                        HashChecks++;
                         var (clientHash, _) = _local.GetPrefixInfo(prefix);
                         if (serverHash == clientHash) continue;
                     }
