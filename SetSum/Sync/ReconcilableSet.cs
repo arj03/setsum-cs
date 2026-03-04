@@ -134,11 +134,10 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Server-side leaf resolution via Setsum peeling.
-    /// Client sends (prefixSum, prefixCount) — 36 bytes.
-    /// Server computes diff = serverSum - clientSum, then scans its prefix items once:
-    /// any item whose hash equals diff (for k=1) is the missing item.
-    /// For k>1 the BFS should have descended further — returns Fallback.
+    /// Server-side leaf resolution.
+    /// - clientCount == 0: server returns all its items under the prefix directly.
+    /// - missingCount == 1: server does one linear scan; the missing item's hash == diff.
+    /// - missingCount > 1: returns Fallback (caller should have descended further).
     /// </summary>
     public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum clientPrefixSum, int clientPrefixCount)
     {
@@ -148,20 +147,19 @@ public class ReconcilableSet
         int missingCount = serverPrefixCount - clientPrefixCount;
         if (missingCount <= 0) return ReconcileResult.Fallback();
 
+        // clientCount == 0: no sum to diff against, just send everything.
+        if (clientPrefixCount == 0)
+            return ReconcileResult.Found(GetItemsWithPrefix(prefix).ToList());
+
+        // missingCount == 1: the single missing item's hash equals diff exactly.
         var diff = serverPrefixSum - clientPrefixSum;
+        foreach (var key in GetItemsWithPrefix(prefix))
+            if (Setsum.Hash(key) == diff)
+                return ReconcileResult.Found(new List<byte[]> { key });
 
-        if (missingCount == 1)
-        {
-            // Single linear scan: the one missing item's hash must equal diff exactly.
-            foreach (var key in GetItemsWithPrefix(prefix))
-                if (Setsum.Hash(key) == diff)
-                    return ReconcileResult.Found(new List<byte[]> { key });
-            return ReconcileResult.Fallback();
-        }
-
-        // missingCount > 1: caller should have descended deeper.
         return ReconcileResult.Fallback();
     }
+
 
     // -------------------------------------------------------------------------
     // Fast-path reconciliation

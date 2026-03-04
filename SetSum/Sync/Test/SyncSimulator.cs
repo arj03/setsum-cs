@@ -110,18 +110,19 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     }
 
     /// <summary>
-    /// Binary-prefix trie sync with three optimisations:
+    /// Binary-prefix trie sync.
     ///
-    ///   1. Count-aware short-circuit — if client count is 0, skip hash check and fetch
-    ///      directly. If counts and hashes match, skip the subtree entirely.
+    /// BFS descends until missingCount == 1 per prefix (LeafThreshold=1), pruning
+    /// identical subtrees via hash comparison. All nodes at the same depth are
+    /// queried in one batched round trip — O(depth) trips total.
     ///
-    ///   2. Level-batched BFS — all nodes at the same depth are sent to the server in one
-    ///      round trip. Reduces traversal from O(nodes) trips down to O(depth) trips.
+    /// At each leaf the client sends (prefixSum, prefixCount) — 36 bytes. The server
+    /// does one linear scan: the missing item's hash equals diff = serverSum - clientSum.
+    /// All leaf requests are batched into a single final round trip.
     ///
-    ///   3. Prefix Setsum peeling at leaves — client sends (PrefixSum, PrefixCount) per
-    ///      leaf (36 bytes) instead of uploading all its keys (~11k × 32 bytes). Server
-    ///      peels the exact missing items. All peel requests are batched into one trip.
-    ///      Falls back to key-list exchange per leaf only when peeling fails.
+    /// Total bytes: O(D × 72) for BFS + O(missing × 68) for leaves, where D is the
+    /// number of trie nodes on differing paths (~1000 × log2(N/missing) / 2).
+    /// For N=1M, missing=1000: ~150KB theoretical minimum, ~180KB in practice.
     /// </summary>
     private bool PerformTrieSync(ITestOutputHelper _output)
     {
@@ -210,17 +211,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 {
                     BytesReceived += result.MissingItems!.Count * KeySize;
                     missingItems.AddRange(result.MissingItems!);
-                }
-                else if (result.Outcome == ReconcileOutcome.Fallback)
-                {
-                    _output.WriteLine("doing a fallback getting all items");
-                    // clientCount==0 case or peeling failed: server sends all items.
-                    BytesSent += prefix.NetworkSize;
-                    var serverItems = _remote.GetItemsWithPrefix(prefix).ToList();
-                    BytesReceived += serverItems.Count * KeySize;
-                    foreach (var item in serverItems)
-                        if (!_local.Contains(item))
-                            missingItems.Add(item);
                 }
             }
         }
