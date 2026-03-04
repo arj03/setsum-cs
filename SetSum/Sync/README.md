@@ -100,8 +100,8 @@ sequenceDiagram
 
     loop BFS — one round trip per depth level
         C->>S: GetChildrenCounts(prefix1, prefix2, ...) [batched]
-        S-->>C: (count0, count1) per prefix
-        Note over C: Skip children where serverCount == clientCount
+        S-->>C: (serverCount0, serverCount1) per prefix
+        Note over C: Fetch clientCount0, clientCount1 locally<br/>Skip children where serverCount == clientCount
         Note over C: Mark as leaf if clientCount==0<br/>or missingCount<=2
     end
 
@@ -162,7 +162,7 @@ graph LR
 
 ## Why Setsum Works for Trie Leaves
 
-The Setsums used for fast-path peeling and the Setsums used as trie node hashes are **not independent** — they are just computed over different subsets of the data.
+The Setsums used for fast-path peeling and the Setsums used at trie leaves for `missingCount <= 2` resolution are **not independent** — they are just computed over different subsets of the data. During BFS traversal no hashes are exchanged at all; Setsums only appear at leaves where the client sends its `prefixSum` for the server to peel against.
 
 Every key `k` has exactly one per-item hash `h_k = Setsum.Hash(k)`, computed once on insertion. The trie node hash for any prefix is simply the sum of `h_k` over all keys under that prefix — recoverable in O(log N) from the prefix-sum array.
 
@@ -207,7 +207,9 @@ graph TD
 
 ### Implicit trie from a flat array
 
-Because Setsum is additive and invertible, the full binary-prefix trie is implicitly encoded in `_prefixSums` — no tree nodes are materialised. Any subtree hash is recovered in O(log N) via two binary searches and one subtraction:
+Because Setsum is additive and invertible, the full binary-prefix trie is implicitly encoded in `_prefixSums` — no tree nodes are materialised. Any subtree hash is recovered in O(log N) via two binary searches to find the range boundaries, and one O(1) subtraction `prefixSums[end] - prefixSums[start]`.
+
+This is only needed at leaves: during BFS traversal counts alone drive the descent, so no subtree hashes are exchanged at all. Hashes only appear at leaves where the client sends its `prefixSum` and the server computes `serverPrefixSum` for that prefix to peel against.
 
 ```mermaid
 graph LR
