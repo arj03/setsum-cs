@@ -139,21 +139,10 @@ public class ReconcilableSet
 
     /// <summary>
     /// Server-side leaf resolution.
-    /// <list type="bullet">
-    ///   <item><description>
-    ///     <c>clientPrefixSum == Zero</c>: client has nothing here — server returns all items directly.
-    ///   </description></item>
-    ///   <item><description>
-    ///     <c>missingCount == 1</c>: linear scan over stored hashes in-place — no key copies until match found.
-    ///   </description></item>
-    ///   <item><description>
-    ///     <c>missingCount == 2</c> and server has ≤ <c>MaxServerCountForPairPeel</c> items:
-    ///     O(n²) scan over stored hashes in-place — no key copies until match found.
-    ///   </description></item>
-    ///   <item><description>
-    ///     Otherwise returns <c>Fallback</c> (caller should have descended further).
-    ///   </description></item>
-    /// </list>
+    /// - clientPrefixSum == 0: client has nothing here; server returns all items directly.
+    /// - missingCount == 1: linear scan over stored hashes; no key copies until match found.
+    /// - missingCount == 2: O(n²) pair scan, only when server prefix has at most MaxServerCountForPairPeel items.
+    /// - Otherwise: returns Fallback; caller should descend further before retrying.
     /// </summary>
     public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum clientPrefixSum)
     {
@@ -166,8 +155,6 @@ public class ReconcilableSet
 
         var diff = serverPrefixSum - clientPrefixSum;
 
-        // Delegate the scan entirely to SortedKeyStore so it can walk _hashes[] directly
-        // without materialising any key copies until a match is confirmed.
         var (lo, hi) = prefix.KeyRange();
         var found = _store.TryPeelRange(lo, hi, diff, MaxServerCountForPairPeel);
 
