@@ -196,13 +196,16 @@ public class ReconcilableSet
 
     private void InsertSortedArray(byte[][] keys)
     {
-        var hashes = new Setsum[keys.Length];
-        for (int i = 0; i < keys.Length; i++)
+        int n = keys.Length;
+        var flat = new byte[n * Setsum.DigestSize];
+        var hashes = new Setsum[n];
+        for (int i = 0; i < n; i++)
         {
             hashes[i] = Setsum.Hash(keys[i]);
             RecordHistory(keys[i], hashes[i]);
+            keys[i].CopyTo(flat, i * Setsum.DigestSize);
         }
-        _store.MergeSorted(keys, hashes, keys.Length);
+        _store.MergeSorted(flat, hashes, n);
     }
 
     private bool SolveRecursive(Setsum target, int k, int maxOffset, List<byte[]> result,

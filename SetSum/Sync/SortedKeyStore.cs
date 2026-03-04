@@ -1,16 +1,15 @@
 ﻿namespace Setsum.Sync;
 
 /// <summary>
-/// A sorted store of fixed-size (32-byte) keys with O(1) range-hash queries via prefix sums.
+/// A sorted store of fixed-size (32-byte) keys with O(log N) range-hash queries via prefix sums.
 ///
 /// Layout: keys in a flat byte[] (_data), hashes in a parallel Setsum[] (_hashes).
 /// Both arrays are indexed the same way: record i has key at _data[i*32..(i+1)*32]
 /// and hash at _hashes[i].
 ///
-/// Sorting uses a two-pass LSB radix sort on bytes 0–1 of the key, producing a
-/// permutation in _scratch (int[]) that is applied in one gather pass to both arrays.
-/// This gives O(N) sort with sequential memory access during the counting passes —
-/// the dominant cost over Array.Sort's O(N log N) with random cache misses.
+/// Sorting uses a two-pass LSB radix sort on bytes 0–1 of the key, followed by an
+/// insertion sort within same-prefix buckets. This gives O(N) sort with sequential
+/// memory access — the dominant cost over Array.Sort's O(N log N) with random cache misses.
 /// </summary>
 public class SortedKeyStore
 {
@@ -25,13 +24,13 @@ public class SortedKeyStore
     private Setsum[] _prefixSums = new Setsum[17];
     private bool _prefixSumsDirty = true;
 
-    // Pending unsorted additions
+    // Pending unsorted additions, flushed lazily on next query
     private byte[] _pending = new byte[16 * KeySize];
     private Setsum[] _pendingHashes = new Setsum[16];
     private int _pendingCount;
 
-    // Reusable scratch buffers — never reallocated unless they need to grow
-    private byte[] _scratchData = new byte[16 * KeySize];
+    // Reusable scratch buffers — contents never preserved across calls
+    private byte[] _scratch = new byte[16 * KeySize];
     private Setsum[] _scratchHashes = new Setsum[16];
 
     private readonly int[] _counts = new int[256];
@@ -57,69 +56,61 @@ public class SortedKeyStore
     {
         if (_pendingCount * KeySize >= _pending.Length)
         {
-            GrowFlat(ref _pending, _pendingCount);
-            Grow(ref _pendingHashes, _pendingCount);
+            GrowPreserving(ref _pending, _pendingCount * KeySize);
+            GrowPreserving(ref _pendingHashes, _pendingCount);
         }
         key.CopyTo(_pending, _pendingCount * KeySize);
         _pendingHashes[_pendingCount++] = hash;
-        _prefixSumsDirty = true;
-    }
-
-    public void Prepare()
-    {
-        EnsureSorted();
-        EnsurePrefixSums();
     }
 
     /// <summary>
-    /// Merges a pre-sorted flat key buffer + hash array into the store.
+    /// Flushes pending items and rebuilds the prefix sum table.
+    /// Call before any range query to amortise sort cost.
+    /// </summary>
+    public void Prepare()
+    {
+        EnsureSorted();
+        RebuildPrefixSums();
+    }
+
+    /// <summary>
+    /// Merges a pre-sorted flat key+hash buffer into the store.
     /// </summary>
     public void MergeSorted(byte[] keys, Setsum[] hashes, int newCount)
     {
         int total = _count + newCount;
-        GrowFlatTo(ref _scratchData, total * KeySize);
-        GrowTo(ref _scratchHashes, total);
+        GrowScratch(ref _scratch, total * KeySize);
+        GrowScratch(ref _scratchHashes, total);
 
         int i = 0, j = 0, k = 0;
         while (i < _count && j < newCount)
         {
             if (KeyAt(_data, i).SequenceCompareTo(KeyAt(keys, j)) <= 0)
             {
-                CopyKey(_data, i, _scratchData, k);
+                CopyKey(_data, i, _scratch, k);
                 _scratchHashes[k++] = _hashes[i++];
             }
             else
             {
-                CopyKey(keys, j, _scratchData, k);
+                CopyKey(keys, j, _scratch, k);
                 _scratchHashes[k++] = hashes[j++];
             }
         }
         while (i < _count)
         {
-            CopyKey(_data, i, _scratchData, k);
+            CopyKey(_data, i, _scratch, k);
             _scratchHashes[k++] = _hashes[i++];
         }
         while (j < newCount)
         {
-            CopyKey(keys, j, _scratchData, k);
+            CopyKey(keys, j, _scratch, k);
             _scratchHashes[k++] = hashes[j++];
         }
 
-        (_data, _scratchData) = (_scratchData, _data);
+        (_data, _scratch) = (_scratch, _data);
         (_hashes, _scratchHashes) = (_scratchHashes, _hashes);
         _count = total;
         _prefixSumsDirty = true;
-    }
-
-    /// <summary>
-    /// Overload for callers with jagged byte[][] keys.
-    /// </summary>
-    public void MergeSorted(byte[][] keys, Setsum[] hashes, int newCount)
-    {
-        var flat = new byte[newCount * KeySize];
-        for (int i = 0; i < newCount; i++)
-            keys[i].CopyTo(flat, i * KeySize);
-        MergeSorted(flat, hashes, newCount);
     }
 
     public (Setsum Hash, int Count) RangeInfo(byte[] lo, byte[] hi)
@@ -135,8 +126,6 @@ public class SortedKeyStore
 
     /// <summary>
     /// Returns the hash and count for the entire store.
-    /// Hash == _prefixSums[_count] == the global Setsum over all items.
-    /// This is the single source of truth consumed by ReconcilableSet.Sum.
     /// </summary>
     public (Setsum Hash, int Count) TotalInfo()
     {
@@ -164,18 +153,23 @@ public class SortedKeyStore
         EnsureSorted();
 
         int start = LowerBound(lo), end = UpperBound(hi);
-        for (int i = start; i < end; ++i)
+        for (int i = start; i < end; i++)
+            yield return KeyAt(_data, i).ToArray();
+    }
+
+    public IEnumerable<byte[]> All()
+    {
+        EnsureSorted();
+        for (int i = 0; i < _count; i++)
             yield return KeyAt(_data, i).ToArray();
     }
 
     /// <summary>
-    /// Scans the range [lo, hi) for items whose stored hashes peel against <paramref name="diff"/>,
+    /// Scans the range [lo, hi) for items whose stored hashes peel against diff,
     /// without allocating any key copies until a match is confirmed.
-    ///
-    /// missingCount == 1: returns the single key whose hash == diff.
-    /// missingCount == 2: returns the pair (i, j) where hash[i] ^ hash[j] == diff,
-    ///                    but only when the range has ≤ maxCountForPairPeel items.
-    /// Returns null if no match is found or the range is too large for pair peeling.
+    /// - missingCount == 1: returns the single key whose hash == diff.
+    /// - missingCount == 2: tries all O(n²) pairs, only when range has ≤ maxCountForPairPeel items.
+    /// Returns null if no match found or range too large for pair peeling.
     /// </summary>
     public List<byte[]>? TryPeelRange(byte[] lo, byte[] hi, Setsum diff, int maxCountForPairPeel)
     {
@@ -196,26 +190,12 @@ public class SortedKeyStore
             {
                 var remaining = diff - _hashes[i];
                 for (int j = i + 1; j < end; j++)
-                {
                     if (_hashes[j] == remaining)
-                        return
-                        [
-                            KeyAt(_data, i).ToArray(),
-                            KeyAt(_data, j).ToArray()
-                        ];
-                }
+                        return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray()];
             }
         }
 
         return null;
-    }
-
-    public IEnumerable<byte[]> All()
-    {
-        EnsureSorted();
-
-        for (int i = 0; i < _count; i++)
-            yield return KeyAt(_data, i).ToArray();
     }
 
     // -------------------------------------------------------------------------
@@ -229,36 +209,26 @@ public class SortedKeyStore
         int n = _pendingCount;
         _pendingCount = 0;
 
-        // Two-pass LSB radix sort. Each pass moves actual key+hash data (not indices)
-        // sequentially into a scratch buffer — no random-access gather step.
-        //
-        // Pass 1: scatter by key byte 1 → _scratchData/_scratchHashes
-        // Pass 2: scatter by key byte 0 → _pending/_pendingHashes  (reused as second scratch)
+        // Two-pass LSB radix sort on bytes 0–1, then insertion sort within buckets.
+        // Pass 1: scatter by byte 1 → _scratch/_scratchHashes
+        // Pass 2: scatter by byte 0 → _pending/_pendingHashes (reused as second scratch)
         // Result lands back in _pending/_pendingHashes, sorted by bytes 0–1.
-        GrowFlatTo(ref _scratchData, n * KeySize);
-        GrowTo(ref _scratchHashes, n);
+        GrowScratch(ref _scratch, n * KeySize);
+        GrowScratch(ref _scratchHashes, n);
 
-        RadixPassData(_pending, _pendingHashes, n, byteIndex: 1, _scratchData, _scratchHashes);
-        RadixPassData(_scratchData, _scratchHashes, n, byteIndex: 0, _pending, _pendingHashes);
-
-        // Finish: insertion sort within same-prefix buckets (~15 items, all in L1).
+        RadixPass(_pending, _pendingHashes, n, byteIndex: 1, _scratch, _scratchHashes);
+        RadixPass(_scratch, _scratchHashes, n, byteIndex: 0, _pending, _pendingHashes);
         FinishSort(_pending, _pendingHashes, n);
 
-        // Merge sorted pending into main store.
         MergeSorted(_pending, _pendingHashes, n);
     }
 
-    /// <summary>
-    /// Radix pass that moves key+hash records directly.
-    /// Counts src keys by key[byteIndex], then scatters complete (key, hash) pairs
-    /// into dst. One sequential read of src, one sequential write to dst — no random access.
-    /// </summary>
-    private void RadixPassData(byte[] srcKeys, Setsum[] srcHashes, int n, int byteIndex,
-                                byte[] dstKeys, Setsum[] dstHashes)
+    private void RadixPass(byte[] src, Setsum[] srcHashes, int n, int byteIndex,
+                           byte[] dst, Setsum[] dstHashes)
     {
         Array.Clear(_counts, 0, 256);
         for (int i = 0; i < n; i++)
-            _counts[srcKeys[i * KeySize + byteIndex]]++;
+            _counts[src[i * KeySize + byteIndex]]++;
 
         _offsets[0] = 0;
         for (int b = 1; b < 256; b++)
@@ -266,10 +236,10 @@ public class SortedKeyStore
 
         for (int i = 0; i < n; i++)
         {
-            byte b = srcKeys[i * KeySize + byteIndex];
-            int dst = _offsets[b]++;
-            CopyKey(srcKeys, i, dstKeys, dst);
-            dstHashes[dst] = srcHashes[i];
+            byte b = src[i * KeySize + byteIndex];
+            int d = _offsets[b]++;
+            CopyKey(src, i, dst, d);
+            dstHashes[d] = srcHashes[i];
         }
     }
 
@@ -314,11 +284,10 @@ public class SortedKeyStore
     // Private — queries
     // -------------------------------------------------------------------------
 
-    private void EnsurePrefixSums()
+    private void RebuildPrefixSums()
     {
         if (!_prefixSumsDirty) return;
 
-        // Double capacity on growth to avoid repeated reallocations
         if (_prefixSums.Length < _count + 1)
             _prefixSums = new Setsum[Math.Max(_count + 1, _prefixSums.Length * 2)];
 
@@ -337,13 +306,9 @@ public class SortedKeyStore
         {
             int mid = (lo + hi) >> 1;
             int cmp = KeyAt(_data, mid).SequenceCompareTo(t);
-
-            if (cmp == 0)
-                return mid;
-            else if (cmp < 0)
-                lo = mid + 1;
-            else
-                hi = mid - 1;
+            if (cmp == 0) return mid;
+            if (cmp < 0) lo = mid + 1;
+            else hi = mid - 1;
         }
         return ~lo;
     }
@@ -355,10 +320,8 @@ public class SortedKeyStore
         while (lo < hi)
         {
             int mid = (lo + hi) >> 1;
-            if (KeyAt(_data, mid).SequenceCompareTo(t) < 0)
-                lo = mid + 1;
-            else
-                hi = mid;
+            if (KeyAt(_data, mid).SequenceCompareTo(t) < 0) lo = mid + 1;
+            else hi = mid;
         }
         return lo;
     }
@@ -370,10 +333,8 @@ public class SortedKeyStore
         while (lo < hi)
         {
             int mid = (lo + hi) >> 1;
-            if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0)
-                lo = mid + 1;
-            else
-                hi = mid;
+            if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0) lo = mid + 1;
+            else hi = mid;
         }
         return lo;
     }
@@ -386,9 +347,7 @@ public class SortedKeyStore
             KeyAt(_data, start).Slice(0, fullBytes).CopyTo(splitKey);
 
         if (rem == 0)
-        {
             splitKey[fullBytes] = 0x80;
-        }
         else
         {
             int bit = 7 - rem;
@@ -400,7 +359,7 @@ public class SortedKeyStore
     }
 
     // -------------------------------------------------------------------------
-    // Inline helpers
+    // Helpers
     // -------------------------------------------------------------------------
 
     private static ReadOnlySpan<byte> KeyAt(byte[] buf, int i)
@@ -409,29 +368,17 @@ public class SortedKeyStore
     private static void CopyKey(byte[] src, int si, byte[] dst, int di)
         => src.AsSpan(si * KeySize, KeySize).CopyTo(dst.AsSpan(di * KeySize));
 
-    private static void GrowFlat(ref byte[] buf, int count)
+    // Grows buf in-place, preserving existing contents.
+    private static void GrowPreserving<T>(ref T[] arr, int currentUsed)
     {
-        var next = new byte[Math.Max(count * KeySize * 2, buf.Length * 2)];
-        buf.AsSpan().CopyTo(next);
-        buf = next;
-    }
-
-    // Scratch buffer — contents are NOT preserved; callers always write before reading.
-    private static void GrowFlatTo(ref byte[] buf, int needed)
-    {
-        if (buf.Length >= needed) return;
-        buf = new byte[Math.Max(needed, buf.Length * 2)];
-    }
-
-    private static void Grow<T>(ref T[] arr, int count)
-    {
-        var next = new T[Math.Max(count * 2, arr.Length * 2)];
+        if (currentUsed < arr.Length) return;
+        var next = new T[arr.Length * 2];
         arr.AsSpan().CopyTo(next);
         arr = next;
     }
 
-    // Scratch buffer — contents are NOT preserved; callers always write before reading.
-    private static void GrowTo<T>(ref T[] arr, int needed)
+    // Grows scratch buf without preserving contents — callers always write before reading.
+    private static void GrowScratch<T>(ref T[] arr, int needed)
     {
         if (arr.Length >= needed) return;
         arr = new T[Math.Max(needed, arr.Length * 2)];
