@@ -55,16 +55,6 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Inserts multiple items, sorting first. Use InsertBulkPresorted if already sorted.
-    /// </summary>
-    public void InsertBulk(List<byte[]> items)
-    {
-        if (items.Count == 0) return;
-        items.Sort(ByteComparer.Instance);
-        InsertSortedArray(items.ToArray());
-    }
-
-    /// <summary>
     /// Inserts multiple items that are already in order.
     /// </summary>
     public void InsertBulkPresorted(List<byte[]> items)
@@ -94,11 +84,33 @@ public class ReconcilableSet
         return _store.RangeInfo(lo, hi);
     }
 
-    public (BitPrefix Child0, Setsum Hash0, int Count0, BitPrefix Child1, Setsum Hash1, int Count1) GetChildrenWithHashes(BitPrefix prefix, int depth)
+    /// <summary>
+    /// Batched count-only version of GetChildrenWithHashes.
+    /// Returns child counts for each requested prefix — no hashes.
+    /// Valid for unidirectional sync where serverCount == clientCount implies identical subtrees.
+    /// </summary>
+    public List<(BitPrefix C0, int Sc0, BitPrefix C1, int Sc1)>
+        GetChildrenCountsBatch(IReadOnlyList<(BitPrefix Prefix, int Depth)> requests)
+    {
+        var results = new List<(BitPrefix, int, BitPrefix, int)>(requests.Count);
+        foreach (var (prefix, depth) in requests)
+        {
+            var (lo, hi) = prefix.KeyRange();
+            var (_, c0, _, c1) = _store.RangeInfoSplit(lo, hi, depth);
+            results.Add((prefix.Extend(0), c0, prefix.Extend(1), c1));
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Returns child counts only — no hashes computed.
+    /// Use during BFS traversal where only counts are needed to decide whether to descend.
+    /// </summary>
+    public (int Count0, int Count1) GetChildrenCounts(BitPrefix prefix, int depth)
     {
         var (lo, hi) = prefix.KeyRange();
-        var (h0, c0, h1, c1) = _store.RangeInfoSplit(lo, hi, depth);
-        return (prefix.Extend(0), h0, c0, prefix.Extend(1), h1, c1);
+        var (_, c0, _, c1) = _store.RangeInfoSplit(lo, hi, depth);
+        return (c0, c1);
     }
 
     public IEnumerable<byte[]> GetItemsWithPrefix(BitPrefix prefix)
@@ -106,24 +118,6 @@ public class ReconcilableSet
         if (prefix.Length == 0) return _store.All();
         var (lo, hi) = prefix.KeyRange();
         return _store.Range(lo, hi);
-    }
-
-    /// <summary>
-    /// Batched version of GetChildrenWithHashes: queries multiple prefixes in one call,
-    /// returning child (Hash, Count) pairs for each. Used by the level-batched BFS to
-    /// collapse one round trip per node into one round trip per level.
-    /// </summary>
-    public List<(BitPrefix C0, Setsum H0, int Sc0, BitPrefix C1, Setsum H1, int Sc1)>
-        GetChildrenWithHashesBatch(IReadOnlyList<(BitPrefix Prefix, int Depth)> requests)
-    {
-        var results = new List<(BitPrefix, Setsum, int, BitPrefix, Setsum, int)>(requests.Count);
-        foreach (var (prefix, depth) in requests)
-        {
-            var (lo, hi) = prefix.KeyRange();
-            var (h0, c0, h1, c1) = _store.RangeInfoSplit(lo, hi, depth);
-            results.Add((prefix.Extend(0), h0, c0, prefix.Extend(1), h1, c1));
-        }
-        return results;
     }
 
     /// <summary>

@@ -61,7 +61,9 @@ sequenceDiagram
 
 ### Path 2: Trie Fallback
 
-A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each trie node covers all keys sharing a common bit-prefix. The client and server exchange `(Hash, Count)` for subtrees, recursing only into subtrees that differ, until each differing subtree is small enough to resolve via Setsum peeling.
+A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each trie node covers all keys sharing a common bit-prefix. The client and server exchange subtree counts, recursing only into subtrees where the server has more items than the client, until each differing subtree is small enough to resolve via Setsum peeling.
+
+Because the protocol is unidirectional, **counts alone are sufficient to prune the trie** — no hashes are exchanged during BFS traversal. `serverCount == clientCount` guarantees the subtrees are identical; `serverCount > clientCount` means the server has items the client is missing.
 
 ```mermaid
 flowchart TD
@@ -73,13 +75,13 @@ flowchart TD
     C --> G["Prefix 11"]
     D --> H["..."]
     E --> I["Leaf: Setsum peel (1 or 2 missing)"]
-    F --> J["Hashes match — skip ✓"]
+    F --> J["Counts match — skip ✓"]
     G --> K["..."]
 ```
 
 #### BFS traversal
 
-The BFS processes one full depth level per round trip (level-batched). For each node, the server returns `(Hash, Count)` for both children. Children are enqueued only if the server and client hashes differ — identical subtrees are skipped immediately.
+The BFS processes one full depth level per round trip (level-batched). For each node, the server returns the counts for both children. Children are enqueued only if `serverCount > clientCount` — equal counts mean identical subtrees and are skipped immediately.
 
 A node becomes a leaf when:
 - `clientCount == 0` — client has nothing here; server sends all its items directly, or
@@ -94,12 +96,12 @@ sequenceDiagram
     participant S as Server
 
     C->>S: GetPrefixInfo(Root)
-    S-->>C: (rootHash, rootCount)
+    S-->>C: rootCount
 
     loop BFS — one round trip per depth level
-        C->>S: GetChildrenWithHashes(prefix1, prefix2, ...) [batched]
-        S-->>C: (hash0, count0, hash1, count1) per prefix
-        Note over C: Skip children where hashes match
+        C->>S: GetChildrenCounts(prefix1, prefix2, ...) [batched]
+        S-->>C: (count0, count1) per prefix
+        Note over C: Skip children where serverCount == clientCount
         Note over C: Mark as leaf if clientCount==0<br/>or missingCount<=2
     end
 
@@ -245,9 +247,9 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 | Sets are identical | 1 | 36 | (Sum, Count) sent; Identical returned |
 | Client missing ≤ 3 items | 1 | ~136 | 36 sent + ~100 received (missing keys) |
 | Client missing 4–10 items | 1 | ~386 | 36 sent + ~350 received (missing keys) |
-| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) × 64 + D × 68) | Trie BFS + Setsum leaf peeling |
+| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) × 4 + D × 32) | Trie BFS (counts only) + Setsum leaf peeling |
 
-For a case of D=10,000 missing items in N=1,000,000 total: roughly ~30 round trips, ~1.2 MB transferred. The raw diff is 320 KB; total store size is 32 MB.
+For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round trips, ~680 KB transferred. The raw diff is 320 KB; total store size is 32 MB. BFS traversal overhead is low because only 4-byte counts are exchanged per node rather than 32-byte hashes.
 
 ---
 

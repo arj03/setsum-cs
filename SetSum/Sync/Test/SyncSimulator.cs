@@ -13,7 +13,10 @@ namespace Setsum.Sync.Test;
 /// Trie optimisations:
 ///   1. Level-batched BFS  — All nodes at the same BFS depth are queried in one round trip,
 ///      reducing traversal cost from O(nodes) trips to O(depth) trips.
-///   2. Prefix Setsum peeling at leaves — Instead of uploading all client keys under a
+///   2. Count-only BFS traversal — Since the protocol is unidirectional (server always has a
+///      superset of client data), serverCount > clientCount implies a difference and
+///      serverCount == clientCount implies identical. No hashes needed during traversal.
+///   3. Prefix Setsum peeling at leaves — Instead of uploading all client keys under a
 ///      leaf prefix (O(N/leaves) bytes), the client sends only PrefixSum (32 bytes).
 ///      The server peels up to 2 missing items from its data under that prefix.
 ///      Falls back to key-list exchange only when clientCount == 0 (nothing to peel from),
@@ -98,8 +101,9 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     /// Binary-prefix trie sync.
     ///
     /// BFS descends until missingCount <= LeafThreshold (2) per prefix, pruning
-    /// identical subtrees via hash comparison. All nodes at the same depth are
-    /// queried in one batched round trip — O(depth) trips total.
+    /// identical subtrees via count comparison alone — valid because the protocol is
+    /// unidirectional (server is always a superset of the client).
+    /// All nodes at the same depth are queried in one batched round trip — O(depth) trips total.
     ///
     /// At leaves the server attempts Setsum peeling (missingCount==1: linear scan,
     /// missingCount==2: O(n²) pair scan). If the server prefix is too large for
@@ -110,48 +114,46 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     {
         var missingItems = new List<byte[]>();
 
-        // BFS level: list of (prefix, depth, serverHash, serverCount, clientCount).
-        var currentLevel = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
+        // BFS level: list of (prefix, depth, serverCount, clientCount).
+        var currentLevel = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
 
-        var (rootServerHash, rootServerCount) = _remote.GetPrefixInfo(BitPrefix.Root);
-        var (rootClientHash, rootClientCount) = _local.GetPrefixInfo(BitPrefix.Root);
+        var (_, rootServerCount) = _remote.GetPrefixInfo(BitPrefix.Root);
+        var (_, rootClientCount) = _local.GetPrefixInfo(BitPrefix.Root);
         RoundTrips++;
         BytesSent += BitPrefix.Root.NetworkSize;
-        BytesReceived += SetsumSize + CountSize;
+        BytesReceived += CountSize; // count only — no hash needed at root
 
         if (rootServerCount == 0) return true;
 
-        currentLevel.Add((BitPrefix.Root, 0, rootServerHash, rootServerCount, rootClientCount));
+        currentLevel.Add((BitPrefix.Root, 0, rootServerCount, rootClientCount));
 
         while (currentLevel.Count > 0)
         {
             // Partition current level into leaves (to peel) and interior nodes (to expand).
             var prefixesToSync = new List<BitPrefix>();
-            var toExpand = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
+            var toExpand = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
 
-            foreach (var (prefix, depth, serverHash, serverCount, clientCount) in currentLevel)
+            foreach (var (prefix, depth, serverCount, clientCount) in currentLevel)
             {
                 int missingCount = serverCount - clientCount;
 
+                // Unidirectional invariant: equal counts means identical subtree — skip.
+                if (missingCount == 0) continue;
+
                 if (clientCount == 0 || missingCount <= LeafThreshold || prefix.Length >= MaxPrefixDepth)
                 {
-                    if (missingCount == 0)
-                    {
-                        var (clientHash, _) = _local.GetPrefixInfo(prefix);
-                        if (serverHash == clientHash) continue;
-                    }
                     prefixesToSync.Add(prefix);
                     continue;
                 }
 
-                toExpand.Add((prefix, depth, serverHash, serverCount, clientCount));
+                toExpand.Add((prefix, depth, serverCount, clientCount));
             }
 
             // --- Leaf peeling: one round trip for all leaves at this level ---
             if (prefixesToSync.Count > 0)
             {
                 RoundTrips++;
-                var fallbackPrefixes = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
+                var fallbackPrefixes = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
 
                 foreach (var prefix in prefixesToSync)
                 {
@@ -168,17 +170,19 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                     {
                         // Server prefix too large for pair peel — expand into children
                         // unless we are already at max depth, in which case send all items.
-                        var (sh, sc) = _remote.GetPrefixInfo(prefix);
+                        var (_, sc) = _remote.GetPrefixInfo(prefix);
                         var (_, cc) = _local.GetPrefixInfo(prefix);
+                        RoundTrips++;
                         if (prefix.Length >= MaxPrefixDepth)
                         {
                             // Force full item transfer at max depth.
-                            BytesReceived += sc * KeySize;
                             missingItems.AddRange(_remote.GetItemsWithPrefix(prefix));
+                            BytesReceived += sc * KeySize;
+                            RoundTrips++;
                         }
                         else
                         {
-                            fallbackPrefixes.Add((prefix, prefix.Length, sh, sc, cc));
+                            fallbackPrefixes.Add((prefix, prefix.Length, sc, cc));
                         }
                     }
                 }
@@ -189,22 +193,23 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             if (toExpand.Count == 0) break;
 
             // --- Level-batched BFS: one round trip for the entire current level ---
+            // Only counts are exchanged — hashes are unnecessary in a unidirectional protocol.
             var requests = toExpand.Select(e => (e.Prefix, e.Depth)).ToList();
-            var serverResponses = _remote.GetChildrenWithHashesBatch(requests);
+            var serverResponses = _remote.GetChildrenCountsBatch(requests);
             RoundTrips++;
             BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
-            BytesReceived += toExpand.Count * 2 * (SetsumSize + CountSize);
+            BytesReceived += toExpand.Count * 2 * CountSize;
 
-            var nextLevel = new List<(BitPrefix, int, Setsum, int, int)>();
+            var nextLevel = new List<(BitPrefix, int, int, int)>();
             for (int i = 0; i < toExpand.Count; i++)
             {
                 var depth = toExpand[i].Depth;
-                var (c0, sh0, sc0, c1, sh1, sc1) = serverResponses[i];
-                var (_, ch0, cc0, _, ch1, cc1) = _local.GetChildrenWithHashes(toExpand[i].Prefix, depth);
+                var (c0, sc0, c1, sc1) = serverResponses[i];
+                var (cc0, cc1) = _local.GetChildrenCounts(toExpand[i].Prefix, depth);
 
-                // Skip subtrees where hashes already match — they are identical.
-                if (sc0 > 0 && sh0 != ch0) nextLevel.Add((c0, depth + 1, sh0, sc0, cc0));
-                if (sc1 > 0 && sh1 != ch1) nextLevel.Add((c1, depth + 1, sh1, sc1, cc1));
+                // Only descend into subtrees where server has more items than client.
+                if (sc0 > cc0) nextLevel.Add((c0, depth + 1, sc0, cc0));
+                if (sc1 > cc1) nextLevel.Add((c1, depth + 1, sc1, cc1));
             }
 
             currentLevel = nextLevel;
