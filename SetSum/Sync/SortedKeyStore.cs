@@ -168,6 +168,48 @@ public class SortedKeyStore
             yield return KeyAt(_data, i).ToArray();
     }
 
+    /// <summary>
+    /// Scans the range [lo, hi) for items whose stored hashes peel against <paramref name="diff"/>,
+    /// without allocating any key copies until a match is confirmed.
+    ///
+    /// missingCount == 1: returns the single key whose hash == diff.
+    /// missingCount == 2: returns the pair (i, j) where hash[i] ^ hash[j] == diff,
+    ///                    but only when the range has ≤ maxCountForPairPeel items.
+    /// Returns null if no match is found or the range is too large for pair peeling.
+    /// </summary>
+    public List<byte[]>? TryPeelRange(byte[] lo, byte[] hi, Setsum diff, int maxCountForPairPeel)
+    {
+        Prepare();
+
+        int start = LowerBound(lo), end = UpperBound(hi), count = end - start;
+        if (count == 0) return null;
+
+        // missingCount == 1: one linear scan, no allocations until match found
+        for (int i = start; i < end; i++)
+            if (_hashes[i] == diff)
+                return [KeyAt(_data, i).ToArray()];
+
+        // missingCount == 2: O(n²) scan, guarded by maxCountForPairPeel
+        if (count <= maxCountForPairPeel)
+        {
+            for (int i = start; i < end; i++)
+            {
+                var remaining = diff - _hashes[i];
+                for (int j = i + 1; j < end; j++)
+                {
+                    if (_hashes[j] == remaining)
+                        return
+                        [
+                            KeyAt(_data, i).ToArray(),
+                            KeyAt(_data, j).ToArray()
+                        ];
+                }
+            }
+        }
+
+        return null;
+    }
+
     public IEnumerable<byte[]> All()
     {
         EnsureSorted();

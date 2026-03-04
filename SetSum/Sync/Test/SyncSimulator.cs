@@ -15,15 +15,16 @@ namespace Setsum.Sync.Test;
 ///   1. Level-batched BFS  — All nodes at the same BFS depth are queried in one round trip,
 ///      reducing traversal cost from O(nodes) trips to O(depth) trips.
 ///   2. Prefix Setsum peeling at leaves — Instead of uploading all client keys under a
-///      leaf prefix (O(N/leaves) bytes), the client sends only PrefixSum (32 bytes). 
-///      The server peels the exact missing items from its data under that prefix.
-///      Falls back to key-list exchange only when clientCount == 0 (nothing to peel from).
+///      leaf prefix (O(N/leaves) bytes), the client sends only PrefixSum (32 bytes).
+///      The server peels up to 2 missing items from its data under that prefix.
+///      Falls back to key-list exchange only when clientCount == 0 (nothing to peel from),
+///      or when the server prefix is too large for pair peeling.
 /// </summary>
 public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 {
-    // Stop recursing once only one item is missing under a prefix — then one
-    // linear scan finds it via Setsum diff without transferring any extra items.
-    private const int LeafThreshold = 1;
+    // Stop recursing once missingCount <= LeafThreshold — TryReconcilePrefix handles
+    // both missingCount==1 (linear scan) and missingCount==2 (O(n²) pair scan).
+    private const int LeafThreshold = 2;
 
     // Maximum prefix depth before we force a leaf transfer (64 bits = 8 bytes of the key).
     private const int MaxPrefixDepth = 64;
@@ -112,14 +113,18 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     /// <summary>
     /// Binary-prefix trie sync.
     ///
-    /// BFS descends until missingCount == 1 per prefix (LeafThreshold=1), pruning
+    /// BFS descends until missingCount <= LeafThreshold (2) per prefix, pruning
     /// identical subtrees via hash comparison. All nodes at the same depth are
     /// queried in one batched round trip — O(depth) trips total.
+    ///
+    /// At leaves the server attempts Setsum peeling (missingCount==1: linear scan,
+    /// missingCount==2: O(n²) pair scan). If the server prefix is too large for
+    /// pair peeling it returns Fallback — those prefixes are re-enqueued into the
+    /// BFS for further descent rather than silently dropped.
     /// </summary>
     private bool PerformTrieSync(ITestOutputHelper _output)
     {
-        // All leaf prefixes: server sends its items, client takes what's new.
-        var prefixesToSync = new List<BitPrefix>();
+        var missingItems = new List<byte[]>();
 
         // BFS level: list of (prefix, depth, serverHash, serverCount, clientCount).
         var currentLevel = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
@@ -137,6 +142,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
         while (currentLevel.Count > 0)
         {
+            // Partition current level into leaves (to peel) and interior nodes (to expand).
+            var prefixesToSync = new List<BitPrefix>();
             var toExpand = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
 
             foreach (var (prefix, depth, serverHash, serverCount, clientCount) in currentLevel)
@@ -156,6 +163,36 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 }
 
                 toExpand.Add((prefix, depth, serverHash, serverCount, clientCount));
+            }
+
+            // --- Leaf peeling: one round trip for all leaves at this level ---
+            if (prefixesToSync.Count > 0)
+            {
+                RoundTrips++;
+                var fallbackPrefixes = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
+
+                foreach (var prefix in prefixesToSync)
+                {
+                    var (clientPrefixSum, _) = _local.GetPrefixInfo(prefix);
+                    BytesSent += prefix.NetworkSize + SetsumSize;
+
+                    var result = _remote.TryReconcilePrefix(prefix, clientPrefixSum);
+                    if (result.Outcome == ReconcileOutcome.Found)
+                    {
+                        BytesReceived += result.MissingItems!.Count * KeySize;
+                        missingItems.AddRange(result.MissingItems!);
+                    }
+                    else if (result.Outcome == ReconcileOutcome.Fallback)
+                    {
+                        // Server prefix too large for pair peel — re-enqueue for further descent.
+                        var (sh, sc) = _remote.GetPrefixInfo(prefix);
+                        var (_, cc) = _local.GetPrefixInfo(prefix);
+                        fallbackPrefixes.Add((prefix, prefix.Length, sh, sc, cc));
+                    }
+                }
+
+                // Feed fallback prefixes back into toExpand so the BFS loop continues.
+                toExpand.AddRange(fallbackPrefixes);
             }
 
             if (toExpand.Count == 0) break;
@@ -182,30 +219,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             currentLevel = nextLevel;
         }
 
-        _output.WriteLine($"Leaf prefixes to sync: {prefixesToSync.Count}");
-
-        var missingItems = new List<byte[]>();
-
-        // --- Leaf sync: client sends (prefixSum, prefixCount); server scans its items
-        // to find those whose hashes sum to diff. For missingCount==1 this is a single
-        // linear scan — O(serverPrefixCount) but no items transferred until found.
-        // All leaves batched into one round trip.
-        if (prefixesToSync.Count > 0)
-        {
-            RoundTrips++;
-            foreach (var prefix in prefixesToSync)
-            {
-                var (clientPrefixSum, _) = _local.GetPrefixInfo(prefix);
-                BytesSent += prefix.NetworkSize + SetsumSize;
-
-                var result = _remote.TryReconcilePrefix(prefix, clientPrefixSum);
-                if (result.Outcome == ReconcileOutcome.Found)
-                {
-                    BytesReceived += result.MissingItems!.Count * KeySize;
-                    missingItems.AddRange(result.MissingItems!);
-                }
-            }
-        }
+        _output.WriteLine($"Leaf prefixes synced: {missingItems.Count} items recovered");
 
         // Ensure globally sorted order that InsertBulkPresorted requires.
         missingItems.Sort(ByteComparer.Instance);

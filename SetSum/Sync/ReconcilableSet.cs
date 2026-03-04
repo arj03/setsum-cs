@@ -14,6 +14,10 @@ public class ReconcilableSet
     private const int MaxDiffForRecentScan = 10;
     private const int RecentScanLimit = 20;
 
+    // Maximum server-side prefix item count for which we attempt O(n²) pair peeling.
+    // At 256 items the search space is 256² = 65.536 pairs — cheap enough to do inline.
+    private const int MaxServerCountForPairPeel = 256;
+
     public Setsum Sum() => _store.TotalInfo().Hash;
 
     public long Count() => _store.Count();
@@ -135,9 +139,21 @@ public class ReconcilableSet
 
     /// <summary>
     /// Server-side leaf resolution.
-    /// - clientCount == 0: server returns all its items under the prefix directly.
-    /// - missingCount == 1: server does one linear scan; the missing item's hash == diff.
-    /// - missingCount > 1: returns Fallback (caller should have descended further).
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <c>clientPrefixSum == Zero</c>: client has nothing here — server returns all items directly.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <c>missingCount == 1</c>: linear scan over stored hashes in-place — no key copies until match found.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <c>missingCount == 2</c> and server has ≤ <c>MaxServerCountForPairPeel</c> items:
+    ///     O(n²) scan over stored hashes in-place — no key copies until match found.
+    ///   </description></item>
+    ///   <item><description>
+    ///     Otherwise returns <c>Fallback</c> (caller should have descended further).
+    ///   </description></item>
+    /// </list>
     /// </summary>
     public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum clientPrefixSum)
     {
@@ -148,13 +164,14 @@ public class ReconcilableSet
         if (clientPrefixSum.IsEmpty())
             return ReconcileResult.Found(GetItemsWithPrefix(prefix).ToList());
 
-        // Otherwise missingCount == 1: diff is the single missing item's hash.
         var diff = serverPrefixSum - clientPrefixSum;
-        foreach (var key in GetItemsWithPrefix(prefix))
-            if (Setsum.Hash(key) == diff)
-                return ReconcileResult.Found(new List<byte[]> { key });
 
-        return ReconcileResult.Fallback();
+        // Delegate the scan entirely to SortedKeyStore so it can walk _hashes[] directly
+        // without materialising any key copies until a match is confirmed.
+        var (lo, hi) = prefix.KeyRange();
+        var found = _store.TryPeelRange(lo, hi, diff, MaxServerCountForPairPeel);
+
+        return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
     }
 
     // -------------------------------------------------------------------------
