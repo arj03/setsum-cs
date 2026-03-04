@@ -8,7 +8,6 @@ namespace Setsum.Sync.Test;
 /// Protocol overview:
 ///   Fast path  – The remote (server) tries to identify and return items the client is missing
 ///                in a single round trip using set-difference peeling on recent history.
-///   Push path  – If the client is ahead of the server, the client sends its extra items.
 ///   Trie path  – Full binary-prefix traversal when the diff is too large for the fast path.
 ///
 /// Trie optimisations:
@@ -66,7 +65,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         BytesSent = 0;
         BytesReceived = 0;
 
-        // Fast path
+        // Fast path: server tries to identify what the client is missing via Setsum peeling.
         var remoteResult = _remote.TryReconcile(_local.Sum(), _local.Count());
         RoundTrips++;
         BytesSent += SetsumSize + CountSize; // (Sum, Count)
@@ -91,18 +90,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 return true;
 
             case ReconcileOutcome.Fallback:
-                break; // fall through
-        }
-
-        // Push path: check if the client is ahead
-        var localResult = _local.TryReconcile(_remote.Sum(), _remote.Count());
-        _output.WriteLine($"result of local reconcile: {localResult.Outcome}");
-        if (localResult.Outcome == ReconcileOutcome.Found)
-        {
-            BytesSent += localResult.MissingItems!.Count * KeySize;
-            _remote.AcceptPushedItems(localResult.MissingItems!);
-            RoundTrips++;
-            return true;
+                break; // fall through to trie
         }
 
         // Trie fallback
@@ -184,14 +172,23 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                     }
                     else if (result.Outcome == ReconcileOutcome.Fallback)
                     {
-                        // Server prefix too large for pair peel — re-enqueue for further descent.
+                        // Server prefix too large for pair peel — expand into children
+                        // unless we are already at max depth, in which case send all items.
                         var (sh, sc) = _remote.GetPrefixInfo(prefix);
                         var (_, cc) = _local.GetPrefixInfo(prefix);
-                        fallbackPrefixes.Add((prefix, prefix.Length, sh, sc, cc));
+                        if (prefix.Length >= MaxPrefixDepth)
+                        {
+                            // Force full item transfer at max depth.
+                            BytesReceived += sc * KeySize;
+                            missingItems.AddRange(_remote.GetItemsWithPrefix(prefix));
+                        }
+                        else
+                        {
+                            fallbackPrefixes.Add((prefix, prefix.Length, sh, sc, cc));
+                        }
                     }
                 }
 
-                // Feed fallback prefixes back into toExpand so the BFS loop continues.
                 toExpand.AddRange(fallbackPrefixes);
             }
 

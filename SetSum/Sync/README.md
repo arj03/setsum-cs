@@ -8,11 +8,12 @@ A set-reconciliation library for efficiently synchronising two sets of 32-byte k
 
 The core challenge: two nodes each hold a set of 32-byte keys. They want to converge to the same set with as few network round-trips as possible, without transferring keys they already share.
 
-The library solves this in three escalating strategies:
+The protocol is **unidirectional** — the server transfers items it has to the client. It does not support the case where both sides are ahead of each other. The BFS uses `missingCount = serverCount - clientCount` to decide when to stop descending, so when both sides have extra items under a prefix the counts partially cancel — a prefix where the server has 5 extras and the client has 5 extras looks like `missingCount == 0` and gets skipped entirely, silently dropping all 10 differences.
+
+The library solves this in two escalating strategies:
 
 1. **Fast Path** — Setsum peeling (1 round-trip, works for tiny diffs)
-2. **Push Path** — if the *client* is ahead, push its extras to the server (0–1 round-trips)
-3. **Trie Fallback** — binary-prefix trie traversal for large diffs (O(log N) round-trips)
+2. **Trie Fallback** — binary-prefix trie traversal for large diffs (O(log N) round-trips)
 
 ---
 
@@ -28,7 +29,7 @@ This allows the server to compute what a client is missing by subtraction alone 
 
 ---
 
-## The Three Sync Paths
+## The Two Sync Paths
 
 ### Path 1: Fast Path (Setsum Peeling)
 
@@ -58,29 +59,7 @@ sequenceDiagram
 
 ---
 
-### Path 2: Push Path
-
-If the server returned `Fallback`, it might be because the *client* is ahead (has items the server lacks). The client runs `TryReconcile` in reverse — checking if the server's `(Sum, Count)` can be peeled against the client's history.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-
-    Note over C: Server returned Fallback.<br/>Maybe we're the ones ahead.
-    C->>C: localResult = TryReconcile(Server.Sum, Server.Count)
-    alt Found
-        C->>S: AcceptPushedItems(missing items)
-        Note over S: Filters to items not already held
-        Note over C,S: Sync complete ✓
-    else Not Found
-        Note over C,S: Proceed to trie fallback
-    end
-```
-
----
-
-### Path 3: Trie Fallback
+### Path 2: Trie Fallback
 
 A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each trie node covers all keys sharing a common bit-prefix. The client and server exchange `(Hash, Count)` for subtrees, recursing only into subtrees that differ, until each differing subtree is small enough to resolve via Setsum peeling.
 
@@ -107,7 +86,7 @@ A node becomes a leaf when:
 - `missingCount <= 2` — at most two items are missing; resolved via Setsum peeling (see below), or
 - `prefix.Length >= MaxPrefixDepth` — maximum trie depth reached.
 
-All leaf resolutions are batched into a single final round trip. If a leaf's server-side prefix is too large for pair peeling, it is re-enqueued into the BFS for further descent rather than dropped.
+All leaf resolutions are batched into a single round trip per BFS level. If a leaf's server-side prefix is too large for pair peeling, it is re-enqueued through the partition check for further descent rather than dropped.
 
 ```mermaid
 sequenceDiagram
@@ -124,14 +103,13 @@ sequenceDiagram
         Note over C: Mark as leaf if clientCount==0<br/>or missingCount<=2
     end
 
-    Note over C: One round trip for all leaves at this level
-    loop For each leaf prefix [batched]
-        C->>S: prefixSum
+    loop One round trip for all leaves at this level
+        C->>S: prefixSum [batched]
         Note over S: diff = serverSum - clientSum<br/>missingCount==1: scan for Hash(key)==diff<br/>missingCount==2: scan pairs for Hash(i)+Hash(j)==diff
         S-->>C: [1 or 2 missing items]
     end
 
-    Note over C: Repeat leaf round trip if any fallbacks remain
+    Note over C: Repeat if any prefixes fell back to further descent
     C->>C: Sort and insert received items
 ```
 
@@ -145,7 +123,7 @@ diff = serverPrefixSum - clientPrefixSum
 
 **missingCount == 1:** `diff` equals exactly one item's hash. The server does one linear scan over its items under that prefix and returns the matching key. No key list is exchanged — only the 32-byte summary goes up and the single key comes back.
 
-**missingCount == 2:** `diff` equals the sum of exactly two items' hashes. The server tries all O(n²) pairs of items under the prefix, checking whether `hash[i] + hash[j] == diff`. This is only attempted when the server holds at most `MaxServerCountForPairPeel` (256) items under that prefix, keeping the search space bounded (≤ 32,768 pairs). If the prefix is larger the server returns `Fallback` and the client descends further.
+**missingCount == 2:** `diff` equals the sum of exactly two items' hashes. The server tries all O(n²) pairs of items under the prefix, checking whether `hash[i] + hash[j] == diff`. This is only attempted when the server holds at most `MaxServerCountForPairPeel` (256) items under that prefix, keeping the search space bounded (≤ 65,536 pairs). If the prefix is larger the server returns `Fallback` and the client descends further.
 
 For `clientCount == 0` the server simply returns all its items under the prefix directly, since there is no client sum to subtract from.
 
@@ -267,10 +245,9 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 | Sets are identical | 1 | 36 | (Sum, Count) sent; Identical returned |
 | Client missing ≤ 3 items | 1 | ~136 | 36 sent + ~100 received (missing keys) |
 | Client missing 4–10 items | 1 | ~386 | 36 sent + ~350 received (missing keys) |
-| Client ahead by ≤ 10 items | 1 | ~386 | 36 sent + ~350 received (pushed keys) |
 | Large diff (D missing, N total) | O(log N) | O(D × log(N/D) × 64 + D × 68) | Trie BFS + Setsum leaf peeling |
 
-For a case of D=10,000 missing items in N=1,000,000 total we have roughly ~30 round trips, 1.2 MB transferred. The raw diff is 320KB, Total size is 32MB.
+For a case of D=10,000 missing items in N=1,000,000 total: roughly ~30 round trips, ~1.2 MB transferred. The raw diff is 320 KB; total store size is 32 MB.
 
 ---
 

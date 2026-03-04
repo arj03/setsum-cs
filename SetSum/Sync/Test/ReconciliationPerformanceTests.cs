@@ -136,34 +136,6 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void Perf_LocalAhead_PushSync()
-    {
-        // Client has 3 extra items; server doesn't.
-        // Trip 1: Client→Server (fast path). Server sees client is ahead, returns Fallback.
-        // Trip 2: Client pushes its 3 extra items to server.
-        var server = new ReconcilableSet();
-        var client = new ReconcilableSet();
-
-        for (int i = 0; i < 50; i++)
-        {
-            var k = RandomKey();
-            server.Insert(k);
-            client.Insert(k);
-        }
-
-        for (int i = 0; i < 3; i++) client.Insert(RandomKey());
-
-        var sim = new SyncSimulator(client, server);
-        bool success = sim.TrySync(_output);
-
-        Assert.True(success);
-        Assert.Equal(2, sim.RoundTrips);
-
-        Assert.Equal(server.Count(), client.Count());
-        Assert.Equal(server.Sum(), client.Sum());
-    }
-
-    [Fact]
     public void Perf_LargeDiff_TrieFallback_RecoversEfficiently()
     {
         var server = new ReconcilableSet();

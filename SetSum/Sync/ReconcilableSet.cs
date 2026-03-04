@@ -15,7 +15,7 @@ public class ReconcilableSet
     private const int RecentScanLimit = 20;
 
     // Maximum server-side prefix item count for which we attempt O(n²) pair peeling.
-    // At 256 items the search space is 256² = 65.536 pairs — cheap enough to do inline.
+    // At 256 items the search space is 256² = 65,536 pairs — cheap enough to do inline.
     private const int MaxServerCountForPairPeel = 256;
 
     public Setsum Sum() => _store.TotalInfo().Hash;
@@ -74,17 +74,6 @@ public class ReconcilableSet
         Debug.Assert(IsSorted(items), "InsertBulkPresorted called with unsorted input — store invariants would be corrupted.");
 
         InsertSortedArray(items.ToArray());
-    }
-
-    /// <summary>
-    /// Push path receiver. Accepts a batch of items the sender believes we are missing,
-    /// inserting only those we do not already have. Returns the count actually inserted.
-    /// </summary>
-    public int AcceptPushedItems(IReadOnlyList<byte[]> items)
-    {
-        var missing = items.Where(item => !_store.Contains(item)).ToList();
-        if (missing.Count > 0) InsertBulk(missing);
-        return missing.Count;
     }
 
     public bool Contains(byte[] key) => _store.Contains(key);
@@ -237,7 +226,6 @@ public class ReconcilableSet
 
         return false;
     }
-
 
     private static bool IsSorted(List<byte[]> items)
     {
