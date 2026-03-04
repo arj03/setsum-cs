@@ -116,13 +116,51 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Appends to result all keys under prefix that are absent from other.
-    /// Items are yielded in sorted order — safe to pass directly to InsertBulkPresorted.
+    /// Batched version of GetChildrenWithHashes: queries multiple prefixes in one call,
+    /// returning child (Hash, Count) pairs for each. Used by the level-batched BFS to
+    /// collapse one round trip per node into one round trip per level.
     /// </summary>
-    public void CollectMissingItemsWithPrefix(BitPrefix prefix, ReconcilableSet other, List<byte[]> result)
+    public List<(BitPrefix C0, Setsum H0, int Sc0, BitPrefix C1, Setsum H1, int Sc1)>
+        GetChildrenWithHashesBatch(IReadOnlyList<(BitPrefix Prefix, int Depth)> requests)
     {
-        var (lo, hi) = prefix.KeyRange();
-        _store.CollectMissing(lo, hi, other._store, result);
+        var results = new List<(BitPrefix, Setsum, int, BitPrefix, Setsum, int)>(requests.Count);
+        foreach (var (prefix, depth) in requests)
+        {
+            var (lo, hi) = prefix.KeyRange();
+            var (h0, c0, h1, c1) = _store.RangeInfoSplit(lo, hi, depth);
+            results.Add((prefix.Extend(0), h0, c0, prefix.Extend(1), h1, c1));
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Server-side leaf resolution via Setsum peeling.
+    /// Client sends (prefixSum, prefixCount) — 36 bytes.
+    /// Server computes diff = serverSum - clientSum, then scans its prefix items once:
+    /// any item whose hash equals diff (for k=1) is the missing item.
+    /// For k>1 the BFS should have descended further — returns Fallback.
+    /// </summary>
+    public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum clientPrefixSum, int clientPrefixCount)
+    {
+        var (serverPrefixSum, serverPrefixCount) = GetPrefixInfo(prefix);
+        if (serverPrefixSum == clientPrefixSum) return ReconcileResult.Identical();
+
+        int missingCount = serverPrefixCount - clientPrefixCount;
+        if (missingCount <= 0) return ReconcileResult.Fallback();
+
+        var diff = serverPrefixSum - clientPrefixSum;
+
+        if (missingCount == 1)
+        {
+            // Single linear scan: the one missing item's hash must equal diff exactly.
+            foreach (var key in GetItemsWithPrefix(prefix))
+                if (Setsum.Hash(key) == diff)
+                    return ReconcileResult.Found(new List<byte[]> { key });
+            return ReconcileResult.Fallback();
+        }
+
+        // missingCount > 1: caller should have descended deeper.
+        return ReconcileResult.Fallback();
     }
 
     // -------------------------------------------------------------------------
@@ -201,6 +239,7 @@ public class ReconcilableSet
 
         return false;
     }
+
 
     private static bool IsSorted(List<byte[]> items)
     {

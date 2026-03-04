@@ -10,18 +10,27 @@ namespace Setsum.Sync.Test;
 ///                in a single round trip using set-difference peeling on recent history.
 ///   Push path  – If the client is ahead of the server, the client sends its extra items.
 ///   Trie path  – Full binary-prefix traversal when the diff is too large for the fast path.
+///
+/// Trie optimisations:
+///   1. Level-batched BFS  — All nodes at the same BFS depth are queried in one round trip,
+///      reducing traversal cost from O(nodes) trips to O(depth) trips.
+///   2. Prefix Setsum peeling at leaves — Instead of uploading all client keys under a
+///      leaf prefix (O(N/leaves) bytes), the client sends only (PrefixSum, PrefixCount)
+///      (36 bytes). The server peels the exact missing items from its data under that prefix.
+///      Falls back to key-list exchange only when clientCount == 0 (nothing to peel from).
 /// </summary>
 public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 {
-    // After this many items under a prefix, stop recursing and just transfer the diff directly.
-    private const int LeafThreshold = 16;
+    // Stop recursing once only one item is missing under a prefix — then one
+    // linear scan finds it via Setsum diff without transferring any extra items.
+    private const int LeafThreshold = 1;
 
     // Maximum prefix depth before we force a leaf transfer (64 bits = 8 bytes of the key).
     private const int MaxPrefixDepth = 64;
 
     private const int KeySize = Setsum.DigestSize;    // 32 bytes per key
     private const int SetsumSize = Setsum.DigestSize; // 32 bytes per Setsum
-    private const int CountSize = sizeof(int);         // 4 bytes per count
+    private const int CountSize = sizeof(int);        // 4 bytes per count
 
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }
@@ -101,23 +110,26 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
     }
 
     /// <summary>
-    /// Binary-prefix trie sync with two key optimizations:
+    /// Binary-prefix trie sync with three optimisations:
     ///
-    ///   1. Count-aware short-circuit — every server response includes the item count
-    ///      under that prefix. If the client has 0 and server has N, we skip the hash
-    ///      comparison and go straight to requesting the items. Similarly, if server
-    ///      count equals client count and hashes match we skip the subtree immediately.
+    ///   1. Count-aware short-circuit — if client count is 0, skip hash check and fetch
+    ///      directly. If counts and hashes match, skip the subtree entirely.
     ///
-    ///   2. Batched leaf transfers — instead of one round trip per leaf node we collect
-    ///      all prefixes that need item transfers and fetch them in a single batch at the
-    ///      end. This collapses O(leaves) trips into 1.
+    ///   2. Level-batched BFS — all nodes at the same depth are sent to the server in one
+    ///      round trip. Reduces traversal from O(nodes) trips down to O(depth) trips.
+    ///
+    ///   3. Prefix Setsum peeling at leaves — client sends (PrefixSum, PrefixCount) per
+    ///      leaf (36 bytes) instead of uploading all its keys (~11k × 32 bytes). Server
+    ///      peels the exact missing items. All peel requests are batched into one trip.
+    ///      Falls back to key-list exchange per leaf only when peeling fails.
     /// </summary>
     private bool PerformTrieSync(ITestOutputHelper _output)
     {
-        var prefixesToFetch = new List<BitPrefix>();
+        // All leaf prefixes: server sends its items, client takes what's new.
+        var prefixesToSync = new List<BitPrefix>();
 
-        // Queue carries hash and count for both sides
-        var queue = new Queue<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
+        // BFS level: list of (prefix, depth, serverHash, serverCount, clientCount).
+        var currentLevel = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
 
         var (rootServerHash, rootServerCount) = _remote.GetPrefixInfo(BitPrefix.Root);
         var (rootClientHash, rootClientCount) = _local.GetPrefixInfo(BitPrefix.Root);
@@ -128,53 +140,89 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
         if (rootServerCount == 0) return true;
 
-        queue.Enqueue((BitPrefix.Root, 0, rootServerHash, rootServerCount, rootClientCount));
+        currentLevel.Add((BitPrefix.Root, 0, rootServerHash, rootServerCount, rootClientCount));
 
-        while (queue.Count > 0)
+        while (currentLevel.Count > 0)
         {
-            var (prefix, depth, serverHash, serverCount, clientCount) = queue.Dequeue();
+            var toExpand = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, int ClientCount)>();
 
-            if (clientCount == 0)
+            foreach (var (prefix, depth, serverHash, serverCount, clientCount) in currentLevel)
             {
-                prefixesToFetch.Add(prefix);
-                continue;
-            }
+                int missingCount = serverCount - clientCount;
 
-            int missingCount = serverCount - clientCount;
-
-            if (missingCount <= LeafThreshold || prefix.Length >= MaxPrefixDepth)
-            {
-                if (missingCount == 0)
+                if (clientCount == 0 || missingCount <= LeafThreshold || prefix.Length >= MaxPrefixDepth)
                 {
-                    HashChecks++;
-                    var (clientHash, _) = _local.GetPrefixInfo(prefix);
-                    if (serverHash == clientHash) continue;
+                    if (missingCount == 0)
+                    {
+                        HashChecks++;
+                        var (clientHash, _) = _local.GetPrefixInfo(prefix);
+                        if (serverHash == clientHash) continue;
+                    }
+                    prefixesToSync.Add(prefix);
+                    continue;
                 }
-                prefixesToFetch.Add(prefix);
-                continue;
+
+                toExpand.Add((prefix, depth, serverHash, serverCount, clientCount));
             }
 
-            // Check children
-            var (c0, sh0, sc0, c1, sh1, sc1) = _remote.GetChildrenWithHashes(prefix, depth);
-            var (_, _, cc0, _, _, cc1) = _local.GetChildrenWithHashes(prefix, depth);
+            if (toExpand.Count == 0) break;
 
+            // --- Level-batched BFS: one round trip for the entire current level ---
+            var requests = toExpand.Select(e => (e.Prefix, e.Depth)).ToList();
+            var serverResponses = _remote.GetChildrenWithHashesBatch(requests);
             RoundTrips++;
-            BytesSent += prefix.NetworkSize + sizeof(int);     // prefix + depth
-            BytesReceived += 2 * (SetsumSize + CountSize);     // two (Hash, Count) pairs
+            BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
+            BytesReceived += toExpand.Count * 2 * (SetsumSize + CountSize);
 
-            if (sc0 > 0) queue.Enqueue((c0, depth + 1, sh0, sc0, cc0));
-            if (sc1 > 0) queue.Enqueue((c1, depth + 1, sh1, sc1, cc1));
+            var nextLevel = new List<(BitPrefix, int, Setsum, int, int)>();
+            for (int i = 0; i < toExpand.Count; i++)
+            {
+                var depth = toExpand[i].Depth;
+                var (c0, sh0, sc0, c1, sh1, sc1) = serverResponses[i];
+                var (_, ch0, cc0, _, ch1, cc1) = _local.GetChildrenWithHashes(toExpand[i].Prefix, depth);
+
+                // Skip subtrees where hashes already match — they are identical.
+                if (sc0 > 0 && sh0 != ch0) nextLevel.Add((c0, depth + 1, sh0, sc0, cc0));
+                if (sc1 > 0 && sh1 != ch1) nextLevel.Add((c1, depth + 1, sh1, sc1, cc1));
+            }
+
+            currentLevel = nextLevel;
         }
 
-        _output.WriteLine($"Prefixes to fetch: {prefixesToFetch.Count}");
+        _output.WriteLine($"Leaf prefixes to sync: {prefixesToSync.Count}");
 
         var missingItems = new List<byte[]>();
-        foreach (var prefix in prefixesToFetch)
+
+        // --- Leaf sync: client sends (prefixSum, prefixCount); server scans its items
+        // to find those whose hashes sum to diff. For missingCount==1 this is a single
+        // linear scan — O(serverPrefixCount) but no items transferred until found.
+        // All leaves batched into one round trip.
+        if (prefixesToSync.Count > 0)
         {
             RoundTrips++;
-            BytesSent += prefix.NetworkSize; // prefix request
-            // FIXME: this is cheating
-            _remote.CollectMissingItemsWithPrefix(prefix, _local, missingItems);
+            foreach (var prefix in prefixesToSync)
+            {
+                var (clientPrefixSum, clientPrefixCount) = _local.GetPrefixInfo(prefix);
+                BytesSent += prefix.NetworkSize + SetsumSize + CountSize;
+
+                var result = _remote.TryReconcilePrefix(prefix, clientPrefixSum, clientPrefixCount);
+                if (result.Outcome == ReconcileOutcome.Found)
+                {
+                    BytesReceived += result.MissingItems!.Count * KeySize;
+                    missingItems.AddRange(result.MissingItems!);
+                }
+                else if (result.Outcome == ReconcileOutcome.Fallback)
+                {
+                    _output.WriteLine("doing a fallback getting all items");
+                    // clientCount==0 case or peeling failed: server sends all items.
+                    BytesSent += prefix.NetworkSize;
+                    var serverItems = _remote.GetItemsWithPrefix(prefix).ToList();
+                    BytesReceived += serverItems.Count * KeySize;
+                    foreach (var item in serverItems)
+                        if (!_local.Contains(item))
+                            missingItems.Add(item);
+                }
+            }
         }
 
         // Ensure globally sorted order that InsertBulkPresorted requires.
@@ -183,7 +231,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
         if (missingItems.Count > 0)
         {
             ItemsTransferred = missingItems.Count;
-            BytesReceived += missingItems.Count * KeySize;
             _local.InsertBulkPresorted(missingItems);
         }
 
