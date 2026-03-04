@@ -43,15 +43,6 @@ public class SortedKeyStore
         return _count;
     }
 
-    /// <summary>
-    /// The Setsum over all items in the store
-    /// </summary>
-    public Setsum TotalHash()
-    {
-        Prepare();
-        return _prefixSums[_count];
-    }
-
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
@@ -183,32 +174,6 @@ public class SortedKeyStore
 
         for (int i = 0; i < _count; i++)
             yield return KeyAt(_data, i).ToArray();
-    }
-
-    public void CollectMissing(byte[] lo, byte[] hi, SortedKeyStore other, List<byte[]> result)
-    {
-        EnsureSorted();
-        other.EnsureSorted();
-
-        int si = LowerBound(lo), sEnd = UpperBound(hi);
-        int li = other.LowerBound(lo), lEnd = other.UpperBound(hi);
-
-        while (si < sEnd)
-        {
-            var sKey = KeyAt(_data, si);
-
-            // Advance other past keys that are strictly less than sKey
-            while (li < lEnd)
-            {
-                int cmp = KeyAt(other._data, li).SequenceCompareTo(sKey);
-                if (cmp > 0) break;        // other is ahead — sKey is missing
-                if (cmp == 0) { li++; goto found; }
-                li++;
-            }
-
-            result.Add(sKey.ToArray());
-        found: si++;
-        }
     }
 
     // -------------------------------------------------------------------------
