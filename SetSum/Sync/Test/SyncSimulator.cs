@@ -1,143 +1,284 @@
-﻿using Xunit.Abstractions;
+using Xunit.Abstractions;
 
 namespace Setsum.Sync.Test;
 
 /// <summary>
-/// Simulates a two-node sync protocol over a network, counting round trips, items, and bytes transferred.
+/// Simulates a two-node sync protocol over a network.
 ///
 /// Protocol overview:
-///   Fast path  – The remote (server) tries to identify and return items the client is missing
-///                in a single round trip using set-difference peeling on recent history.
-///   Trie path  – Full binary-prefix traversal when the diff is too large for the fast path.
+///   Each node maintains two append-only stores:
+///     AddStore    - all inserted keys. Synced server->client (unidirectional).
+///     DeleteStore - all deleted keys. Synced server->client (unidirectional).
 ///
-/// Trie optimisations:
-///   1. Level-batched BFS  — All nodes at the same BFS depth are queried in one round trip,
-///      reducing traversal cost from O(nodes) trips to O(depth) trips.
-///   2. Count-only BFS traversal — Since the protocol is unidirectional (server always has a
-///      superset of client data), serverCount > clientCount implies a difference and
-///      serverCount == clientCount implies identical. No hashes needed during traversal.
-///   3. Prefix Setsum peeling at leaves — Instead of uploading all client keys under a
-///      leaf prefix (O(N/leaves) bytes), the client sends only PrefixSum (32 bytes).
-///      The server peels up to 2 missing items from its data under that prefix.
-///      Falls back to key-list exchange only when clientCount == 0 (nothing to peel from),
-///      or when the server prefix is too large for pair peeling.
+///   After syncing both stores the client applies any new deletes to its add store,
+///   producing the correct effective set without ever needing bidirectional trie logic.
+///
+///   Epoch - bumped when the server compacts its delete store. The client detects
+///   this, materializes local tombstones, repairs add-store drift, wipes local delete store,
+///   then resumes normal add/delete sync.
 /// </summary>
-public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
+public class SyncSimulator(SyncableNode local, SyncableNode remote)
 {
-    // Stop recursing once missingCount <= LeafThreshold — TryReconcilePrefix handles
-    // both missingCount==1 (linear scan) and missingCount==2 (O(n²) pair scan).
     private const int LeafThreshold = 2;
-
-    // Maximum prefix depth before we force a leaf transfer (64 bits = 8 bytes of the key).
     private const int MaxPrefixDepth = 64;
+    private const int EpochRepairLeafItemThreshold = 64;
 
-    private const int KeySize = Setsum.DigestSize;    // 32 bytes per key
-    private const int SetsumSize = Setsum.DigestSize; // 32 bytes per Setsum
-    private const int CountSize = sizeof(int);        // 4 bytes per count
+    private const int KeySize = Setsum.DigestSize;
+    private const int SetsumSize = Setsum.DigestSize;
+    private const int CountSize = sizeof(int);
+    private const int EpochSize = sizeof(int);
 
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }
-
-    /// <summary>
-    /// Number of items actually transferred from remote to local (i.e. items local was missing).
-    /// Duplicate items that local already had are NOT counted.
-    /// </summary>
-    public int ItemsTransferred { get; private set; }
-
-    /// <summary>Bytes sent from local (client) to remote (server).</summary>
+    public int ItemsAdded { get; private set; }
+    public int ItemsDeleted { get; private set; }
     public int BytesSent { get; private set; }
-
-    /// <summary>Bytes received by local (client) from remote (server).</summary>
     public int BytesReceived { get; private set; }
 
-    /// <summary>Total bytes exchanged in both directions.</summary>
-    public int TotalBytes => BytesSent + BytesReceived;
+    private readonly SyncableNode _local = local;
+    private readonly SyncableNode _remote = remote;
 
-    private readonly ReconcilableSet _local = local;
-    private readonly ReconcilableSet _remote = remote;
-
-    public bool TrySync(ITestOutputHelper _output)
+    public bool TrySync(ITestOutputHelper output)
     {
         RoundTrips = 0;
         UsedFallback = false;
-        ItemsTransferred = 0;
+        ItemsAdded = 0;
+        ItemsDeleted = 0;
         BytesSent = 0;
         BytesReceived = 0;
 
-        // Fast path: server tries to identify what the client is missing via Setsum peeling.
-        var remoteResult = _remote.TryReconcile(_local.Sum(), _local.Count());
+        // Step 1: epoch handshake.
+        BytesSent += EpochSize;
+        BytesReceived += EpochSize;
         RoundTrips++;
-        BytesSent += SetsumSize + CountSize; // (Sum, Count)
 
-        _output.WriteLine($"result of first reconcile: {remoteResult.Outcome}");
-
-        switch (remoteResult.Outcome)
+        int epochRepairRemoved = 0;
+        if (_local.DeleteEpoch != _remote.DeleteEpoch)
         {
-            case ReconcileOutcome.Identical:
-                return true;
+            output.WriteLine("Delete store epoch mismatch - materializing local tombstones before reset");
+            epochRepairRemoved += _local.MaterializeLocalDeleteStore();
 
-            case ReconcileOutcome.Found:
-                foreach (var item in remoteResult.MissingItems!)
-                {
-                    BytesReceived += KeySize;
-                    if (!_local.Contains(item))
-                    {
-                        _local.Insert(item);
-                        ItemsTransferred++;
-                    }
-                }
-                return true;
+            output.WriteLine("Delete store epoch mismatch - repairing add store by authoritative prefix sync");
+            var (_, repairRemoved) = RepairAddStoreAfterEpoch(output);
+            epochRepairRemoved += repairRemoved;
 
-            case ReconcileOutcome.Fallback:
-                break; // fall through to trie
+            _local.WipeDeleteStore();
+            _local.DeleteEpoch = _remote.DeleteEpoch;
         }
 
-        // Trie fallback
-        UsedFallback = true;
-        return PerformTrieSync(_output);
+        // Step 2: sync add store (server -> client, unidirectional).
+        var added = SyncStore(_remote.AddStore, _local.AddStore, output, "add");
+        ItemsAdded = added.Count;
+        if (added.Count > 0)
+        {
+            added.Sort(ByteComparer.Instance);
+            _local.AddStore.InsertBulkPresorted(added);
+            _local.AddStore.Prepare();
+        }
+
+        // Step 3: sync delete store (server -> client, unidirectional).
+        var newDeletes = SyncStore(_remote.DeleteStore, _local.DeleteStore, output, "delete");
+        if (newDeletes.Count > 0)
+        {
+            newDeletes.Sort(ByteComparer.Instance);
+            _local.DeleteStore.InsertBulkPresorted(newDeletes);
+        }
+
+        // Step 4: apply deletes + update epoch.
+        ItemsDeleted = epochRepairRemoved + _local.ApplyDeletes(newDeletes);
+        _local.DeleteEpoch = _remote.DeleteEpoch;
+
+        output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
+        return true;
     }
-
-    /// <summary>
-    /// Binary-prefix trie sync.
-    ///
-    /// BFS descends until missingCount <= LeafThreshold (2) per prefix, pruning
-    /// identical subtrees via count comparison alone — valid because the protocol is
-    /// unidirectional (server is always a superset of the client).
-    /// All nodes at the same depth are queried in one batched round trip — O(depth) trips total.
-    ///
-    /// At leaves the server attempts Setsum peeling (missingCount==1: linear scan,
-    /// missingCount==2: O(n²) pair scan). If the server prefix is too large for
-    /// pair peeling it returns Fallback — those prefixes are re-enqueued into the
-    /// BFS for further descent rather than silently dropped.
-    /// </summary>
-    private bool PerformTrieSync(ITestOutputHelper _output)
+    private (int Added, int Removed) RepairAddStoreAfterEpoch(ITestOutputHelper output)
     {
-        var missingItems = new List<byte[]>();
+        int added = 0;
+        int removed = 0;
+        var pendingRemoves = new List<byte[]>();
 
-        // BFS level: list of (prefix, depth, serverCount, clientCount).
-        var currentLevel = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
+        var (serverRootHash, serverRootCount) = _remote.AddStore.GetPrefixInfo(BitPrefix.Root);
+        var (clientRootHash, clientRootCount) = _local.AddStore.GetPrefixInfo(BitPrefix.Root);
 
-        var (_, rootServerCount) = _remote.GetPrefixInfo(BitPrefix.Root);
-        var (_, rootClientCount) = _local.GetPrefixInfo(BitPrefix.Root);
         RoundTrips++;
         BytesSent += BitPrefix.Root.NetworkSize;
-        BytesReceived += CountSize; // count only — no hash needed at root
+        BytesReceived += SetsumSize + CountSize;
 
-        if (rootServerCount == 0) return true;
+        if (serverRootHash == clientRootHash && serverRootCount == clientRootCount)
+            return (0, 0);
+
+        var currentLevel = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, Setsum ClientHash, int ClientCount)>
+        {
+            (BitPrefix.Root, 0, serverRootHash, serverRootCount, clientRootHash, clientRootCount)
+        };
+
+        while (currentLevel.Count > 0)
+        {
+            var leaves = new List<(BitPrefix Prefix, int ServerCount, int ClientCount)>();
+            var toExpand = new List<(BitPrefix Prefix, int Depth)>();
+
+            foreach (var node in currentLevel)
+            {
+                if (node.ServerCount == node.ClientCount && node.ServerHash == node.ClientHash)
+                    continue;
+
+                int maxCount = Math.Max(node.ServerCount, node.ClientCount);
+                bool isLeaf = node.Depth >= MaxPrefixDepth || maxCount <= EpochRepairLeafItemThreshold;
+                if (isLeaf)
+                    leaves.Add((node.Prefix, node.ServerCount, node.ClientCount));
+                else
+                    toExpand.Add((node.Prefix, node.Depth));
+            }
+
+            if (leaves.Count > 0)
+            {
+                RoundTrips++;
+                foreach (var leaf in leaves)
+                {
+                    BytesSent += leaf.Prefix.NetworkSize + CountSize + SetsumSize;
+
+                    var serverItems = _remote.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
+                    var clientItems = _local.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
+
+                    var (_, toRemove) = DiffSorted(serverItems, clientItems);
+
+                    if (toRemove.Count > 0)
+                    {
+                        pendingRemoves.AddRange(toRemove);
+                        removed += toRemove.Count;
+                    }
+
+                    // For accounting we model a remove-only repair response.
+                    BytesReceived += toRemove.Count * KeySize;
+                }
+            }
+
+            if (toExpand.Count == 0)
+                break;
+
+            RoundTrips++;
+            BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
+            BytesReceived += toExpand.Count * 2 * (SetsumSize + CountSize);
+
+            var nextLevel = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, Setsum ClientHash, int ClientCount)>(toExpand.Count * 2);
+            foreach (var (prefix, depth) in toExpand)
+            {
+                var c0 = prefix.Extend(0);
+                var c1 = prefix.Extend(1);
+
+                var (sh0, sc0) = _remote.AddStore.GetPrefixInfo(c0);
+                var (ch0, cc0) = _local.AddStore.GetPrefixInfo(c0);
+                if (sc0 != cc0 || sh0 != ch0)
+                    nextLevel.Add((c0, depth + 1, sh0, sc0, ch0, cc0));
+
+                var (sh1, sc1) = _remote.AddStore.GetPrefixInfo(c1);
+                var (ch1, cc1) = _local.AddStore.GetPrefixInfo(c1);
+                if (sc1 != cc1 || sh1 != ch1)
+                    nextLevel.Add((c1, depth + 1, sh1, sc1, ch1, cc1));
+            }
+
+            currentLevel = nextLevel;
+        }
+
+        if (pendingRemoves.Count > 0)
+        {
+            pendingRemoves.Sort(ByteComparer.Instance);
+            _local.AddStore.DeleteBulkPresorted(pendingRemoves);
+        }
+
+        _local.AddStore.Prepare();
+        output.WriteLine($"epoch add-store repair: +{added} / -{removed}");
+        return (added, removed);
+    }
+    private static (List<byte[]> ToAdd, List<byte[]> ToRemove) DiffSorted(List<byte[]> serverItems, List<byte[]> clientItems)
+    {
+        var toAdd = new List<byte[]>();
+        var toRemove = new List<byte[]>();
+
+        int i = 0;
+        int j = 0;
+
+        while (i < serverItems.Count && j < clientItems.Count)
+        {
+            int cmp = ByteComparer.Instance.Compare(serverItems[i], clientItems[j]);
+            if (cmp == 0)
+            {
+                i++;
+                j++;
+            }
+            else if (cmp < 0)
+            {
+                toAdd.Add(serverItems[i++]);
+            }
+            else
+            {
+                toRemove.Add(clientItems[j++]);
+            }
+        }
+
+        while (i < serverItems.Count)
+            toAdd.Add(serverItems[i++]);
+        while (j < clientItems.Count)
+            toRemove.Add(clientItems[j++]);
+
+        return (toAdd, toRemove);
+    }
+
+    // Shared unidirectional store sync.
+    // Returns newly received items (not yet inserted into the client store).
+    private List<byte[]> SyncStore(ReconcilableSet server, ReconcilableSet client,
+        ITestOutputHelper output, string label)
+    {
+        var fastResult = server.TryReconcile(client.Sum(), client.Count());
+        RoundTrips++;
+        BytesSent += SetsumSize + CountSize;
+
+        output.WriteLine($"{label} store fast path: {fastResult.Outcome}");
+
+        switch (fastResult.Outcome)
+        {
+            case ReconcileOutcome.Identical:
+                return [];
+
+            case ReconcileOutcome.Found:
+                var found = new List<byte[]>();
+                foreach (var item in fastResult.MissingItems!)
+                {
+                    BytesReceived += KeySize;
+                    if (!client.Contains(item))
+                        found.Add(item);
+                }
+                return found;
+        }
+
+        UsedFallback = true;
+        return PerformTrieSync(server, client, output, label);
+    }
+
+    private List<byte[]> PerformTrieSync(ReconcilableSet server, ReconcilableSet client,
+        ITestOutputHelper output, string label)
+    {
+        var missingItems = new List<byte[]>();
+        var currentLevel = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
+
+        var (_, rootServerCount) = server.GetPrefixInfo(BitPrefix.Root);
+        var (_, rootClientCount) = client.GetPrefixInfo(BitPrefix.Root);
+        RoundTrips++;
+        BytesSent += BitPrefix.Root.NetworkSize;
+        BytesReceived += CountSize;
+
+        if (rootServerCount == 0) return missingItems;
 
         currentLevel.Add((BitPrefix.Root, 0, rootServerCount, rootClientCount));
 
         while (currentLevel.Count > 0)
         {
-            // Partition current level into leaves (to peel) and interior nodes (to expand).
             var prefixesToSync = new List<BitPrefix>();
             var toExpand = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
 
             foreach (var (prefix, depth, serverCount, clientCount) in currentLevel)
             {
                 int missingCount = serverCount - clientCount;
-
-                // Unidirectional invariant: equal counts means identical subtree — skip.
                 if (missingCount == 0) continue;
 
                 if (clientCount == 0 || missingCount <= LeafThreshold || prefix.Length >= MaxPrefixDepth)
@@ -149,7 +290,6 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                 toExpand.Add((prefix, depth, serverCount, clientCount));
             }
 
-            // --- Leaf peeling: one round trip for all leaves at this level ---
             if (prefixesToSync.Count > 0)
             {
                 RoundTrips++;
@@ -157,10 +297,10 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
                 foreach (var prefix in prefixesToSync)
                 {
-                    var (clientPrefixSum, _) = _local.GetPrefixInfo(prefix);
+                    var (clientPrefixSum, _) = client.GetPrefixInfo(prefix);
                     BytesSent += prefix.NetworkSize + SetsumSize;
 
-                    var result = _remote.TryReconcilePrefix(prefix, clientPrefixSum);
+                    var result = server.TryReconcilePrefix(prefix, clientPrefixSum);
                     if (result.Outcome == ReconcileOutcome.Found)
                     {
                         BytesReceived += result.MissingItems!.Count * KeySize;
@@ -168,15 +308,12 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
                     }
                     else if (result.Outcome == ReconcileOutcome.Fallback)
                     {
-                        // Server prefix too large for pair peel — expand into children
-                        // unless we are already at max depth, in which case send all items.
-                        var (_, sc) = _remote.GetPrefixInfo(prefix);
-                        var (_, cc) = _local.GetPrefixInfo(prefix);
+                        var (_, sc) = server.GetPrefixInfo(prefix);
+                        var (_, cc) = client.GetPrefixInfo(prefix);
                         RoundTrips++;
                         if (prefix.Length >= MaxPrefixDepth)
                         {
-                            // Force full item transfer at max depth.
-                            missingItems.AddRange(_remote.GetItemsWithPrefix(prefix));
+                            missingItems.AddRange(server.GetItemsWithPrefix(prefix));
                             BytesReceived += sc * KeySize;
                             RoundTrips++;
                         }
@@ -192,10 +329,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
 
             if (toExpand.Count == 0) break;
 
-            // --- Level-batched BFS: one round trip for the entire current level ---
-            // Only counts are exchanged — hashes are unnecessary in a unidirectional protocol.
             var requests = toExpand.Select(e => (e.Prefix, e.Depth)).ToList();
-            var serverResponses = _remote.GetChildrenCountsBatch(requests);
+            var serverResponses = server.GetChildrenCountsBatch(requests);
             RoundTrips++;
             BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
             BytesReceived += toExpand.Count * 2 * CountSize;
@@ -205,9 +340,8 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             {
                 var depth = toExpand[i].Depth;
                 var (c0, sc0, c1, sc1) = serverResponses[i];
-                var (cc0, cc1) = _local.GetChildrenCounts(toExpand[i].Prefix, depth);
+                var (cc0, cc1) = client.GetChildrenCounts(toExpand[i].Prefix, depth);
 
-                // Only descend into subtrees where server has more items than client.
                 if (sc0 > cc0) nextLevel.Add((c0, depth + 1, sc0, cc0));
                 if (sc1 > cc1) nextLevel.Add((c1, depth + 1, sc1, cc1));
             }
@@ -215,17 +349,7 @@ public class SyncSimulator(ReconcilableSet local, ReconcilableSet remote)
             currentLevel = nextLevel;
         }
 
-        _output.WriteLine($"Leaf prefixes synced: {missingItems.Count} items recovered");
-
-        // Ensure globally sorted order that InsertBulkPresorted requires.
-        missingItems.Sort(ByteComparer.Instance);
-
-        if (missingItems.Count > 0)
-        {
-            ItemsTransferred = missingItems.Count;
-            _local.InsertBulkPresorted(missingItems);
-        }
-
-        return true;
+        output.WriteLine($"{label} trie: {missingItems.Count} items recovered");
+        return missingItems;
     }
 }

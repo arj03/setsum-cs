@@ -18,6 +18,12 @@ public class ReconcilableSet
     // At 256 items the search space is 256² = 65,536 pairs — cheap enough to do inline.
     private const int MaxServerCountForPairPeel = 256;
 
+    /// <summary>
+    /// Monotonic epoch. Bumped when the delete store is compacted so clients know
+    /// to re-sync the delete store from scratch rather than from their last watermark.
+    /// </summary>
+    public long Epoch { get; private set; }
+
     public Setsum Sum() => _store.TotalInfo().Hash;
 
     public long Count() => _store.Count();
@@ -64,6 +70,22 @@ public class ReconcilableSet
         Debug.Assert(IsSorted(items), "InsertBulkPresorted called with unsorted input — store invariants would be corrupted.");
 
         InsertSortedArray(items.ToArray());
+    }
+
+    /// <summary>
+    /// Removes multiple keys that are already sorted — single O(N) merge pass.
+    /// </summary>
+    public void DeleteBulkPresorted(List<byte[]> items)
+    {
+        if (items.Count == 0) return;
+        Debug.Assert(IsSorted(items), "DeleteBulkPresorted called with unsorted input.");
+
+        int n = items.Count;
+        var flat = new byte[n * Setsum.DigestSize];
+        for (int i = 0; i < n; i++)
+            items[i].CopyTo(flat, i * Setsum.DigestSize);
+
+        _store.RemoveSorted(flat, n);
     }
 
     public bool Contains(byte[] key) => _store.Contains(key);

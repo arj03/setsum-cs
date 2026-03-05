@@ -18,21 +18,23 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         return bytes;
     }
 
-    [Fact]
-    public void Perf_FastPath_SmallDiff_IsInstantAndEfficient()
+    private (SyncableNode server, SyncableNode client) MakeNodesWithSharedKeys(int shared)
     {
-        // 100 shared items, server has 3 extra items the client doesn't.
-        // Expected: server peels the 3 items from its history, returns them in 1 trip.
-        var server = new ReconcilableSet();
-        var client = new ReconcilableSet();
-
-        for (int i = 0; i < 100; i++)
+        var server = new SyncableNode();
+        var client = new SyncableNode();
+        for (int i = 0; i < shared; i++)
         {
             var k = RandomKey();
             server.Insert(k);
             client.Insert(k);
         }
+        return (server, client);
+    }
 
+    [Fact]
+    public void Perf_Add_SmallDiff_FastPath()
+    {
+        var (server, client) = MakeNodesWithSharedKeys(100);
         for (int i = 0; i < 3; i++) server.Insert(RandomKey());
 
         var sim = new SyncSimulator(client, server);
@@ -41,31 +43,20 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         bool success = sim.TrySync(_output);
         sw.Stop();
 
-        Assert.True(success, "Should resolve via fast path");
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.Equal(3, sim.ItemsTransferred);
+        Assert.True(success);
+        Assert.Equal(3, sim.RoundTrips);
+        Assert.Equal(3, sim.ItemsAdded);
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(0, sim.ItemsDeleted);
 
-        Assert.Equal(server.Count(), client.Count());
-        Assert.Equal(server.Sum(), client.Sum());
-
-        _output.WriteLine($"Small Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}");
+        _output.WriteLine($"Small Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}");
     }
 
     [Fact]
-    public void Perf_FastPath_MediumDiff_IsFastAndEfficient()
+    public void Perf_Add_MediumDiff_FastPath()
     {
-        // 100 shared items, server has 8 extra items (within the RecentScanLimit window).
-        // Expected: still resolved in 1 trip using recent-history scan.
-        var server = new ReconcilableSet();
-        var client = new ReconcilableSet();
-
-        for (int i = 0; i < 100; i++)
-        {
-            var k = RandomKey();
-            server.Insert(k);
-            client.Insert(k);
-        }
-
+        var (server, client) = MakeNodesWithSharedKeys(100);
         for (int i = 0; i < 8; i++) server.Insert(RandomKey());
 
         var sim = new SyncSimulator(client, server);
@@ -74,130 +65,197 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         bool success = sim.TrySync(_output);
         sw.Stop();
 
-        Assert.True(success, "Should resolve via recent-history scan");
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.Equal(8, sim.ItemsTransferred);
-
-        Assert.Equal(server.Count(), client.Count());
-        Assert.Equal(server.Sum(), client.Sum());
-
-        _output.WriteLine($"Medium Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}");
+        Assert.True(success);
+        Assert.Equal(3, sim.RoundTrips);
+        Assert.Equal(8, sim.ItemsAdded);
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
         Assert.True(sw.ElapsedMilliseconds < 100);
+
+        _output.WriteLine($"Medium Diff – Time: {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}");
     }
 
     [Fact]
-    public void Perf_LargeDiff_Fallback_SavesComputeTime()
+    public void Perf_Add_LargeDiff_Fallback_SavesComputeTime()
     {
-        // Diff is way beyond MaxDiffForRecentScan so fast-path should bail immediately.
-        // We want to confirm the simulator reports failure fast (before fallback kicks in).
-        // This test deliberately stops at the fast-path stage; it doesn't exercise Trie fallback.
-        var server = new ReconcilableSet();
-        var client = new ReconcilableSet();
-
-        for (int i = 0; i < 50_000; i++)
-        {
-            var k = RandomKey();
-            server.Insert(k);
-            client.Insert(k);
-        }
+        var (server, client) = MakeNodesWithSharedKeys(50_000);
 
         for (int i = 0; i < 50_000; i++) server.Insert(RandomKey());
 
         // Use a simulator that stops after the fast-path check so we can time just that.
         // (TrySync will go on to Trie; we want to time TryReconcile directly.)
         var sw = Stopwatch.StartNew();
-        var result = server.TryReconcile(client.Sum(), client.Count());
+        var result = server.AddStore.TryReconcile(client.AddStore.Sum(), client.AddStore.Count());
         sw.Stop();
 
-        Assert.True(result.Outcome == ReconcileOutcome.Fallback, "Large diff should immediately signal Fallback");
-
+        Assert.Equal(ReconcileOutcome.Fallback, result.Outcome);
         _output.WriteLine($"Fast-path bailout – Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     [Fact]
-    public void Perf_Identical_IsOneTrip()
+    public void Perf_Identical_IsMinimal()
     {
-        var server = new ReconcilableSet();
-        var client = new ReconcilableSet();
-
-        for (int i = 0; i < 100; i++)
-        {
-            var k = RandomKey();
-            server.Insert(k);
-            client.Insert(k);
-        }
-
-        var sim = new SyncSimulator(client, server);
-        bool success = sim.TrySync(_output);
-
-        Assert.True(success);
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.Equal(0, sim.ItemsTransferred);
-    }
-
-    [Fact]
-    public void Perf_LargeDiff_TrieFallback_RecoversEfficiently()
-    {
-        var server = new ReconcilableSet();
-        var client = new ReconcilableSet();
-
-        var swInsert = Stopwatch.StartNew();
-        for (int i = 0; i < 1_000_000; i++)
-        {
-            var k = RandomKey();
-            server.Insert(k);
-            client.Insert(k);
-        }
-
-        int newItems = 10_000;
-        for (int i = 0; i < newItems; i++) server.Insert(RandomKey());
-
-        // Pay the sort + prefix-sum cost now, before the timed sync window.
-        client.Prepare();
-        server.Prepare();
-
-        swInsert.Stop();
-        _output.WriteLine($"Setup time, doing 2 * 1 million inserts: {swInsert.Elapsed.TotalMilliseconds:F2} ms");
-
+        var (server, client) = MakeNodesWithSharedKeys(100);
         var sim = new SyncSimulator(client, server);
 
         var sw = Stopwatch.StartNew();
         bool success = sim.TrySync(_output);
         sw.Stop();
 
-        Assert.True(success, "Trie sync should succeed");
-        Assert.True(sim.UsedFallback, "Should have used Trie fallback");
-
-        Assert.Equal(server.Count(), client.Count());
-        Assert.Equal(server.Sum(), client.Sum());
-
-        Assert.Equal(newItems, sim.ItemsTransferred);
-
-        _output.WriteLine($"Trie – Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes received: {sim.BytesReceived}, Bytes sent: {sim.BytesSent}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+        Assert.True(success);
+        Assert.Equal(0, sim.ItemsAdded);
+        Assert.Equal(0, sim.ItemsDeleted);
+        // 3 round trips minimum: add store fast path + epoch check + delete store fast path
+        Assert.Equal(3, sim.RoundTrips);
     }
 
     [Fact]
-    public void Perf_TrieSync_EmptyClient_FullTransfer()
+    public void Perf_Add_LargeDiff_TrieFallback_RecoversEfficiently()
     {
-        var server = new ReconcilableSet();
-        var client = new ReconcilableSet();
+        var swInsert = Stopwatch.StartNew();
+        var (server, client) = MakeNodesWithSharedKeys(1_000_000);
+
+        int newItems = 10_000;
+        for (int i = 0; i < newItems; i++) server.Insert(RandomKey());
+
+        client.Prepare();
+        server.Prepare();
+        swInsert.Stop();
+        _output.WriteLine($"Setup: {swInsert.Elapsed.TotalMilliseconds:F2} ms");
+
+        var sim = new SyncSimulator(client, server);
+        var sw = Stopwatch.StartNew();
+        bool success = sim.TrySync(_output);
+        sw.Stop();
+
+        Assert.True(success);
+        Assert.True(sim.UsedFallback);
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(newItems, sim.ItemsAdded);
+
+        _output.WriteLine($"Trie – Trips: {sim.RoundTrips}, Added: {sim.ItemsAdded}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    [Fact]
+    public void Perf_Add_LargeDiff_TrieSync_EmptyClient_FullTransfer()
+    {
+        var server = new SyncableNode();
+        var client = new SyncableNode();
 
         int items = 10_000;
-
         for (int i = 0; i < items; i++) server.Insert(RandomKey());
 
         var sim = new SyncSimulator(client, server);
         bool success = sim.TrySync(_output);
 
         Assert.True(success);
-        Assert.Equal(server.Count(), client.Count());
-        Assert.Equal(server.Sum(), client.Sum());
-        Assert.Equal(items, sim.ItemsTransferred);
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(items, sim.ItemsAdded);
 
-        // Trips: 1 (fast-path check) + 1 (root hash check → short-circuit) + 1 (batch fetch) = 3.
-        // Crucially this is a constant regardless of how many items the server has.
-        Assert.Equal(3, sim.RoundTrips);
+        _output.WriteLine($"Empty Client – Trips: {sim.RoundTrips}, Items: {sim.ItemsAdded}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}");
+    }
 
-        _output.WriteLine($"Empty Client – Trips: {sim.RoundTrips}, Items transferred: {sim.ItemsTransferred}, Bytes transferred: {sim.TotalBytes}");
+    // ── Delete tests ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Perf_Delete_RecoversAddsAndDeletes()
+    {
+        var server = new SyncableNode();
+        var client = new SyncableNode();
+        var sharedKeys = new List<byte[]>();
+
+        for (int i = 0; i < 1_000_000; i++)
+        {
+            var k = RandomKey();
+            sharedKeys.Add(k);
+            server.Insert(k);
+            client.Insert(k);
+        }
+
+        int changeCount = 1_000;
+        foreach (var k in sharedKeys.Take(changeCount)) server.Delete(k);
+        for (int i = 0; i < changeCount; i++) server.Insert(RandomKey());
+
+        server.Prepare();
+        client.Prepare();
+
+        var sim = new SyncSimulator(client, server);
+        var sw = Stopwatch.StartNew();
+        bool success = sim.TrySync(_output);
+        sw.Stop();
+
+        Assert.True(success);
+        Assert.Equal(changeCount, sim.ItemsAdded);
+        Assert.Equal(changeCount, sim.ItemsDeleted);
+
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+
+        _output.WriteLine($"Deletes – Trips: {sim.RoundTrips}, Added: {sim.ItemsAdded}, Deleted: {sim.ItemsDeleted}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    [Fact]
+    public void Perf_Delete_Epoch_Resync()
+    {
+        var server = new SyncableNode();
+        var client = new SyncableNode();
+        var sharedKeys = new List<byte[]>();
+
+        for (int i = 0; i < 1_000_000; i++)
+        {
+            var k = RandomKey();
+            sharedKeys.Add(k);
+            server.Insert(k);
+            client.Insert(k);
+        }
+
+        int changeCount = 5_000;
+
+        // First sync: server deletes some keys.
+        foreach (var k in sharedKeys.Take(changeCount)) server.Delete(k);
+        server.Prepare(); 
+        client.Prepare();
+        
+        var firstSyncSuccess = new SyncSimulator(client, server).TrySync(_output);
+
+        Assert.True(firstSyncSuccess);
+
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+
+        // remove one element after sync
+        server.Delete(sharedKeys[changeCount + 1]);
+
+        var sumBeforeCompaction = server.Sum();
+
+        // Server compacts (wipes) delete store, bumps epoch.
+        server.CompactDeleteStore();
+
+        Assert.Equal(sumBeforeCompaction, server.Sum());
+
+        // Server makes more changes after compaction.
+        foreach (var k in sharedKeys.Skip(changeCount).Take(changeCount)) server.Delete(k);
+        for (int i = 0; i < changeCount; i++) server.Insert(RandomKey());
+        server.Prepare(); client.Prepare();
+
+        var sim = new SyncSimulator(client, server);
+        var sw = Stopwatch.StartNew();
+        bool success = sim.TrySync(_output);
+        sw.Stop();
+
+        Assert.True(success);
+
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+
+        _output.WriteLine($"Epoch – Trips: {sim.RoundTrips}, Added: {sim.ItemsAdded}, Deleted: {sim.ItemsDeleted}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 }

@@ -264,3 +264,77 @@ For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round tr
 | `BitPrefix.cs` | Bit-level trie prefix for binary-prefix traversal |
 | `ReconcileResult.cs` | Discriminated union result type (`Identical / Found / Fallback`) |
 | `SyncSimulator.cs` | Test harness simulating two-node sync, counting round-trips and bytes |
+
+---
+
+## Delete Protocol Addendum (Current Implementation)
+
+This section documents the delete protocol currently implemented in `SyncableNode` and `SyncSimulator`.
+
+### Why Epochs Exist
+
+Delete tombstones grow forever if they are never compacted. Epochs let the server compact safely while giving clients a clear signal that compaction happened.
+
+Without epochs, you must either:
+
+- keep tombstones forever, or
+- risk clients silently missing deletes that were compacted before they synced.
+
+### Data Model
+
+- `AddStore`: inserted keys
+- `DeleteStore`: tombstones
+- Effective membership: `AddStore - DeleteStore`
+
+### Server Compaction
+
+`CompactDeleteStore` does:
+
+1. Remove all keys in `DeleteStore` from server `AddStore`.
+2. Clear server `DeleteStore`.
+3. Increment `DeleteEpoch`.
+
+```mermaid
+flowchart TD
+    A["DeleteStore tombstones"] --> B["Apply to AddStore"]
+    B --> C["Clear DeleteStore"]
+    C --> D["DeleteEpoch++"]
+```
+
+### Client Flow On Epoch Mismatch
+
+If `client.DeleteEpoch != server.DeleteEpoch`, client runs:
+
+1. Materialize local tombstones into local `AddStore` (`MaterializeLocalDeleteStore`).
+2. Run authoritative add-store repair (`RepairAddStoreAfterEpoch`) to remove stale local keys.
+3. Wipe local `DeleteStore`.
+4. Set local `DeleteEpoch = server.DeleteEpoch`.
+5. Continue normal add sync, then normal delete sync.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: Send client DeleteEpoch
+    S-->>C: Send server DeleteEpoch
+
+    alt Epoch mismatch
+        C->>C: Materialize local DeleteStore into AddStore
+        C->>S: Authoritative add-store repair
+        S-->>C: Prefix-diff repair responses
+        C->>C: Wipe local DeleteStore
+        C->>C: Set local DeleteEpoch
+    end
+
+    C->>S: Normal AddStore sync
+    S-->>C: Missing add keys
+    C->>S: Normal DeleteStore sync
+    S-->>C: Missing tombstones
+```
+
+### Tradeoff
+
+- Keeps protocol state simple (no replay log state).
+- Bounded delete storage on server.
+- Epoch mismatch adds an extra repair phase.
