@@ -232,6 +232,9 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         // remove one element after sync
         server.Delete(sharedKeys[changeCount + 1]);
 
+        // and add one
+        server.Insert(RandomKey());
+
         var sumBeforeCompaction = server.Sum();
 
         // Server compacts (wipes) delete store, bumps epoch.

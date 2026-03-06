@@ -59,11 +59,9 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
             epochRepairRemoved += _local.MaterializeLocalDeleteStore();
 
             output.WriteLine("Delete store epoch mismatch - repairing add store by authoritative prefix sync");
-            var (_, repairRemoved) = RepairAddStoreAfterEpoch(output);
-            epochRepairRemoved += repairRemoved;
+            epochRepairRemoved += RepairAddStoreAfterEpoch(output);
 
             _local.WipeDeleteStore();
-            _local.DeleteEpoch = _remote.DeleteEpoch;
         }
 
         // Step 2: sync add store (server -> client, unidirectional).
@@ -92,9 +90,8 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         return true;
     }
 
-    private (int Added, int Removed) RepairAddStoreAfterEpoch(ITestOutputHelper output)
+    private int RepairAddStoreAfterEpoch(ITestOutputHelper output)
     {
-        int added = 0;
         int removed = 0;
         var pendingRemoves = new List<byte[]>();
 
@@ -106,7 +103,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         BytesReceived += SetsumSize + CountSize;
 
         if (serverRootHash == clientRootHash && serverRootCount == clientRootCount)
-            return (0, 0);
+            return 0;
 
         var currentLevel = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, Setsum ClientHash, int ClientCount)>
         {
@@ -188,8 +185,8 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         }
 
         _local.AddStore.Prepare();
-        output.WriteLine($"epoch add-store repair: +{added} / -{removed}");
-        return (added, removed);
+        output.WriteLine($"epoch add-store repair: -{removed}");
+        return removed;
     }
 
     private static (List<byte[]> ToAdd, List<byte[]> ToRemove) DiffSorted(List<byte[]> serverItems, List<byte[]> clientItems)
@@ -251,6 +248,10 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                         found.Add(item);
                 }
                 return found;
+
+            case ReconcileOutcome.Fallback:
+            default:
+                break;
         }
 
         UsedFallback = true;

@@ -114,7 +114,7 @@ public class SortedKeyStore
         while (i < _count)
         {
             CopyKey(_data, i, _scratch, k);
-            _scratchHashes[k++] = _hashes[i++]; 
+            _scratchHashes[k++] = _hashes[i++];
         }
         while (j < newCount)
         {
