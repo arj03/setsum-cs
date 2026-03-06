@@ -67,9 +67,6 @@ public class SortedKeyStore
         _pendingHashes[_pendingCount++] = hash;
     }
 
-    /// <summary>
-    /// Queues a key for removal. Flushed lazily on next query — O(1) per call.
-    /// </summary>
     public void Remove(byte[] key)
     {
         if (_pendingDeleteCount * KeySize >= _pendingDeletes.Length)
@@ -148,7 +145,11 @@ public class SortedKeyStore
             else if (cmp == 0) { i++; j++; } // drop matched key
             else { j++; }      // skip key not in store
         }
-        while (i < _count) { CopyKey(_data, i, _scratch, k); _scratchHashes[k++] = _hashes[i++]; }
+        while (i < _count) 
+        {
+            CopyKey(_data, i, _scratch, k);
+            _scratchHashes[k++] = _hashes[i++];
+        }
 
         (_data, _scratch) = (_scratch, _data);
         (_hashes, _scratchHashes) = (_scratchHashes, _hashes);
