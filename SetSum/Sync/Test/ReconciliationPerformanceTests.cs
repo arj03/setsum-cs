@@ -105,7 +105,10 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         Assert.True(success);
         Assert.Equal(0, sim.ItemsAdded);
         Assert.Equal(0, sim.ItemsDeleted);
-        // 3 round trips minimum: add store fast path + epoch check + delete store fast path
+        // Exactly 3 round trips for a fully-identical sync:
+        //   1. epoch handshake
+        //   2. add store fast-path (Identical → no trie needed)
+        //   3. delete store fast-path (Identical → no trie needed)
         Assert.Equal(3, sim.RoundTrips);
     }
 
@@ -217,9 +220,9 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
 
         // First sync: server deletes some keys.
         foreach (var k in sharedKeys.Take(changeCount)) server.Delete(k);
-        server.Prepare(); 
+        server.Prepare();
         client.Prepare();
-        
+
         var firstSyncSuccess = new SyncSimulator(client, server).TrySync(_output);
 
         Assert.True(firstSyncSuccess);

@@ -1,4 +1,4 @@
-using Xunit.Abstractions;
+ï»¿using Xunit.Abstractions;
 
 namespace Setsum.Sync.Test;
 
@@ -16,11 +16,15 @@ namespace Setsum.Sync.Test;
 ///   Epoch - bumped when the server compacts its delete store. The client detects
 ///   this, materializes local tombstones, repairs add-store drift, wipes local delete store,
 ///   then resumes normal add/delete sync.
+///
+///   NOTE: the epoch repair path (RepairAddStoreAfterEpoch) is the one exception to the
+///   unidirectional rule: it performs a full bidirectional diff of AddStore so it can both
+///   add keys the client is missing AND remove stale keys the server has already compacted out.
 /// </summary>
 public class SyncSimulator(SyncableNode local, SyncableNode remote)
 {
     // Stop recursing once missingCount <= LeafThreshold
-    // TryReconcilePrefix handles both missingCount==1 (linear scan) and missingCount==2 (O(n²) pair scan).
+    // TryReconcilePrefix handles both missingCount==1 (linear scan) and missingCount==2 (O(nÂ²) pair scan).
     private const int LeafThreshold = 2;
     private const int MaxPrefixDepth = 64;
     private const int EpochRepairLeafItemThreshold = 64;
@@ -95,7 +99,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         }
 
         // Step 4: apply deletes + update epoch.
-        ItemsDeleted = epochRepairRemoved + _local.ApplyDeletes(newDeletes);
+        ItemsDeleted = epochRepairRemoved + _local.CountApplicableDeletes(newDeletes);
         _local.DeleteEpoch = _remote.DeleteEpoch;
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
@@ -284,12 +288,12 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
     /// Binary-prefix trie sync.
     ///
     /// BFS descends until missingCount <= LeafThreshold (2) per prefix, pruning
-    /// identical subtrees via count comparison alone — valid because the protocol is
+    /// identical subtrees via count comparison alone â€” valid because the protocol is
     /// unidirectional (server is always a superset of the client).
-    /// All nodes at the same depth are queried in one batched round trip — O(depth) trips total.
+    /// All nodes at the same depth are queried in one batched round trip â€” O(depth) trips total.
     ///
     /// At leaves the server attempts Setsum peeling. If the server prefix is too large for
-    /// pair peeling it returns Fallback — those prefixes are re-enqueued into the
+    /// pair peeling it returns Fallback â€” those prefixes are re-enqueued into the
     /// BFS for further descent rather than silently dropped.
     /// </summary>
     private List<byte[]> PerformTrieSync(ReconcilableSet server, ReconcilableSet client, ITestOutputHelper output, string label)
@@ -316,7 +320,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
             foreach (var (prefix, depth, serverCount, clientCount) in currentLevel)
             {
                 int missingCount = serverCount - clientCount;
-                // Unidirectional invariant: equal counts means identical subtree — skip.
+                // Unidirectional invariant: equal counts means identical subtree â€” skip.
                 if (missingCount == 0) continue;
 
                 if (clientCount == 0 || missingCount <= LeafThreshold || prefix.Length >= MaxPrefixDepth)

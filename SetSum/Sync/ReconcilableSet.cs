@@ -18,15 +18,9 @@ public class ReconcilableSet
     // At 256 items the search space is 256² = 65,536 pairs — cheap enough to do inline.
     private const int MaxServerCountForPairPeel = 256;
 
-    /// <summary>
-    /// Monotonic epoch. Bumped when the delete store is compacted so clients know
-    /// to re-sync the delete store from scratch rather than from their last watermark.
-    /// </summary>
-    public long Epoch { get; private set; }
-
     public Setsum Sum() => _store.TotalInfo().Hash;
 
-    public long Count() => _store.Count();
+    public int Count() => _store.Count();
 
     // Circular buffer of recent insertions for fast-path peeling.
     // Stores (key, hash) pairs so the peeling backtracker can verify candidates
