@@ -53,25 +53,35 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         RoundTrips++;
 
         int epochRepairRemoved = 0;
+        bool addStoreSyncedByRepair = false;
         if (_local.DeleteEpoch != _remote.DeleteEpoch)
         {
             output.WriteLine("Delete store epoch mismatch - materializing local tombstones before reset");
             epochRepairRemoved += _local.MaterializeLocalDeleteStore();
 
+            // Merged bidirectional repair: handles both stale key removal and new key adds
+            // in one trie pass, replacing the separate add sync that would follow.
             output.WriteLine("Delete store epoch mismatch - repairing add store by authoritative prefix sync");
-            epochRepairRemoved += RepairAddStoreAfterEpoch(output);
+            var (repairAdded, repairRemoved) = RepairAddStoreAfterEpoch(output);
+            ItemsAdded = repairAdded;
+            epochRepairRemoved += repairRemoved;
 
             _local.WipeDeleteStore();
+            addStoreSyncedByRepair = true;
         }
 
         // Step 2: sync add store (server -> client, unidirectional).
-        var added = SyncStore(_remote.AddStore, _local.AddStore, output, "add");
-        ItemsAdded = added.Count;
-        if (added.Count > 0)
+        // Skipped when epoch repair already performed a full bidirectional reconciliation.
+        if (!addStoreSyncedByRepair)
         {
-            added.Sort(ByteComparer.Instance);
-            _local.AddStore.InsertBulkPresorted(added);
-            _local.AddStore.Prepare();
+            var added = SyncStore(_remote.AddStore, _local.AddStore, output, "add");
+            ItemsAdded = added.Count;
+            if (added.Count > 0)
+            {
+                added.Sort(ByteComparer.Instance);
+                _local.AddStore.InsertBulkPresorted(added);
+                _local.AddStore.Prepare();
+            }
         }
 
         // Step 3: sync delete store (server -> client, unidirectional).
@@ -90,9 +100,11 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         return true;
     }
 
-    private int RepairAddStoreAfterEpoch(ITestOutputHelper output)
+    private (int Added, int Removed) RepairAddStoreAfterEpoch(ITestOutputHelper output)
     {
+        int added = 0;
         int removed = 0;
+        var pendingAdds = new List<byte[]>();
         var pendingRemoves = new List<byte[]>();
 
         var (serverRootHash, serverRootCount) = _remote.AddStore.GetPrefixInfo(BitPrefix.Root);
@@ -103,7 +115,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         BytesReceived += SetsumSize + CountSize;
 
         if (serverRootHash == clientRootHash && serverRootCount == clientRootCount)
-            return 0;
+            return (0, 0);
 
         var currentLevel = new List<(BitPrefix Prefix, int Depth, Setsum ServerHash, int ServerCount, Setsum ClientHash, int ClientCount)>
         {
@@ -138,16 +150,20 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                     var serverItems = _remote.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
                     var clientItems = _local.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
 
-                    var (_, toRemove) = DiffSorted(serverItems, clientItems);
+                    var (toAdd, toRemove) = DiffSorted(serverItems, clientItems);
 
+                    if (toAdd.Count > 0)
+                    {
+                        pendingAdds.AddRange(toAdd);
+                        added += toAdd.Count;
+                    }
                     if (toRemove.Count > 0)
                     {
                         pendingRemoves.AddRange(toRemove);
                         removed += toRemove.Count;
                     }
 
-                    // For accounting we model a remove-only repair response.
-                    BytesReceived += toRemove.Count * KeySize;
+                    BytesReceived += (toAdd.Count + toRemove.Count) * KeySize;
                 }
             }
 
@@ -183,10 +199,15 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
             pendingRemoves.Sort(ByteComparer.Instance);
             _local.AddStore.DeleteBulkPresorted(pendingRemoves);
         }
+        if (pendingAdds.Count > 0)
+        {
+            pendingAdds.Sort(ByteComparer.Instance);
+            _local.AddStore.InsertBulkPresorted(pendingAdds);
+        }
 
         _local.AddStore.Prepare();
-        output.WriteLine($"epoch add-store repair: -{removed}");
-        return removed;
+        output.WriteLine($"epoch add-store repair: +{added} / -{removed}");
+        return (added, removed);
     }
 
     private static (List<byte[]> ToAdd, List<byte[]> ToRemove) DiffSorted(List<byte[]> serverItems, List<byte[]> clientItems)
