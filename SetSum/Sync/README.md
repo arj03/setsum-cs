@@ -292,10 +292,9 @@ sequenceDiagram
     C->>S: DeleteStore (Sum, Count)
     S-->>C: Missing tombstones
     C->>C: Insert into DeleteStore
-    C->>C: Apply new tombstones to AddStore
 ```
 
-After both stores sync, the client applies any newly received tombstones, keeping `AddStore − DeleteStore` consistent.
+After both stores sync, the effective set (`AddStore − DeleteStore`) is consistent at query time. Tombstones are not physically applied to `AddStore` on the normal path — the subtraction is computed dynamically.
 
 ### Epoch-Mismatch Recovery
 
@@ -320,7 +319,6 @@ sequenceDiagram
     S-->>C: Missing add keys
     C->>S: Normal DeleteStore sync
     S-->>C: Missing tombstones
-    C->>C: Apply tombstones + update epoch
 ```
 
 The repair phase uses the same binary-prefix trie traversal as normal sync, but identifies keys the client holds that the server no longer does — the inverse of the usual direction. Because this is the only place where the client can be *ahead* of the server (holding keys the server has already compacted out), it is handled as a special authoritative repair pass rather than through the normal unidirectional protocol.
