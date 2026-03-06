@@ -31,10 +31,25 @@ public class SyncableNode
     /// <summary>
     /// Records a deletion into the delete store (append-only).
     /// No-op if the key is already recorded as deleted.
+    /// Does not verify the key exists in AddStore — phantom tombstones are harmless
+    /// for correctness (the effective set subtraction handles them) but waste space.
+    /// NOTE: calls Prepare() internally to check for duplicates — for bulk deletes,
+    /// prefer <see cref="DeleteBulk"/> after external deduplication.
     /// </summary>
     public void Delete(byte[] key)
     {
         if (!DeleteStore.Contains(key))
+            DeleteStore.Insert(key);
+    }
+
+    /// <summary>
+    /// Records multiple deletions into the delete store without per-item dedup checks.
+    /// Caller must ensure no duplicates within <paramref name="keys"/> and that none
+    /// are already present in the delete store — duplicate tombstones corrupt the Setsum.
+    /// </summary>
+    public void DeleteBulk(IEnumerable<byte[]> keys)
+    {
+        foreach (var key in keys)
             DeleteStore.Insert(key);
     }
 

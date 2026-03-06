@@ -96,7 +96,8 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         {
             newDeletes.Sort(ByteComparer.Instance);
             _local.DeleteStore.InsertBulkPresorted(newDeletes);
-            ItemsDeleted = newDeletes.Count;
+            _local.DeleteStore.Prepare();
+            ItemsDeleted += newDeletes.Count;
         }
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
@@ -148,10 +149,11 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                 RoundTrips++;
                 foreach (var leaf in leaves)
                 {
-                    BytesSent += leaf.Prefix.NetworkSize + CountSize + SetsumSize;
-
                     var serverItems = _remote.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
                     var clientItems = _local.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
+
+                    // Client sends its keys under this prefix so the server can diff.
+                    BytesSent += leaf.Prefix.NetworkSize + leaf.ClientCount * KeySize;
 
                     var (toAdd, toRemove) = DiffSorted(serverItems, clientItems);
 
@@ -166,7 +168,8 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                         removed += toRemove.Count;
                     }
 
-                    BytesReceived += (toAdd.Count + toRemove.Count) * KeySize;
+                    // Server responds with items to add and keys to remove.
+                    BytesReceived += toAdd.Count * KeySize + toRemove.Count * KeySize;
                 }
             }
 

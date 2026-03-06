@@ -178,8 +178,9 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         }
 
         int changeCount = 1_000;
-        foreach (var k in sharedKeys.Take(changeCount)) server.Delete(k);
-        for (int i = 0; i < changeCount; i++) server.Insert(RandomKey());
+        server.DeleteBulk(sharedKeys.Take(changeCount));
+        for (int i = 0; i < changeCount; i++)
+            server.Insert(RandomKey());
 
         server.Prepare();
         client.Prepare();
@@ -202,7 +203,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void Perf_Delete_Epoch_Resync()
+    public void Perf_Delete_Epoch_Tiny_Resync()
     {
         var server = new SyncableNode();
         var client = new SyncableNode();
@@ -219,7 +220,8 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
         int changeCount = 5_000;
 
         // First sync: server deletes some keys.
-        foreach (var k in sharedKeys.Take(changeCount)) server.Delete(k);
+        server.DeleteBulk(sharedKeys.Take(changeCount));
+        
         server.Prepare();
         client.Prepare();
 
@@ -237,6 +239,126 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
 
         // and add one
         server.Insert(RandomKey());
+
+        var sumBeforeCompaction = server.Sum();
+
+        // Server compacts (wipes) delete store, bumps epoch.
+        server.CompactDeleteStore();
+
+        Assert.Equal(sumBeforeCompaction, server.Sum());
+
+        var sim = new SyncSimulator(client, server);
+        var sw = Stopwatch.StartNew();
+        bool success = sim.TrySync(_output);
+        sw.Stop();
+
+        Assert.True(success);
+
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+
+        _output.WriteLine($"Epoch – Trips: {sim.RoundTrips}, Added: {sim.ItemsAdded}, Deleted: {sim.ItemsDeleted}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    [Fact]
+    public void Perf_Delete_Epoch_Large_Resync()
+    {
+        var server = new SyncableNode();
+        var client = new SyncableNode();
+        var sharedKeys = new List<byte[]>();
+
+        for (int i = 0; i < 1_000_000; i++)
+        {
+            var k = RandomKey();
+            sharedKeys.Add(k);
+            server.Insert(k);
+            client.Insert(k);
+        }
+
+        int changeCount = 5_000;
+
+        // First sync: server deletes some keys.
+        server.DeleteBulk(sharedKeys.Take(changeCount));
+
+        server.Prepare();
+        client.Prepare();
+
+        var firstSyncSuccess = new SyncSimulator(client, server).TrySync(_output);
+
+        Assert.True(firstSyncSuccess);
+
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+
+        int secondChangeCount = 50_000;
+
+        server.DeleteBulk(sharedKeys.Skip(changeCount).Take(secondChangeCount));
+
+        for (int i = 0; i < secondChangeCount; i++)
+            server.Insert(RandomKey());
+
+        var sumBeforeCompaction = server.Sum();
+
+        // Server compacts (wipes) delete store, bumps epoch.
+        server.CompactDeleteStore();
+
+        Assert.Equal(sumBeforeCompaction, server.Sum());
+
+        var sim = new SyncSimulator(client, server);
+        var sw = Stopwatch.StartNew();
+        bool success = sim.TrySync(_output);
+        sw.Stop();
+
+        Assert.True(success);
+
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+
+        _output.WriteLine($"Epoch – Trips: {sim.RoundTrips}, Added: {sim.ItemsAdded}, Deleted: {sim.ItemsDeleted}, BytesRx: {sim.BytesReceived}, BytesTx: {sim.BytesSent}, Time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    [Fact]
+    public void Perf_Delete_Epoch_Only_Adds()
+    {
+        var server = new SyncableNode();
+        var client = new SyncableNode();
+        var sharedKeys = new List<byte[]>();
+
+        for (int i = 0; i < 1_000_000; i++)
+        {
+            var k = RandomKey();
+            sharedKeys.Add(k);
+            server.Insert(k);
+            client.Insert(k);
+        }
+
+        int changeCount = 5_000;
+
+        // First sync: server deletes some keys.
+        server.DeleteBulk(sharedKeys.Take(changeCount));
+
+        server.Prepare();
+        client.Prepare();
+
+        var firstSyncSuccess = new SyncSimulator(client, server).TrySync(_output);
+
+        Assert.True(firstSyncSuccess);
+
+        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+
+        int secondChangeCount = 10_000;
+
+        for (int i = 0; i < secondChangeCount; i++)
+            server.Insert(RandomKey());
 
         var sumBeforeCompaction = server.Sum();
 
