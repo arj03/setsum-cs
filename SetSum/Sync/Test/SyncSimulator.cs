@@ -24,7 +24,7 @@ namespace Setsum.Sync.Test;
 public class SyncSimulator(SyncableNode local, SyncableNode remote)
 {
     // Stop recursing once missingCount <= LeafThreshold
-    // TryReconcilePrefix handles both missingCount==1 (linear scan) and missingCount==2 (O(n²) pair scan).
+    // TryReconcilePrefix handles both missingCount==1 (linear scan) and missingCount==2 (O(n^2) pair scan).
     private const int LeafThreshold = 2;
     private const int MaxPrefixDepth = 64;
     private const int EpochRepairLeafItemThreshold = 64;
@@ -58,21 +58,21 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         BytesReceived += EpochSize;
         RoundTrips++;
 
-        int epochRepairRemoved = 0;
         bool addStoreSyncedByRepair = false;
         if (_local.DeleteEpoch != _remote.DeleteEpoch)
         {
             output.WriteLine("Delete store epoch mismatch - materializing local tombstones before reset");
-            epochRepairRemoved += _local.MaterializeLocalDeleteStore();
+            int epochRepairRemoved = _local.MaterializeLocalDeleteStore();
 
             // Merged bidirectional repair: handles both stale key removal and new key adds
             // in one trie pass, replacing the separate add sync that would follow.
             output.WriteLine("Delete store epoch mismatch - repairing add store by authoritative prefix sync");
             var (repairAdded, repairRemoved) = RepairAddStoreAfterEpoch(output);
             ItemsAdded = repairAdded;
-            epochRepairRemoved += repairRemoved;
+            ItemsDeleted = epochRepairRemoved + repairRemoved;
 
             _local.WipeDeleteStore();
+            _local.DeleteEpoch = _remote.DeleteEpoch;
             addStoreSyncedByRepair = true;
         }
 
@@ -96,11 +96,8 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         {
             newDeletes.Sort(ByteComparer.Instance);
             _local.DeleteStore.InsertBulkPresorted(newDeletes);
+            ItemsDeleted = newDeletes.Count;
         }
-
-        // Step 4: apply deletes + update epoch.
-        ItemsDeleted = epochRepairRemoved + _local.CountApplicableDeletes(newDeletes);
-        _local.DeleteEpoch = _remote.DeleteEpoch;
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
@@ -285,15 +282,13 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
     }
 
     /// <summary>
-    /// Binary-prefix trie sync.
+    /// Binary-prefix trie sync (BFS).
     ///
-    /// BFS descends until missingCount <= LeafThreshold (2) per prefix, pruning
-    /// identical subtrees via count comparison alone — valid because the protocol is
-    /// unidirectional (server is always a superset of the client).
-    /// All nodes at the same depth are queried in one batched round trip — O(depth) trips total.
+    /// Assumes the protocol is unidirectional (server is always a superset of the client).
+    /// All nodes at the same depth are queried in one batched round trip - O(depth) trips total.
     ///
     /// At leaves the server attempts Setsum peeling. If the server prefix is too large for
-    /// pair peeling it returns Fallback — those prefixes are re-enqueued into the
+    /// pair peeling it returns Fallback - those prefixes are re-enqueued into the
     /// BFS for further descent rather than silently dropped.
     /// </summary>
     private List<byte[]> PerformTrieSync(ReconcilableSet server, ReconcilableSet client, ITestOutputHelper output, string label)
@@ -313,17 +308,16 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
 
         while (currentLevel.Count > 0)
         {
-            // Partition current level into leaves (to peel) and interior nodes (to expand).
             var prefixesToSync = new List<BitPrefix>();
             var toExpand = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
 
             foreach (var (prefix, depth, serverCount, clientCount) in currentLevel)
             {
                 int missingCount = serverCount - clientCount;
-                // Unidirectional invariant: equal counts means identical subtree — skip.
+                // Unidirectional invariant: equal counts means identical subtree - skip.
                 if (missingCount == 0) continue;
 
-                if (clientCount == 0 || missingCount <= LeafThreshold || prefix.Length >= MaxPrefixDepth)
+                if (clientCount == 0 || missingCount <= LeafThreshold || depth >= MaxPrefixDepth)
                 {
                     prefixesToSync.Add(prefix);
                     continue;
@@ -335,7 +329,6 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
             if (prefixesToSync.Count > 0)
             {
                 RoundTrips++;
-                var fallbackPrefixes = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
 
                 foreach (var prefix in prefixesToSync)
                 {
@@ -346,7 +339,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                     if (result.Outcome == ReconcileOutcome.Found)
                     {
                         BytesReceived += result.MissingItems!.Count * KeySize;
-                        missingItems.AddRange(result.MissingItems!);
+                        missingItems.AddRange(result.MissingItems);
                     }
                     else if (result.Outcome == ReconcileOutcome.Fallback)
                     {
@@ -361,12 +354,10 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                         }
                         else
                         {
-                            fallbackPrefixes.Add((prefix, prefix.Length, sc, cc));
+                            toExpand.Add((prefix, prefix.Length, sc, cc));
                         }
                     }
                 }
-
-                toExpand.AddRange(fallbackPrefixes);
             }
 
             if (toExpand.Count == 0) break;
@@ -377,7 +368,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
             BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
             BytesReceived += toExpand.Count * 2 * CountSize;
 
-            var nextLevel = new List<(BitPrefix, int, int, int)>();
+            var nextLevel = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
             for (int i = 0; i < toExpand.Count; i++)
             {
                 var depth = toExpand[i].Depth;

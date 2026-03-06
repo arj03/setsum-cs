@@ -69,20 +69,8 @@ public class SyncableNode
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Records that the given keys are now accounted for in the local delete store.
-    /// </summary>
-    public int ApplyDeletes(IEnumerable<byte[]> keysToDelete)
-    {
-        AddStore.Prepare();
-        int removed = 0;
-        foreach (var key in keysToDelete)
-            if (AddStore.Contains(key))
-                removed++;
-        return removed;
-    }
-
-    /// <summary>
-    /// Applies delete keys to AddStore by physically removing keys.
+    /// Physically removes <paramref name="keysToDelete"/> from AddStore in a single
+    /// O(N) pass and returns the number of keys that were actually present.
     /// Used on epoch recovery paths.
     /// </summary>
     public int ApplyDeletesToAddStore(IEnumerable<byte[]> keysToDelete)
@@ -90,16 +78,11 @@ public class SyncableNode
         var deletes = keysToDelete.ToList();
         if (deletes.Count == 0) return 0;
 
-        AddStore.Prepare();
-        int removed = 0;
-        foreach (var key in deletes)
-            if (AddStore.Contains(key))
-                removed++;
-
+        var before = AddStore.Count();
         deletes.Sort(ByteComparer.Instance);
         AddStore.DeleteBulkPresorted(deletes);
         AddStore.Prepare();
-        return removed;
+        return before - AddStore.Count();
     }
 
     /// <summary>
