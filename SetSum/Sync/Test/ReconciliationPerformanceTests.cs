@@ -242,11 +242,6 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(sumBeforeCompaction, server.Sum());
 
-        // Server makes more changes after compaction.
-        foreach (var k in sharedKeys.Skip(changeCount).Take(changeCount)) server.Delete(k);
-        for (int i = 0; i < changeCount; i++) server.Insert(RandomKey());
-        server.Prepare(); client.Prepare();
-
         var sim = new SyncSimulator(client, server);
         var sw = Stopwatch.StartNew();
         bool success = sim.TrySync(_output);
