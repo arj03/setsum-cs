@@ -27,7 +27,6 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
     // TryReconcilePrefix handles both missingCount==1 (linear scan) and missingCount==2 (O(n^2) pair scan).
     private const int LeafThreshold = 2;
     private const int MaxPrefixDepth = 64;
-    private const int EpochRepairLeafItemThreshold = 64;
 
     private const int KeySize = Setsum.DigestSize;
     private const int SetsumSize = Setsum.DigestSize;
@@ -58,11 +57,12 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         BytesReceived += EpochSize;
         RoundTrips++;
 
-        bool addStoreSyncedByRepair = false;
+        bool storesSyncedByRepair = false;
         if (_local.DeleteEpoch != _remote.DeleteEpoch)
         {
             output.WriteLine("Delete store epoch mismatch - materializing local tombstones before reset");
             int epochRepairRemoved = _local.MaterializeLocalDeleteStore();
+            _local.WipeDeleteStore();
 
             // Merged bidirectional repair: handles both stale key removal and new key adds
             // in one trie pass, replacing the separate add sync that would follow.
@@ -71,15 +71,14 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
             ItemsAdded = repairAdded;
             ItemsDeleted = epochRepairRemoved + repairRemoved;
 
-            _local.WipeDeleteStore();
             _local.DeleteEpoch = _remote.DeleteEpoch;
-            addStoreSyncedByRepair = true;
+            storesSyncedByRepair = true;
         }
 
-        // Step 2: sync add store (server -> client, unidirectional).
         // Skipped when epoch repair already performed a full bidirectional reconciliation.
-        if (!addStoreSyncedByRepair)
+        if (!storesSyncedByRepair)
         {
+            // Step 2: sync add store (server -> client, unidirectional).
             var added = SyncStore(_remote.AddStore, _local.AddStore, output, "add");
             ItemsAdded = added.Count;
             if (added.Count > 0)
@@ -88,16 +87,16 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                 _local.AddStore.InsertBulkPresorted(added);
                 _local.AddStore.Prepare();
             }
-        }
 
-        // Step 3: sync delete store (server -> client, unidirectional).
-        var newDeletes = SyncStore(_remote.DeleteStore, _local.DeleteStore, output, "delete");
-        if (newDeletes.Count > 0)
-        {
-            newDeletes.Sort(ByteComparer.Instance);
-            _local.DeleteStore.InsertBulkPresorted(newDeletes);
-            _local.DeleteStore.Prepare();
-            ItemsDeleted += newDeletes.Count;
+            // Step 3: sync delete store (server -> client, unidirectional).
+            var newDeletes = SyncStore(_remote.DeleteStore, _local.DeleteStore, output, "delete");
+            if (newDeletes.Count > 0)
+            {
+                newDeletes.Sort(ByteComparer.Instance);
+                _local.DeleteStore.InsertBulkPresorted(newDeletes);
+                _local.DeleteStore.Prepare();
+                ItemsDeleted += newDeletes.Count;
+            }
         }
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
@@ -128,7 +127,13 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
 
         while (currentLevel.Count > 0)
         {
-            var leaves = new List<(BitPrefix Prefix, int ServerCount, int ClientCount)>();
+            // Leaves where server is ahead — use normal unidirectional peeling (server sends missing items).
+            var serverAheadLeaves = new List<(BitPrefix Prefix, Setsum ClientHash)>();
+            // Leaves where client is ahead — use inverse peeling (client sends excess items to remove).
+            var clientAheadLeaves = new List<(BitPrefix Prefix, Setsum ServerHash)>();
+            // Leaves where counts match but hashes differ (swap) — full key exchange needed.
+            var swapLeaves = new List<(BitPrefix Prefix, int ServerCount, int ClientCount)>();
+
             var toExpand = new List<(BitPrefix Prefix, int Depth)>();
 
             foreach (var node in currentLevel)
@@ -137,22 +142,106 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                     continue;
 
                 int maxCount = Math.Max(node.ServerCount, node.ClientCount);
-                bool isLeaf = node.Depth >= MaxPrefixDepth || maxCount <= EpochRepairLeafItemThreshold;
-                if (isLeaf)
-                    leaves.Add((node.Prefix, node.ServerCount, node.ClientCount));
+                int diff = Math.Abs(node.ServerCount - node.ClientCount);
+                bool atMaxDepth = node.Depth >= MaxPrefixDepth;
+
+                // Server-ahead with small diff: peel the server side.
+                if (node.ServerCount > node.ClientCount && diff <= LeafThreshold)
+                {
+                    serverAheadLeaves.Add((node.Prefix, node.ClientHash));
+                }
+                // Client-ahead with small diff: peel the client side (inverse).
+                else if (node.ClientCount > node.ServerCount && diff <= LeafThreshold)
+                {
+                    clientAheadLeaves.Add((node.Prefix, node.ServerHash));
+                }
+                // Client has nothing here: server sends all items.
+                else if (node.ClientCount == 0)
+                {
+                    serverAheadLeaves.Add((node.Prefix, node.ClientHash));
+                }
+                // Server has nothing here: all client items are stale — remove them directly.
+                // No additional network cost: client already knows serverCount==0 from BFS expansion.
+                else if (node.ServerCount == 0)
+                {
+                    var staleItems = _local.AddStore.GetItemsWithPrefix(node.Prefix).ToList();
+                    pendingRemoves.AddRange(staleItems);
+                    removed += staleItems.Count;
+                }
+                // At max depth or very small bucket: fall back to full key exchange.
+                else if (atMaxDepth || maxCount <= LeafThreshold)
+                {
+                    swapLeaves.Add((node.Prefix, node.ServerCount, node.ClientCount));
+                }
+                // Otherwise: descend further to isolate the diff.
                 else
+                {
                     toExpand.Add((node.Prefix, node.Depth));
+                }
             }
 
-            if (leaves.Count > 0)
+            // --- Server-ahead peeling: client sends prefix + hash, server peels ---
+            if (serverAheadLeaves.Count > 0)
             {
                 RoundTrips++;
-                foreach (var leaf in leaves)
+                foreach (var (prefix, clientHash) in serverAheadLeaves)
+                {
+                    BytesSent += prefix.NetworkSize + SetsumSize;
+                    var result = _remote.AddStore.TryReconcilePrefix(prefix, clientHash);
+                    if (result.Outcome == ReconcileOutcome.Found)
+                    {
+                        BytesReceived += result.MissingItems!.Count * KeySize;
+                        pendingAdds.AddRange(result.MissingItems);
+                        added += result.MissingItems.Count;
+                    }
+                    else if (prefix.Length < MaxPrefixDepth)
+                    {
+                        // Peeling failed (mixed adds+removes under this prefix) — descend further.
+                        toExpand.Add((prefix, prefix.Length));
+                    }
+                    else
+                    {
+                        var (sc, cc) = (_remote.AddStore.GetPrefixInfo(prefix).Count, _local.AddStore.GetPrefixInfo(prefix).Count);
+                        swapLeaves.Add((prefix, sc, cc));
+                    }
+                }
+            }
+
+            // --- Client-ahead peeling: server sends prefix + hash, client peels ---
+            if (clientAheadLeaves.Count > 0)
+            {
+                RoundTrips++;
+                foreach (var (prefix, serverHash) in clientAheadLeaves)
+                {
+                    BytesSent += prefix.NetworkSize + SetsumSize;
+                    var result = _local.AddStore.TryReconcilePrefix(prefix, serverHash);
+                    if (result.Outcome == ReconcileOutcome.Found)
+                    {
+                        BytesReceived += result.MissingItems!.Count * KeySize;
+                        pendingRemoves.AddRange(result.MissingItems);
+                        removed += result.MissingItems.Count;
+                    }
+                    else if (prefix.Length < MaxPrefixDepth)
+                    {
+                        toExpand.Add((prefix, prefix.Length));
+                    }
+                    else
+                    {
+                        var (sc, cc) = (_remote.AddStore.GetPrefixInfo(prefix).Count, _local.AddStore.GetPrefixInfo(prefix).Count);
+                        swapLeaves.Add((prefix, sc, cc));
+                    }
+                }
+            }
+
+            // --- Swap / fallback: full key-list exchange ---
+            if (swapLeaves.Count > 0)
+            {
+                RoundTrips++;
+                foreach (var leaf in swapLeaves)
                 {
                     var serverItems = _remote.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
                     var clientItems = _local.AddStore.GetItemsWithPrefix(leaf.Prefix).ToList();
 
-                    // Client sends its keys under this prefix so the server can diff.
                     BytesSent += leaf.Prefix.NetworkSize + leaf.ClientCount * KeySize;
 
                     var (toAdd, toRemove) = DiffSorted(serverItems, clientItems);
@@ -168,7 +257,6 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                         removed += toRemove.Count;
                     }
 
-                    // Server responds with items to add and keys to remove.
                     BytesReceived += toAdd.Count * KeySize + toRemove.Count * KeySize;
                 }
             }

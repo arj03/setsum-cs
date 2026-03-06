@@ -177,7 +177,7 @@ public class ReconciliationPerformanceTests(ITestOutputHelper output)
             client.Insert(k);
         }
 
-        int changeCount = 1_000;
+        int changeCount = 50_000;
         server.DeleteBulk(sharedKeys.Take(changeCount));
         for (int i = 0; i < changeCount; i++)
             server.Insert(RandomKey());
