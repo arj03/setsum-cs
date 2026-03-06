@@ -111,15 +111,15 @@ public class SortedKeyStore
                 _scratchHashes[k++] = hashes[j++];
             }
         }
-        while (i < _count) 
-        { 
+        while (i < _count)
+        {
             CopyKey(_data, i, _scratch, k);
             _scratchHashes[k++] = _hashes[i++]; 
         }
-        while (j < newCount) 
-        { 
+        while (j < newCount)
+        {
             CopyKey(keys, j, _scratch, k);
-            _scratchHashes[k++] = hashes[j++]; 
+            _scratchHashes[k++] = hashes[j++];
         }
 
         (_data, _scratch) = (_scratch, _data);
@@ -167,9 +167,13 @@ public class SortedKeyStore
             return (_prefixSums[end] - _prefixSums[start], count);
     }
 
+    /// <summary>
+    /// Returns the hash and count for the entire store.
+    /// </summary>
     public (Setsum Hash, int Count) TotalInfo()
     {
         Prepare();
+
         return (_prefixSums[_count], _count);
     }
 
@@ -304,6 +308,7 @@ public class SortedKeyStore
     private static void FinishSort(byte[] keys, Setsum[] hashes, int n)
     {
         Span<byte> tmp = stackalloc byte[KeySize];
+
         int start = 0;
         while (start < n)
         {
@@ -312,10 +317,12 @@ public class SortedKeyStore
             while (end < n && keys[end * KeySize] == b0 && keys[end * KeySize + 1] == b1)
                 end++;
 
+            // Insertion sort [start, end) by bytes 2..31
             for (int i = start + 1; i < end; i++)
             {
                 keys.AsSpan(i * KeySize, KeySize).CopyTo(tmp);
                 Setsum hashI = hashes[i];
+
                 int j = i - 1;
                 while (j >= start && keys.AsSpan(j * KeySize, KeySize).SequenceCompareTo(tmp) > 0)
                 {

@@ -91,6 +91,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
     }
+
     private (int Added, int Removed) RepairAddStoreAfterEpoch(ITestOutputHelper output)
     {
         int added = 0;
@@ -190,6 +191,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         output.WriteLine($"epoch add-store repair: +{added} / -{removed}");
         return (added, removed);
     }
+
     private static (List<byte[]> ToAdd, List<byte[]> ToRemove) DiffSorted(List<byte[]> serverItems, List<byte[]> clientItems)
     {
         var toAdd = new List<byte[]>();
