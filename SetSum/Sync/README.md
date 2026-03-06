@@ -255,6 +255,78 @@ For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round tr
 
 ---
 
+## Delete Protocol
+
+Set reconciliation alone is not enough: a key the server has removed should eventually disappear from clients too. Deletes are tracked separately so removals can be synced with the same unidirectional guarantees as insertions, without complicating the trie protocol.
+### Data Model
+
+Each node owns two append-only stores:
+
+- **`AddStore`** — all inserted keys, synced server→client. Never mutated by deletes.
+- **`DeleteStore`** — tombstones for deleted keys, synced server→client.
+- **Effective membership** — `AddStore − DeleteStore`, computed at query time.
+
+Both stores are strictly append-only. This keeps the unidirectional trie sync valid across compactions: the server is always a superset of the client within each store.
+
+### Why Epochs Exist
+
+`DeleteStore` tombstones would grow forever without compaction. Epochs let the server compact safely while giving clients an unambiguous signal that compaction occurred.
+
+Without epochs you must either keep tombstones forever, or risk clients silently missing deletes that were compacted before they synced.
+
+### Server Compaction
+
+Compaction works by applying all pending tombstones to `AddStore`, wipes `DeleteStore`, and increments `DeleteEpoch`.
+
+### Normal Sync Flow (No Epoch Mismatch)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: AddStore (Sum, Count)
+    S-->>C: Missing add keys
+    C->>C: Insert into AddStore
+
+    C->>S: DeleteStore (Sum, Count)
+    S-->>C: Missing tombstones
+    C->>C: Insert into DeleteStore
+    C->>C: Apply new tombstones to AddStore
+```
+
+After both stores sync, the client applies any newly received tombstones, keeping `AddStore − DeleteStore` consistent.
+
+### Epoch-Mismatch Recovery
+
+If `client.DeleteEpoch != server.DeleteEpoch`, the client's `DeleteStore` may reference tombstones the server has already compacted away. The client recovers before resuming normal sync:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: client.DeleteEpoch
+    S-->>C: server.DeleteEpoch
+
+    alt Epoch mismatch
+        Note over C: Materialize local DeleteStore<br/>into AddStore
+        C->>S: Authoritative add-store repair<br/>(prefix-diff to remove stale keys)
+        S-->>C: Keys to remove
+        Note over C: Wipe local DeleteStore<br/>Set DeleteEpoch = server.DeleteEpoch
+    end
+
+    C->>S: Normal AddStore sync
+    S-->>C: Missing add keys
+    C->>S: Normal DeleteStore sync
+    S-->>C: Missing tombstones
+    C->>C: Apply tombstones + update epoch
+```
+
+The repair phase uses the same binary-prefix trie traversal as normal sync, but identifies keys the client holds that the server no longer does — the inverse of the usual direction. Because this is the only place where the client can be *ahead* of the server (holding keys the server has already compacted out), it is handled as a special authoritative repair pass rather than through the normal unidirectional protocol.
+
+---
+
 ## Key Files
 
 | File | Purpose |
@@ -264,77 +336,4 @@ For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round tr
 | `BitPrefix.cs` | Bit-level trie prefix for binary-prefix traversal |
 | `ReconcileResult.cs` | Discriminated union result type (`Identical / Found / Fallback`) |
 | `SyncSimulator.cs` | Test harness simulating two-node sync, counting round-trips and bytes |
-
----
-
-## Delete Protocol Addendum (Current Implementation)
-
-This section documents the delete protocol currently implemented in `SyncableNode` and `SyncSimulator`.
-
-### Why Epochs Exist
-
-Delete tombstones grow forever if they are never compacted. Epochs let the server compact safely while giving clients a clear signal that compaction happened.
-
-Without epochs, you must either:
-
-- keep tombstones forever, or
-- risk clients silently missing deletes that were compacted before they synced.
-
-### Data Model
-
-- `AddStore`: inserted keys
-- `DeleteStore`: tombstones
-- Effective membership: `AddStore - DeleteStore`
-
-### Server Compaction
-
-`CompactDeleteStore` does:
-
-1. Remove all keys in `DeleteStore` from server `AddStore`.
-2. Clear server `DeleteStore`.
-3. Increment `DeleteEpoch`.
-
-```mermaid
-flowchart TD
-    A["DeleteStore tombstones"] --> B["Apply to AddStore"]
-    B --> C["Clear DeleteStore"]
-    C --> D["DeleteEpoch++"]
-```
-
-### Client Flow On Epoch Mismatch
-
-If `client.DeleteEpoch != server.DeleteEpoch`, client runs:
-
-1. Materialize local tombstones into local `AddStore` (`MaterializeLocalDeleteStore`).
-2. Run authoritative add-store repair (`RepairAddStoreAfterEpoch`) to remove stale local keys.
-3. Wipe local `DeleteStore`.
-4. Set local `DeleteEpoch = server.DeleteEpoch`.
-5. Continue normal add sync, then normal delete sync.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-
-    C->>S: Send client DeleteEpoch
-    S-->>C: Send server DeleteEpoch
-
-    alt Epoch mismatch
-        C->>C: Materialize local DeleteStore into AddStore
-        C->>S: Authoritative add-store repair
-        S-->>C: Prefix-diff repair responses
-        C->>C: Wipe local DeleteStore
-        C->>C: Set local DeleteEpoch
-    end
-
-    C->>S: Normal AddStore sync
-    S-->>C: Missing add keys
-    C->>S: Normal DeleteStore sync
-    S-->>C: Missing tombstones
-```
-
-### Tradeoff
-
-- Keeps protocol state simple (no replay log state).
-- Bounded delete storage on server.
-- Epoch mismatch adds an extra repair phase.
+| `SyncableNode.cs` | Per-node add/delete stores, compaction, and epoch management |
