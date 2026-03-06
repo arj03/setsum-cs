@@ -19,6 +19,8 @@ namespace Setsum.Sync.Test;
 /// </summary>
 public class SyncSimulator(SyncableNode local, SyncableNode remote)
 {
+    // Stop recursing once missingCount <= LeafThreshold
+    // TryReconcilePrefix handles both missingCount==1 (linear scan) and missingCount==2 (O(n²) pair scan).
     private const int LeafThreshold = 2;
     private const int MaxPrefixDepth = 64;
     private const int EpochRepairLeafItemThreshold = 64;
@@ -246,8 +248,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
 
     // Shared unidirectional store sync.
     // Returns newly received items (not yet inserted into the client store).
-    private List<byte[]> SyncStore(ReconcilableSet server, ReconcilableSet client,
-        ITestOutputHelper output, string label)
+    private List<byte[]> SyncStore(ReconcilableSet server, ReconcilableSet client, ITestOutputHelper output, string label)
     {
         var fastResult = server.TryReconcile(client.Sum(), client.Count());
         RoundTrips++;
@@ -279,8 +280,19 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         return PerformTrieSync(server, client, output, label);
     }
 
-    private List<byte[]> PerformTrieSync(ReconcilableSet server, ReconcilableSet client,
-        ITestOutputHelper output, string label)
+    /// <summary>
+    /// Binary-prefix trie sync.
+    ///
+    /// BFS descends until missingCount <= LeafThreshold (2) per prefix, pruning
+    /// identical subtrees via count comparison alone — valid because the protocol is
+    /// unidirectional (server is always a superset of the client).
+    /// All nodes at the same depth are queried in one batched round trip — O(depth) trips total.
+    ///
+    /// At leaves the server attempts Setsum peeling. If the server prefix is too large for
+    /// pair peeling it returns Fallback — those prefixes are re-enqueued into the
+    /// BFS for further descent rather than silently dropped.
+    /// </summary>
+    private List<byte[]> PerformTrieSync(ReconcilableSet server, ReconcilableSet client, ITestOutputHelper output, string label)
     {
         var missingItems = new List<byte[]>();
         var currentLevel = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
@@ -297,12 +309,14 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
 
         while (currentLevel.Count > 0)
         {
+            // Partition current level into leaves (to peel) and interior nodes (to expand).
             var prefixesToSync = new List<BitPrefix>();
             var toExpand = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
 
             foreach (var (prefix, depth, serverCount, clientCount) in currentLevel)
             {
                 int missingCount = serverCount - clientCount;
+                // Unidirectional invariant: equal counts means identical subtree — skip.
                 if (missingCount == 0) continue;
 
                 if (clientCount == 0 || missingCount <= LeafThreshold || prefix.Length >= MaxPrefixDepth)
@@ -366,6 +380,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                 var (c0, sc0, c1, sc1) = serverResponses[i];
                 var (cc0, cc1) = client.GetChildrenCounts(toExpand[i].Prefix, depth);
 
+                // Only descend into subtrees where server has more items than client.
                 if (sc0 > cc0) nextLevel.Add((c0, depth + 1, sc0, cc0));
                 if (sc1 > cc1) nextLevel.Add((c1, depth + 1, sc1, cc1));
             }
