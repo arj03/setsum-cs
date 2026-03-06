@@ -14,8 +14,8 @@ namespace Setsum.Sync.Test;
 ///   producing the correct effective set without ever needing bidirectional trie logic.
 ///
 ///   Epoch - bumped when the server compacts its delete store. The client detects
-///   this, materializes local tombstones, repairs add-store drift, wipes local delete store,
-///   then resumes normal add/delete sync.
+///   this, materializes local tombstones, wipes local delete store, repairs add-store drift, 
+///   then resumes normal delete sync.
 ///
 ///   NOTE: the epoch repair path (RepairAddStoreAfterEpoch) is the one exception to the
 ///   unidirectional rule: it performs a full bidirectional diff of AddStore so it can both
@@ -57,7 +57,6 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
         BytesReceived += EpochSize;
         RoundTrips++;
 
-        bool storesSyncedByRepair = false;
         if (_local.DeleteEpoch != _remote.DeleteEpoch)
         {
             output.WriteLine("Delete store epoch mismatch - materializing local tombstones before reset");
@@ -72,11 +71,8 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
             ItemsDeleted = epochRepairRemoved + repairRemoved;
 
             _local.DeleteEpoch = _remote.DeleteEpoch;
-            storesSyncedByRepair = true;
         }
-
-        // Skipped when epoch repair already performed a full bidirectional reconciliation.
-        if (!storesSyncedByRepair)
+        else
         {
             // Step 2: sync add store (server -> client, unidirectional).
             var added = SyncStore(_remote.AddStore, _local.AddStore, output, "add");
@@ -87,16 +83,16 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                 _local.AddStore.InsertBulkPresorted(added);
                 _local.AddStore.Prepare();
             }
+        }
 
-            // Step 3: sync delete store (server -> client, unidirectional).
-            var newDeletes = SyncStore(_remote.DeleteStore, _local.DeleteStore, output, "delete");
-            if (newDeletes.Count > 0)
-            {
-                newDeletes.Sort(ByteComparer.Instance);
-                _local.DeleteStore.InsertBulkPresorted(newDeletes);
-                _local.DeleteStore.Prepare();
-                ItemsDeleted += newDeletes.Count;
-            }
+        // Step 3: sync delete store (server -> client, unidirectional).
+        var newDeletes = SyncStore(_remote.DeleteStore, _local.DeleteStore, output, "delete");
+        if (newDeletes.Count > 0)
+        {
+            newDeletes.Sort(ByteComparer.Instance);
+            _local.DeleteStore.InsertBulkPresorted(newDeletes);
+            _local.DeleteStore.Prepare();
+            ItemsDeleted += newDeletes.Count;
         }
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
