@@ -70,7 +70,6 @@ public class SyncableNode
         var allDeletes = DeleteStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
         if (allDeletes.Count > 0)
         {
-            allDeletes.Sort(ByteComparer.Instance);
             AddStore.DeleteBulkPresorted(allDeletes);
             AddStore.Prepare();
         }

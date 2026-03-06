@@ -354,8 +354,7 @@ public class SyncSimulator(SyncableNode local, SyncableNode remote)
                 foreach (var item in fastResult.MissingItems!)
                 {
                     BytesReceived += KeySize;
-                    if (!client.Contains(item))
-                        found.Add(item);
+                    found.Add(item);
                 }
                 return found;
 
