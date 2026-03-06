@@ -111,8 +111,16 @@ public class SortedKeyStore
                 _scratchHashes[k++] = hashes[j++];
             }
         }
-        while (i < _count) { CopyKey(_data, i, _scratch, k); _scratchHashes[k++] = _hashes[i++]; }
-        while (j < newCount) { CopyKey(keys, j, _scratch, k); _scratchHashes[k++] = hashes[j++]; }
+        while (i < _count) 
+        { 
+            CopyKey(_data, i, _scratch, k);
+            _scratchHashes[k++] = _hashes[i++]; 
+        }
+        while (j < newCount) 
+        { 
+            CopyKey(keys, j, _scratch, k);
+            _scratchHashes[k++] = hashes[j++]; 
+        }
 
         (_data, _scratch) = (_scratch, _data);
         (_hashes, _scratchHashes) = (_scratchHashes, _hashes);
@@ -151,8 +159,12 @@ public class SortedKeyStore
     public (Setsum Hash, int Count) RangeInfo(byte[] lo, byte[] hi)
     {
         Prepare();
+
         int start = LowerBound(lo), end = UpperBound(hi), count = end - start;
-        return count <= 0 ? (new Setsum(), 0) : (_prefixSums[end] - _prefixSums[start], count);
+        if (count <= 0)
+            return (new Setsum(), 0);
+        else
+            return (_prefixSums[end] - _prefixSums[start], count);
     }
 
     public (Setsum Hash, int Count) TotalInfo()
@@ -200,13 +212,16 @@ public class SortedKeyStore
     public List<byte[]>? TryPeelRange(byte[] lo, byte[] hi, Setsum diff, int maxCountForPairPeel)
     {
         Prepare();
+
         int start = LowerBound(lo), end = UpperBound(hi), count = end - start;
         if (count == 0) return null;
 
+        // missingCount == 1: one linear scan, no allocations until match found
         for (int i = start; i < end; i++)
             if (_hashes[i] == diff)
                 return [KeyAt(_data, i).ToArray()];
 
+        // missingCount == 2: O(n²) scan, guarded by maxCountForPairPeel
         if (count <= maxCountForPairPeel)
         {
             for (int i = start; i < end; i++)
