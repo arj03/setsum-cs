@@ -26,7 +26,17 @@ public class SyncableNode
     // Mutations
     // -------------------------------------------------------------------------
 
-    public void Insert(byte[] key) => AddStore.Insert(key);
+    /// <summary>
+    /// Inserts a key into AddStore. If the key has a tombstone in DeleteStore,
+    /// the tombstone is removed so the key becomes visible in the effective set again.
+    /// </summary>
+    public void Insert(byte[] key)
+    {
+        if (DeleteStore.Contains(key))
+            DeleteStore.DeleteBulkPresorted([key]);
+
+        AddStore.Insert(key);
+    }
 
     /// <summary>
     /// Records a deletion into the delete store (append-only).
