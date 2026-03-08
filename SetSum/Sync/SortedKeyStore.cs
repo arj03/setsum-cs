@@ -29,6 +29,10 @@ public class SortedKeyStore
     private Setsum[] _pendingHashes = new Setsum[16];
     private int _pendingCount;
 
+    // Pending unsorted deletions, flushed lazily on next query — same pattern as inserts.
+    private byte[] _pendingDeletes = new byte[16 * KeySize];
+    private int _pendingDeleteCount;
+
     // Reusable scratch buffers — contents never preserved across calls
     private byte[] _scratch = new byte[16 * KeySize];
     private Setsum[] _scratchHashes = new Setsum[16];
@@ -63,6 +67,14 @@ public class SortedKeyStore
         _pendingHashes[_pendingCount++] = hash;
     }
 
+    public void Remove(byte[] key)
+    {
+        if (_pendingDeleteCount * KeySize >= _pendingDeletes.Length)
+            GrowPreserving(ref _pendingDeletes, _pendingDeleteCount * KeySize);
+        key.CopyTo(_pendingDeletes, _pendingDeleteCount * KeySize);
+        _pendingDeleteCount++;
+    }
+
     /// <summary>
     /// Flushes pending items and rebuilds the prefix sum table.
     /// Call before any range query to amortise sort cost.
@@ -74,7 +86,7 @@ public class SortedKeyStore
     }
 
     /// <summary>
-    /// Merges a pre-sorted flat key+hash buffer into the store.
+    /// Merges a pre-sorted flat key+hash buffer into the store in a single O(N) pass.
     /// </summary>
     public void MergeSorted(byte[] keys, Setsum[] hashes, int newCount)
     {
@@ -110,6 +122,38 @@ public class SortedKeyStore
         (_data, _scratch) = (_scratch, _data);
         (_hashes, _scratchHashes) = (_scratchHashes, _hashes);
         _count = total;
+        _prefixSumsDirty = true;
+    }
+
+    /// <summary>
+    /// Removes a batch of pre-sorted keys in a single O(N) merge pass.
+    /// Keys not present in the store are silently skipped.
+    /// </summary>
+    public void RemoveSorted(byte[] keys, int removeCount)
+    {
+        if (removeCount == 0) return;
+        EnsureSorted();
+
+        GrowScratch(ref _scratch, _count * KeySize);
+        GrowScratch(ref _scratchHashes, _count);
+
+        int i = 0, j = 0, k = 0;
+        while (i < _count && j < removeCount)
+        {
+            int cmp = KeyAt(_data, i).SequenceCompareTo(KeyAt(keys, j));
+            if (cmp < 0) { CopyKey(_data, i, _scratch, k); _scratchHashes[k++] = _hashes[i++]; }
+            else if (cmp == 0) { i++; j++; } // drop matched key
+            else { j++; }      // skip key not in store
+        }
+        while (i < _count) 
+        {
+            CopyKey(_data, i, _scratch, k);
+            _scratchHashes[k++] = _hashes[i++];
+        }
+
+        (_data, _scratch) = (_scratch, _data);
+        (_hashes, _scratchHashes) = (_scratchHashes, _hashes);
+        _count = k;
         _prefixSumsDirty = true;
     }
 
@@ -165,8 +209,7 @@ public class SortedKeyStore
     }
 
     /// <summary>
-    /// Scans the range [lo, hi) for items whose stored hashes peel against diff,
-    /// without allocating any key copies until a match is confirmed.
+    /// Scans the range [lo, hi) for items whose stored hashes peel against diff.
     /// - missingCount == 1: returns the single key whose hash == diff.
     /// - missingCount == 2: tries all O(n²) pairs, only when range has ≤ maxCountForPairPeel items.
     /// Returns null if no match found or range too large for pair peeling.
@@ -204,23 +247,39 @@ public class SortedKeyStore
 
     private void EnsureSorted()
     {
-        if (_pendingCount == 0) return;
+        if (_pendingCount > 0)
+        {
+            int n = _pendingCount;
+            _pendingCount = 0;
+            GrowScratch(ref _scratch, n * KeySize);
+            GrowScratch(ref _scratchHashes, n);
+            SortPending(_pending, _pendingHashes, n, _scratch, _scratchHashes);
+            MergeSorted(_pending, _pendingHashes, n);
+        }
 
-        int n = _pendingCount;
-        _pendingCount = 0;
+        if (_pendingDeleteCount > 0)
+        {
+            int n = _pendingDeleteCount;
+            _pendingDeleteCount = 0;
+            GrowScratch(ref _scratch, n * KeySize);
+            GrowScratch(ref _scratchHashes, n);
+            // Deletes don't need hashes — dummy array; FinishSort ignores hash values for ordering.
+            var dummy = new Setsum[n];
+            SortPending(_pendingDeletes, dummy, n, _scratch, _scratchHashes);
+            RemoveSorted(_pendingDeletes, n);
+        }
+    }
 
-        // Two-pass LSB radix sort on bytes 0–1, then insertion sort within buckets.
-        // Pass 1: scatter by byte 1 → _scratch/_scratchHashes
-        // Pass 2: scatter by byte 0 → _pending/_pendingHashes (reused as second scratch)
-        // Result lands back in _pending/_pendingHashes, sorted by bytes 0–1.
-        GrowScratch(ref _scratch, n * KeySize);
-        GrowScratch(ref _scratchHashes, n);
-
-        RadixPass(_pending, _pendingHashes, n, byteIndex: 1, _scratch, _scratchHashes);
-        RadixPass(_scratch, _scratchHashes, n, byteIndex: 0, _pending, _pendingHashes);
-        FinishSort(_pending, _pendingHashes, n);
-
-        MergeSorted(_pending, _pendingHashes, n);
+    /// <summary>
+    /// Two-pass LSB radix sort on bytes 0–1, then insertion sort within same-prefix buckets.
+    /// Works for both inserts (real hashes) and deletes (dummy hashes — keys only).
+    /// Result lands back in <paramref name="keys"/>/<paramref name="hashes"/>.
+    /// </summary>
+    private void SortPending(byte[] keys, Setsum[] hashes, int n, byte[] scratch, Setsum[] scratchHashes)
+    {
+        RadixPass(keys, hashes, n, byteIndex: 1, scratch, scratchHashes);
+        RadixPass(scratch, scratchHashes, n, byteIndex: 0, keys, hashes);
+        FinishSort(keys, hashes, n);
     }
 
     private void RadixPass(byte[] src, Setsum[] srcHashes, int n, int byteIndex,
@@ -368,7 +427,6 @@ public class SortedKeyStore
     private static void CopyKey(byte[] src, int si, byte[] dst, int di)
         => src.AsSpan(si * KeySize, KeySize).CopyTo(dst.AsSpan(di * KeySize));
 
-    // Grows buf in-place, preserving existing contents.
     private static void GrowPreserving<T>(ref T[] arr, int currentUsed)
     {
         if (currentUsed < arr.Length) return;
@@ -377,7 +435,6 @@ public class SortedKeyStore
         arr = next;
     }
 
-    // Grows scratch buf without preserving contents — callers always write before reading.
     private static void GrowScratch<T>(ref T[] arr, int needed)
     {
         if (arr.Length >= needed) return;

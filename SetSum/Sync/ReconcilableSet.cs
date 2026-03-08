@@ -20,7 +20,7 @@ public class ReconcilableSet
 
     public Setsum Sum() => _store.TotalInfo().Hash;
 
-    public long Count() => _store.Count();
+    public int Count() => _store.Count();
 
     // Circular buffer of recent insertions for fast-path peeling.
     // Stores (key, hash) pairs so the peeling backtracker can verify candidates
@@ -64,6 +64,22 @@ public class ReconcilableSet
         Debug.Assert(IsSorted(items), "InsertBulkPresorted called with unsorted input — store invariants would be corrupted.");
 
         InsertSortedArray(items.ToArray());
+    }
+
+    /// <summary>
+    /// Removes multiple keys that are already sorted — single O(N) merge pass.
+    /// </summary>
+    public void DeleteBulkPresorted(List<byte[]> items)
+    {
+        if (items.Count == 0) return;
+        Debug.Assert(IsSorted(items), "DeleteBulkPresorted called with unsorted input.");
+
+        int n = items.Count;
+        var flat = new byte[n * Setsum.DigestSize];
+        for (int i = 0; i < n; i++)
+            items[i].CopyTo(flat, i * Setsum.DigestSize);
+
+        _store.RemoveSorted(flat, n);
     }
 
     public bool Contains(byte[] key) => _store.Contains(key);
