@@ -1,41 +1,49 @@
 ﻿namespace Setsum.Sync;
 
 /// <summary>
-/// Represents a bit-level MSB-first prefix for Binary-prefix trie traversal.
+/// Represents a bit-level MSB-first prefix for binary-prefix trie traversal.
 ///
-/// Wire format (1–9 bytes, variable):
-///   Byte 0       : Length (0–64)
-///   Bytes 1..N   : The significant bytes of Bits, MSB first.
-///                  N = (Length + 7) / 8  — only bytes that carry prefix bits are sent.
+/// Wire format (0–8 bytes, prefix bits only):
+///   The significant bytes of Bits, MSB first.
+///   N = (Length + 7) / 8  — only bytes that carry prefix bits are sent.
+///
+///   Length is NOT transmitted — it is implicit from the BFS depth, which both
+///   sides track in lockstep. This saves 1 byte at every depth vs. the
+///   length-prefixed format, and reduces the root query to 0 bytes.
+///
+///   Deserialize therefore requires the caller to supply the expected length.
 /// </summary>
 public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
 {
     public readonly ulong Bits = bits;
     public readonly int Length = length;
-
     public static readonly BitPrefix Root = new(0, 0);
 
-    public int NetworkSize => 1 + (Length + 7) / 8;
+    /// <summary>
+    /// Number of bytes on the wire: just the significant prefix bytes, no length byte.
+    /// Root (Length == 0) costs 0 bytes.
+    /// </summary>
+    public int NetworkSize => (Length + 7) / 8;
 
     /// <summary>
-    /// Serializes the prefix into <paramref name="dest"/> starting at <paramref name="offset"/>.
-    /// Writes exactly <see cref="NetworkSize"/> bytes.
+    /// Serializes the prefix bits into <paramref name="dest"/> starting at <paramref name="offset"/>.
+    /// Writes exactly <see cref="NetworkSize"/> bytes. Length is not written — the receiver
+    /// must supply it from context (BFS depth).
     /// </summary>
     public void Serialize(byte[] dest, int offset = 0)
     {
-        dest[offset] = (byte)Length;
         int sigBytes = (Length + 7) / 8;
         for (int i = 0; i < sigBytes; i++)
-            dest[offset + 1 + i] = (byte)(Bits >> (56 - i * 8));
+            dest[offset + i] = (byte)(Bits >> (56 - i * 8));
     }
 
     /// <summary>
-    /// Deserializes a <see cref="BitPrefix"/> from <paramref name="src"/> starting at
-    /// <paramref name="offset"/>. Advances <paramref name="offset"/> past the bytes consumed.
+    /// Deserializes a <see cref="BitPrefix"/> of known <paramref name="length"/> from
+    /// <paramref name="src"/> starting at <paramref name="offset"/>.
+    /// Advances <paramref name="offset"/> past the bytes consumed.
     /// </summary>
-    public static BitPrefix Deserialize(byte[] src, ref int offset)
+    public static BitPrefix Deserialize(byte[] src, ref int offset, int length)
     {
-        int length = src[offset++];
         int sigBytes = (length + 7) / 8;
         ulong bits = 0;
         for (int i = 0; i < sigBytes; i++)

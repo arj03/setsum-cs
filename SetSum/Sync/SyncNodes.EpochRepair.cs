@@ -149,7 +149,7 @@ public partial class SyncNodes
             if (toExpand.Count == 0)
                 break;
 
-            BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
+            BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize);
 
             var nextLevel = new List<(BitPrefix Prefix, int Depth, Setsum PrimaryHash, int PrimaryCount, Setsum ReplicaHash, int ReplicaCount)>(toExpand.Count * 2);
             foreach (var (prefix, depth) in toExpand)

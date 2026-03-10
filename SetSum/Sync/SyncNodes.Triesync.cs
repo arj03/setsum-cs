@@ -129,7 +129,7 @@ public partial class SyncNodes
             var requests = toExpand.Select(e => (e.Prefix, e.Depth)).ToList();
             var primaryResponses = primary.GetChildrenCountsBatch(requests);
             RoundTrips++;
-            BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
+            BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize);
 
             var nextLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
             for (int i = 0; i < toExpand.Count; i++)

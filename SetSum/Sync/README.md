@@ -249,9 +249,9 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 | Sets are identical | 1 | 33–37 | Sum (32) + varint(Count) sent; Identical returned |
 | Replica missing ≤ 3 items | 1 | ~130 | 33–37 sent + ~96 received (missing keys) |
 | Replica missing 4–10 items | 1 | ~355 | 33–37 sent + ~320 received (missing keys) |
-| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) + D × 32) | Trie BFS (counts only) + Setsum leaf peeling; per-node count is 1–5 varint bytes |
+| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) + D × 32) | Trie BFS (counts only) + Setsum leaf peeling; per-node cost is ⌈depth/8⌉ prefix bytes + 1–5 varint count bytes |
 
-For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round trips, ~650 KB transferred. The raw diff is 320 KB; total store size is 32 MB. BFS traversal overhead is low because only varint-encoded counts (1–3 bytes at typical trie depths) are exchanged per node rather than 32-byte hashes.
+For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round trips, ~600 KB transferred. The raw diff is 320 KB; total store size is 32 MB. BFS traversal overhead is low because prefix length is implicit (depth is tracked in lockstep, so no length byte is sent), and counts are varint-encoded (1–3 bytes at typical trie depths) rather than 32-byte hashes.
 
 ---
 
@@ -276,7 +276,7 @@ Without epochs you must either keep tombstones forever, or risk replicas silentl
 
 ### Primary Compaction
 
-Compaction works by applying all pending tombstones to `AddStore`, wipes `DeleteStore`, and increments `DeleteEpoch`.
+Compaction works by applying all pending tombstones to `AddStore`, wiping `DeleteStore`, and incrementing `DeleteEpoch`.
 
 ### Normal Sync Flow (No Epoch Mismatch)
 
