@@ -249,7 +249,7 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 | Sets are identical | 1 | 33–37 | Sum (32) + varint(Count) sent; Identical returned |
 | Replica missing ≤ 3 items | 1 | ~130 | 33–37 sent + ~96 received (missing keys) |
 | Replica missing 4–10 items | 1 | ~355 | 33–37 sent + ~320 received (missing keys) |
-| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) × varint(N/D) + D × 32) | Trie BFS (counts only) + Setsum leaf peeling; varint(N/D) is 1–5 bytes |
+| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) + D × 32) | Trie BFS (counts only) + Setsum leaf peeling; per-node count is 1–5 varint bytes |
 
 For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round trips, ~650 KB transferred. The raw diff is 320 KB; total store size is 32 MB. BFS traversal overhead is low because only varint-encoded counts (1–3 bytes at typical trie depths) are exchanged per node rather than 32-byte hashes.
 
