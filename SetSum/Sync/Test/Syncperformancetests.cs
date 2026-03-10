@@ -50,7 +50,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(3, sim.RoundTrips);
         Assert.Equal(3, sim.ItemsAdded);
-        _output.WriteLine($"Small diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Small diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -67,7 +67,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         Assert.Equal(3, sim.RoundTrips);
         Assert.Equal(8, sim.ItemsAdded);
         Assert.True(sw.ElapsedMilliseconds < 100);
-        _output.WriteLine($"Medium diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Medium diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -103,7 +103,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         Assert.True(sim.UsedFallback);
         Assert.Equal(newItems, sim.ItemsAdded);
         Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        _output.WriteLine($"Trie fallback – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Trie fallback – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -119,7 +119,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(items, sim.ItemsAdded);
         Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        _output.WriteLine($"Empty replica – Trips: {sim.RoundTrips}, Items: {sim.ItemsAdded}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Empty replica – Trips: {sim.RoundTrips}, Items: {sim.ItemsAdded}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     // ── Delete-path ───────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(50_000, sim.ItemsAdded);
         Assert.Equal(50_000, sim.ItemsDeleted);
-        _output.WriteLine($"Large deletes – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Large deletes – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     // ── Epoch recovery ────────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -190,7 +190,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        _output.WriteLine($"Epoch large – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Epoch large – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -212,7 +212,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        _output.WriteLine($"Epoch adds-only – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Epoch adds-only – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -235,6 +235,6 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        _output.WriteLine($"Epoch delete-after – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        _output.WriteLine($"Epoch delete-after – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 }
