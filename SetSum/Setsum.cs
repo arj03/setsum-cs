@@ -39,6 +39,11 @@ public readonly struct Setsum
     public Setsum() => _state = Vector256<uint>.Zero;
     private Setsum(Vector256<uint> state) => _state = state;
 
+    public Setsum(Span<byte> hash)
+    {
+        _state = MemoryMarshal.Read<Vector256<uint>>(hash);
+    }
+
     /// <summary>
     /// Returns true if this Setsum represents the empty set (all field values are zero).
     /// </summary>

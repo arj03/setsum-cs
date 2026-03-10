@@ -32,21 +32,6 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     private const int SetsumSize = Setsum.DigestSize;
     private const int EpochSize = sizeof(int);
 
-    /// <summary>
-    /// Returns the number of bytes a non-negative integer occupies when encoded
-    /// as a protobuf varint (LEB128): 7 payload bits per byte, MSB used as
-    /// continuation flag.
-    /// </summary>
-    private static int VarIntSize(int value)
-    {
-        if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
-        if (value < 0x80) return 1;
-        if (value < 0x4000) return 2;
-        if (value < 0x200000) return 3;
-        if (value < 0x10000000) return 4;
-        return 5;
-    }
-
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }
     public int ItemsAdded { get; private set; }
@@ -66,7 +51,7 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         BytesSent = 0;
         BytesReceived = 0;
 
-        // Step 1: epoch handshake.
+        // Step 1: epoch handshake — each side sends its 4-byte epoch integer.
         BytesSent += EpochSize;
         BytesReceived += EpochSize;
         RoundTrips++;
@@ -111,5 +96,209 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
+    }
+
+    // =========================================================================
+    // Wire message helpers
+    //
+    // Every Build* method produces a byte[] exactly as it would appear on the
+    // wire. Every Parse* method consumes that same buffer, calling the real
+    // BitPrefix and VarInt APIs. BytesSent / BytesReceived are always set from
+    // buf.Length so the counts are derived from actual serialization, not from
+    // manual arithmetic.
+    // =========================================================================
+
+    // ---- Fast-path request: replica's (Setsum, count) -----------------------
+
+    /// <summary>
+    /// Replica → Primary.
+    /// Wire: [Setsum (32 B)] [count (varint)]
+    /// </summary>
+    private static byte[] BuildFastPathRequest(Setsum replicaSum, int replicaCount)
+    {
+        var buf = new byte[SetsumSize + VarInt.Size(replicaCount)];
+        replicaSum.CopyDigest(buf);
+        int off = SetsumSize;
+        VarInt.Write(buf, ref off, replicaCount);
+        return buf;
+    }
+
+    private static (Setsum Sum, int Count) ParseFastPathRequest(byte[] buf)
+    {
+        var sum = new Setsum(buf);
+        int off = SetsumSize;
+        return (sum, VarInt.Read(buf, ref off));
+    }
+
+    // ---- Plain prefix query (replica sends prefix, primary sends count) ------
+
+    /// <summary>
+    /// Replica → Primary: the prefix bytes only; length is implicit from BFS depth.
+    /// Wire: [prefix bytes (0-8 B)]
+    /// </summary>
+    private static byte[] BuildPrefixQuery(BitPrefix prefix)
+    {
+        var buf = new byte[prefix.NetworkSize];
+        prefix.Serialize(buf, 0);
+        return buf;
+    }
+
+    private static BitPrefix ParsePrefixQuery(byte[] buf, int length)
+    {
+        int off = 0;
+        return BitPrefix.Deserialize(buf, ref off, length);
+    }
+
+    // ---- Count-only response ------------------------------------------------
+
+    /// <summary>Primary → Replica. Wire: [count (varint)]</summary>
+    private static byte[] BuildCountResponse(int count)
+    {
+        var buf = new byte[VarInt.Size(count)];
+        int off = 0;
+        VarInt.Write(buf, ref off, count);
+        return buf;
+    }
+
+    private static int ParseCountResponse(byte[] buf)
+    {
+        int off = 0;
+        return VarInt.Read(buf, ref off);
+    }
+
+    // ---- Hash + count response ----------------------------------------------
+
+    /// <summary>
+    /// Primary → Replica.
+    /// Wire: [Setsum (32 B)] [count (varint)]
+    /// </summary>
+    private static byte[] BuildHashCountResponse(Setsum hash, int count)
+    {
+        var buf = new byte[SetsumSize + VarInt.Size(count)];
+        hash.CopyDigest(buf);
+        int off = SetsumSize;
+        VarInt.Write(buf, ref off, count);
+        return buf;
+    }
+
+    private static (Setsum Hash, int Count) ParseHashCountResponse(byte[] buf)
+    {
+        var hash = new Setsum(buf);
+        int off = SetsumSize;
+        return (hash, VarInt.Read(buf, ref off));
+    }
+
+    // ---- Leaf-resolution request: prefix + replica's prefix sum -------------
+
+    /// <summary>
+    /// Replica → Primary (or Primary → Replica for bidirectional repair).
+    /// Wire: [prefix bytes (0-8 B)] [Setsum (32 B)]
+    /// </summary>
+    private static byte[] BuildPrefixSetsumRequest(BitPrefix prefix, Setsum replicaSum)
+    {
+        var buf = new byte[prefix.NetworkSize + SetsumSize];
+        prefix.Serialize(buf, 0);
+        replicaSum.CopyDigest(buf.AsSpan(prefix.NetworkSize));
+        return buf;
+    }
+
+    private static (BitPrefix Prefix, Setsum Sum) ParsePrefixSetsumRequest(byte[] buf, int prefixLength)
+    {
+        int off = 0;
+        var prefix = BitPrefix.Deserialize(buf, ref off, prefixLength);
+        var sum = new Setsum(buf.AsSpan(off));
+        return (prefix, sum);
+    }
+
+    // ---- Batch child-count response (unidirectional, counts only) -----------
+
+    /// <summary>
+    /// Primary → Replica: for each expanded node, the two child counts.
+    /// Wire: interleaved varints — sc0₀, sc1₀, sc0₁, sc1₁, …
+    /// </summary>
+    private static byte[] BuildChildCountsBatchResponse(
+        IReadOnlyList<(BitPrefix C0, int Sc0, BitPrefix C1, int Sc1)> responses)
+    {
+        int size = 0;
+        foreach (var (_, sc0, _, sc1) in responses) size += VarInt.Size(sc0) + VarInt.Size(sc1);
+        var buf = new byte[size];
+        int off = 0;
+        foreach (var (_, sc0, _, sc1) in responses)
+        {
+            VarInt.Write(buf, ref off, sc0);
+            VarInt.Write(buf, ref off, sc1);
+        }
+        return buf;
+    }
+
+    private static (int Sc0, int Sc1)[] ParseChildCountsBatchResponse(byte[] buf, int nodeCount)
+    {
+        var result = new (int, int)[nodeCount];
+        int off = 0;
+        for (int i = 0; i < nodeCount; i++)
+            result[i] = (VarInt.Read(buf, ref off), VarInt.Read(buf, ref off));
+        return result;
+    }
+
+    // ---- Batch hash+count response (bidirectional repair) -------------------
+
+    /// <summary>
+    /// Primary → Replica: for each queried prefix, the (hash, count) pair.
+    /// Wire: [Setsum (32 B)] [count (varint)], repeated per entry.
+    /// </summary>
+    private static byte[] BuildHashCountsBatchResponse(
+        IReadOnlyList<(Setsum Hash, int Count)> responses)
+    {
+        int size = 0;
+        foreach (var (_, count) in responses) size += SetsumSize + VarInt.Size(count);
+        var buf = new byte[size];
+        int off = 0;
+        foreach (var (hash, count) in responses)
+        {
+            hash.CopyDigest(buf.AsSpan(off));
+            off += SetsumSize;
+            VarInt.Write(buf, ref off, count);
+        }
+        return buf;
+    }
+
+    private static (Setsum Hash, int Count)[] ParseHashCountsBatchResponse(byte[] buf, int entryCount)
+    {
+        var result = new (Setsum, int)[entryCount];
+        int off = 0;
+        for (int i = 0; i < entryCount; i++)
+        {
+            var hash = new Setsum(buf.AsSpan(off));
+            off += SetsumSize;
+            result[i] = (hash, VarInt.Read(buf, ref off));
+        }
+        return result;
+    }
+
+    // ---- Key-list response --------------------------------------------------
+
+    /// <summary>
+    /// Primary → Replica (or vice-versa during bidirectional repair).
+    /// Wire: [key₀ (32 B)] [key₁ (32 B)] … — no count prefix; length known from byte count.
+    /// </summary>
+    private static byte[] BuildKeysResponse(IReadOnlyList<byte[]> keys)
+    {
+        var buf = new byte[keys.Count * KeySize];
+        for (int i = 0; i < keys.Count; i++)
+            keys[i].CopyTo(buf, i * KeySize);
+        return buf;
+    }
+
+    private static List<byte[]> ParseKeysResponse(byte[] buf)
+    {
+        int count = buf.Length / KeySize;
+        var keys = new List<byte[]>(count);
+        for (int i = 0; i < count; i++)
+        {
+            var key = new byte[KeySize];
+            Buffer.BlockCopy(buf, i * KeySize, key, 0, KeySize);
+            keys.Add(key);
+        }
+        return keys;
     }
 }
