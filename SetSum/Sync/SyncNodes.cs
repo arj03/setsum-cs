@@ -30,8 +30,22 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 
     private const int KeySize = Setsum.DigestSize;
     private const int SetsumSize = Setsum.DigestSize;
-    private const int CountSize = sizeof(int);
     private const int EpochSize = sizeof(int);
+
+    /// <summary>
+    /// Returns the number of bytes a non-negative integer occupies when encoded
+    /// as a protobuf varint (LEB128): 7 payload bits per byte, MSB used as
+    /// continuation flag.
+    /// </summary>
+    private static int VarIntSize(int value)
+    {
+        if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+        if (value < 0x80) return 1;
+        if (value < 0x4000) return 2;
+        if (value < 0x200000) return 3;
+        if (value < 0x10000000) return 4;
+        return 5;
+    }
 
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }

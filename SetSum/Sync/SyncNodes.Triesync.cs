@@ -11,9 +11,10 @@ public partial class SyncNodes
     /// </summary>
     private List<byte[]> SyncStore(ReconcilableSet primary, ReconcilableSet replica, ITestOutputHelper output, string label)
     {
-        var fastResult = primary.TryReconcile(replica.Sum(), replica.Count());
+        var replicaCount = replica.Count();
+        var fastResult = primary.TryReconcile(replica.Sum(), replicaCount);
         RoundTrips++;
-        BytesSent += SetsumSize + CountSize;
+        BytesSent += SetsumSize + VarIntSize(replicaCount);
 
         output.WriteLine($"{label} store fast path: {fastResult.Outcome}");
 
@@ -63,7 +64,7 @@ public partial class SyncNodes
         var (_, rootReplicaCount) = replica.GetPrefixInfo(BitPrefix.Root);
         RoundTrips++;
         BytesSent += BitPrefix.Root.NetworkSize;
-        BytesReceived += CountSize;
+        BytesReceived += VarIntSize(rootPrimaryCount);
 
         if (rootPrimaryCount == 0) return missingItems;
 
@@ -129,7 +130,6 @@ public partial class SyncNodes
             var primaryResponses = primary.GetChildrenCountsBatch(requests);
             RoundTrips++;
             BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
-            BytesReceived += toExpand.Count * 2 * CountSize;
 
             var nextLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
             for (int i = 0; i < toExpand.Count; i++)
@@ -137,6 +137,7 @@ public partial class SyncNodes
                 var depth = toExpand[i].Depth;
                 var (c0, pc0, c1, pc1) = primaryResponses[i];
                 var (rc0, rc1) = replica.GetChildrenCounts(toExpand[i].Prefix, depth);
+                BytesReceived += VarIntSize(pc0) + VarIntSize(pc1);
 
                 // Only descend into subtrees where primary has more items than replica.
                 if (pc0 > rc0) nextLevel.Add((c0, depth + 1, pc0, rc0));

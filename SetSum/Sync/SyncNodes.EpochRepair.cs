@@ -35,7 +35,7 @@ public partial class SyncNodes
 
         RoundTrips++;
         BytesSent += BitPrefix.Root.NetworkSize;
-        BytesReceived += SetsumSize + CountSize;
+        BytesReceived += SetsumSize + VarIntSize(primaryRootCount);
 
         if (primaryRootHash == replicaRootHash && primaryRootCount == replicaRootCount)
             return (0, 0);
@@ -150,7 +150,6 @@ public partial class SyncNodes
                 break;
 
             BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
-            BytesReceived += toExpand.Count * 2 * (SetsumSize + CountSize);
 
             var nextLevel = new List<(BitPrefix Prefix, int Depth, Setsum PrimaryHash, int PrimaryCount, Setsum ReplicaHash, int ReplicaCount)>(toExpand.Count * 2);
             foreach (var (prefix, depth) in toExpand)
@@ -160,11 +159,13 @@ public partial class SyncNodes
 
                 var (ph0, pc0) = _primary.AddStore.GetPrefixInfo(c0);
                 var (rh0, rc0) = _replica.AddStore.GetPrefixInfo(c0);
+                BytesReceived += SetsumSize + VarIntSize(pc0);
                 if (pc0 != rc0 || ph0 != rh0)
                     nextLevel.Add((c0, depth + 1, ph0, pc0, rh0, rc0));
 
                 var (ph1, pc1) = _primary.AddStore.GetPrefixInfo(c1);
                 var (rh1, rc1) = _replica.AddStore.GetPrefixInfo(c1);
+                BytesReceived += SetsumSize + VarIntSize(pc1);
                 if (pc1 != rc1 || ph1 != rh1)
                     nextLevel.Add((c1, depth + 1, ph1, pc1, rh1, rc1));
             }
