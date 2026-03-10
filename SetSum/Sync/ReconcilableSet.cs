@@ -14,9 +14,9 @@ public class ReconcilableSet
     private const int MaxDiffForRecentScan = 10;
     private const int RecentScanLimit = 20;
 
-    // Maximum server-side prefix item count for which we attempt O(n²) pair peeling.
+    // Maximum primary-side prefix item count for which we attempt O(n²) pair peeling.
     // At 256 items the search space is 256² = 65,536 pairs — cheap enough to do inline.
-    private const int MaxServerCountForPairPeel = 256;
+    private const int MaxPrimaryCountForPairPeel = 256;
 
     public Setsum Sum() => _store.TotalInfo().Hash;
 
@@ -103,7 +103,7 @@ public class ReconcilableSet
     /// <summary>
     /// Batched count-only version of GetChildrenWithHashes.
     /// Returns child counts for each requested prefix — no hashes.
-    /// Valid for unidirectional sync where serverCount == clientCount implies identical subtrees.
+    /// Valid for unidirectional sync where primaryCount == replicaCount implies identical subtrees.
     /// </summary>
     public List<(BitPrefix C0, int Sc0, BitPrefix C1, int Sc1)>
         GetChildrenCountsBatch(IReadOnlyList<(BitPrefix Prefix, int Depth)> requests)
@@ -137,25 +137,25 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Server-side leaf resolution.
-    /// - clientPrefixSum == 0: client has nothing here; server returns all items directly.
+    /// Primary-side leaf resolution.
+    /// - replicaPrefixSum == 0: replica has nothing here; primary returns all items directly.
     /// - missingCount == 1: linear scan over stored hashes; no key copies until match found.
-    /// - missingCount == 2: O(n²) pair scan, only when server prefix has at most MaxServerCountForPairPeel items.
+    /// - missingCount == 2: O(n²) pair scan, only when primary prefix has at most MaxPrimaryCountForPairPeel items.
     /// - Otherwise: returns Fallback; caller should descend further before retrying.
     /// </summary>
-    public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum clientPrefixSum)
+    public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum replicaPrefixSum)
     {
-        var (serverPrefixSum, _) = GetPrefixInfo(prefix);
-        if (serverPrefixSum == clientPrefixSum) return ReconcileResult.Identical();
+        var (primaryPrefixSum, _) = GetPrefixInfo(prefix);
+        if (primaryPrefixSum == replicaPrefixSum) return ReconcileResult.Identical();
 
-        // clientPrefixSum == Zero means the client has nothing here — send everything.
-        if (clientPrefixSum.IsEmpty())
+        // replicaPrefixSum == Zero means the replica has nothing here — send everything.
+        if (replicaPrefixSum.IsEmpty())
             return ReconcileResult.Found(GetItemsWithPrefix(prefix).ToList());
 
-        var diff = serverPrefixSum - clientPrefixSum;
+        var diff = primaryPrefixSum - replicaPrefixSum;
 
         var (lo, hi) = prefix.KeyRange();
-        var found = _store.TryPeelRange(lo, hi, diff, MaxServerCountForPairPeel);
+        var found = _store.TryPeelRange(lo, hi, diff, MaxPrimaryCountForPairPeel);
 
         return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
     }
@@ -165,16 +165,16 @@ public class ReconcilableSet
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Called by the server: given the client's (Sum, Count), return what it's missing.
+    /// Called by the primary: given the replica's (Sum, Count), return what it's missing.
     /// Uses Setsum peeling — works for small diffs only, otherwise returns Fallback.
     /// </summary>
-    public ReconcileResult TryReconcile(Setsum remoteSum, long remoteCount)
+    public ReconcileResult TryReconcile(Setsum replicaSum, long replicaCount)
     {
         var localSum = Sum();
-        if (localSum == remoteSum) return ReconcileResult.Identical();
+        if (localSum == replicaSum) return ReconcileResult.Identical();
 
-        long countDiff = Count() - remoteCount;
-        if (countDiff < 0) return ReconcileResult.Fallback(); // remote is ahead
+        long countDiff = Count() - replicaCount;
+        if (countDiff < 0) return ReconcileResult.Fallback(); // replica is ahead
 
         int missingCount = (int)countDiff;
         if (missingCount is <= 0 or > MaxDiffForRecentScan)
@@ -184,7 +184,7 @@ public class ReconcilableSet
             missingCount <= MaxDiffForFullScan ? HistorySize : RecentScanLimit,
             _historyCount);
 
-        var diff = localSum - remoteSum;
+        var diff = localSum - replicaSum;
         var result = new List<byte[]>(missingCount);
         var found = SolveRecursive(diff, missingCount, searchLimit, result,
             new HashSet<byte[]>(ReferenceEqualityComparer.Instance));

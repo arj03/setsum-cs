@@ -2,12 +2,12 @@ namespace Setsum.Sync;
 
 /// <summary>
 /// A node in the sync protocol. Owns two append-only ReconcilableSets:
-///   AddStore    - all inserted keys, synced server->client (unidirectional). Never mutated by deletes.
-///   DeleteStore - all deleted keys, synced server->client (unidirectional).
+///   AddStore    - all inserted keys, synced primary->replica (unidirectional). Never mutated by deletes.
+///   DeleteStore - all deleted keys, synced primary->replica (unidirectional).
 ///
 /// The effective set is AddStore minus DeleteStore, computed at query time.
 /// Both stores are strictly append-only, which keeps the unidirectional trie sync
-/// valid across compactions - the server is always a superset of the client for each store.
+/// valid across compactions - the primary node is always a superset of the replica for each store.
 /// </summary>
 public class SyncableNode
 {
@@ -17,8 +17,8 @@ public class SyncableNode
     public Setsum Sum() => AddStore.Sum() - DeleteStore.Sum();
 
     /// <summary>
-    /// Epoch of the delete store. Bumped by the server on compaction.
-    /// Clients persist this alongside their delete store.
+    /// Epoch of the delete store. Bumped by the primary on compaction.
+    /// replicas persist this alongside their delete store.
     /// </summary>
     public int DeleteEpoch { get; set; }
 
@@ -72,7 +72,7 @@ public class SyncableNode
     }
 
     /// <summary>
-    /// Server-side compaction: applies all pending deletes to AddStore,
+    /// primary-side compaction: applies all pending deletes to AddStore,
     /// wipes DeleteStore, and bumps DeleteEpoch.
     /// </summary>
     public void CompactDeleteStore()
