@@ -2,20 +2,16 @@
 
 namespace Setsum.Sync.Test;
 
-public partial class SyncSimulator
+public partial class SyncNodes
 {
     /// <summary>
     /// Shared unidirectional store sync. Attempts the fast-path (single round trip)
     /// first, then falls back to a full BFS trie sync if needed.
-    /// Returns newly received items (not yet inserted into the client store).
+    /// Returns newly received items (not yet inserted into the replica store).
     /// </summary>
-    private List<byte[]> SyncStore(
-        ReconcilableSet server,
-        ReconcilableSet client,
-        ITestOutputHelper output,
-        string label)
+    private List<byte[]> SyncStore(ReconcilableSet primary, ReconcilableSet replica, ITestOutputHelper output, string label)
     {
-        var fastResult = server.TryReconcile(client.Sum(), client.Count());
+        var fastResult = primary.TryReconcile(replica.Sum(), replica.Count());
         RoundTrips++;
         BytesSent += SetsumSize + CountSize;
 
@@ -41,56 +37,56 @@ public partial class SyncSimulator
         }
 
         UsedFallback = true;
-        return PerformTrieSync(server, client, output, label);
+        return PerformTrieSync(primary, replica, output, label);
     }
 
     /// <summary>
     /// Binary-prefix trie sync (BFS).
     ///
-    /// Assumes the protocol is unidirectional (server is always a superset of the client).
+    /// Assumes the protocol is unidirectional (primary is always a superset of the replica).
     /// All nodes at the same depth are queried in one batched round trip - O(depth) trips total.
     ///
-    /// At leaves the server attempts Setsum peeling. If the server prefix is too large for
+    /// At leaves the primary attempts Setsum peeling. If the primary prefix is too large for
     /// pair peeling it returns Fallback — those prefixes are re-enqueued into the
     /// BFS for further descent rather than silently dropped.
     /// </summary>
     private List<byte[]> PerformTrieSync(
-        ReconcilableSet server,
-        ReconcilableSet client,
+        ReconcilableSet primary,
+        ReconcilableSet replica,
         ITestOutputHelper output,
         string label)
     {
         var missingItems = new List<byte[]>();
-        var currentLevel = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
+        var currentLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
 
-        var (_, rootServerCount) = server.GetPrefixInfo(BitPrefix.Root);
-        var (_, rootClientCount) = client.GetPrefixInfo(BitPrefix.Root);
+        var (_, rootPrimaryCount) = primary.GetPrefixInfo(BitPrefix.Root);
+        var (_, rootReplicaCount) = replica.GetPrefixInfo(BitPrefix.Root);
         RoundTrips++;
         BytesSent += BitPrefix.Root.NetworkSize;
         BytesReceived += CountSize;
 
-        if (rootServerCount == 0) return missingItems;
+        if (rootPrimaryCount == 0) return missingItems;
 
-        currentLevel.Add((BitPrefix.Root, 0, rootServerCount, rootClientCount));
+        currentLevel.Add((BitPrefix.Root, 0, rootPrimaryCount, rootReplicaCount));
 
         while (currentLevel.Count > 0)
         {
             var prefixesToSync = new List<BitPrefix>();
-            var toExpand = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
+            var toExpand = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
 
-            foreach (var (prefix, depth, serverCount, clientCount) in currentLevel)
+            foreach (var (prefix, depth, primaryCount, replicaCount) in currentLevel)
             {
-                int missingCount = serverCount - clientCount;
+                int missingCount = primaryCount - replicaCount;
                 // Unidirectional invariant: equal counts means identical subtree — skip.
                 if (missingCount == 0) continue;
 
-                if (clientCount == 0 || missingCount <= LeafThreshold || depth >= MaxPrefixDepth)
+                if (replicaCount == 0 || missingCount <= LeafThreshold || depth >= MaxPrefixDepth)
                 {
                     prefixesToSync.Add(prefix);
                     continue;
                 }
 
-                toExpand.Add((prefix, depth, serverCount, clientCount));
+                toExpand.Add((prefix, depth, primaryCount, replicaCount));
             }
 
             if (prefixesToSync.Count > 0)
@@ -99,10 +95,10 @@ public partial class SyncSimulator
 
                 foreach (var prefix in prefixesToSync)
                 {
-                    var (clientPrefixSum, _) = client.GetPrefixInfo(prefix);
+                    var (replicaPrefixSum, _) = replica.GetPrefixInfo(prefix);
                     BytesSent += prefix.NetworkSize + SetsumSize;
 
-                    var result = server.TryReconcilePrefix(prefix, clientPrefixSum);
+                    var result = primary.TryReconcilePrefix(prefix, replicaPrefixSum);
                     if (result.Outcome == ReconcileOutcome.Found)
                     {
                         BytesReceived += result.MissingItems!.Count * KeySize;
@@ -110,18 +106,18 @@ public partial class SyncSimulator
                     }
                     else if (result.Outcome == ReconcileOutcome.Fallback)
                     {
-                        var (_, sc) = server.GetPrefixInfo(prefix);
-                        var (_, cc) = client.GetPrefixInfo(prefix);
+                        var (_, pc) = primary.GetPrefixInfo(prefix);
+                        var (_, rc) = replica.GetPrefixInfo(prefix);
                         RoundTrips++;
                         if (prefix.Length >= MaxPrefixDepth)
                         {
-                            missingItems.AddRange(server.GetItemsWithPrefix(prefix));
-                            BytesReceived += sc * KeySize;
+                            missingItems.AddRange(primary.GetItemsWithPrefix(prefix));
+                            BytesReceived += pc * KeySize;
                             RoundTrips++;
                         }
                         else
                         {
-                            toExpand.Add((prefix, prefix.Length, sc, cc));
+                            toExpand.Add((prefix, prefix.Length, pc, rc));
                         }
                     }
                 }
@@ -130,21 +126,21 @@ public partial class SyncSimulator
             if (toExpand.Count == 0) break;
 
             var requests = toExpand.Select(e => (e.Prefix, e.Depth)).ToList();
-            var serverResponses = server.GetChildrenCountsBatch(requests);
+            var primaryResponses = primary.GetChildrenCountsBatch(requests);
             RoundTrips++;
             BytesSent += toExpand.Sum(e => e.Prefix.NetworkSize + sizeof(int));
             BytesReceived += toExpand.Count * 2 * CountSize;
 
-            var nextLevel = new List<(BitPrefix Prefix, int Depth, int ServerCount, int ClientCount)>();
+            var nextLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
             for (int i = 0; i < toExpand.Count; i++)
             {
                 var depth = toExpand[i].Depth;
-                var (c0, sc0, c1, sc1) = serverResponses[i];
-                var (cc0, cc1) = client.GetChildrenCounts(toExpand[i].Prefix, depth);
+                var (c0, pc0, c1, pc1) = primaryResponses[i];
+                var (rc0, rc1) = replica.GetChildrenCounts(toExpand[i].Prefix, depth);
 
-                // Only descend into subtrees where server has more items than client.
-                if (sc0 > cc0) nextLevel.Add((c0, depth + 1, sc0, cc0));
-                if (sc1 > cc1) nextLevel.Add((c1, depth + 1, sc1, cc1));
+                // Only descend into subtrees where primary has more items than replica.
+                if (pc0 > rc0) nextLevel.Add((c0, depth + 1, pc0, rc0));
+                if (pc1 > rc1) nextLevel.Add((c1, depth + 1, pc1, rc1));
             }
 
             currentLevel = nextLevel;

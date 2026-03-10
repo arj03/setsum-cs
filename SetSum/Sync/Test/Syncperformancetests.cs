@@ -22,17 +22,17 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         return b;
     }
 
-    private (SyncableNode server, SyncableNode client) MakeNodesWithSharedKeys(int shared)
+    private (SyncableNode primary, SyncableNode replica) MakeNodesWithSharedKeys(int shared)
     {
-        var server = new SyncableNode();
-        var client = new SyncableNode();
+        var primary = new SyncableNode();
+        var replica = new SyncableNode();
         for (int i = 0; i < shared; i++)
         {
             var k = RandomKey();
-            server.Insert(k);
-            client.Insert(k);
+            primary.Insert(k);
+            replica.Insert(k);
         }
-        return (server, client);
+        return (primary, replica);
     }
 
     // ── Add-path ──────────────────────────────────────────────────────────────
@@ -40,10 +40,10 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     [Fact]
     public void Perf_Add_SmallDiff_FastPath()
     {
-        var (server, client) = MakeNodesWithSharedKeys(100);
-        for (int i = 0; i < 3; i++) server.Insert(RandomKey());
+        var (primary, replica) = MakeNodesWithSharedKeys(100);
+        for (int i = 0; i < 3; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
@@ -56,10 +56,10 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     [Fact]
     public void Perf_Add_MediumDiff_FastPath()
     {
-        var (server, client) = MakeNodesWithSharedKeys(100);
-        for (int i = 0; i < 8; i++) server.Insert(RandomKey());
+        var (primary, replica) = MakeNodesWithSharedKeys(100);
+        for (int i = 0; i < 8; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
@@ -74,11 +74,11 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     public void Perf_Add_LargeDiff_FastPathBailout_IsImmediate()
     {
         // Verifies the fast-path bails without doing expensive trie work.
-        var (server, client) = MakeNodesWithSharedKeys(50_000);
-        for (int i = 0; i < 50_000; i++) server.Insert(RandomKey());
+        var (primary, replica) = MakeNodesWithSharedKeys(50_000);
+        for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
 
         var sw = Stopwatch.StartNew();
-        var result = server.AddStore.TryReconcile(client.AddStore.Sum(), client.AddStore.Count());
+        var result = primary.AddStore.TryReconcile(replica.AddStore.Sum(), replica.AddStore.Count());
         sw.Stop();
 
         Assert.Equal(ReconcileOutcome.Fallback, result.Outcome);
@@ -88,38 +88,38 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     [Fact]
     public void Perf_Add_LargeDiff_TrieFallback_RecoversEfficiently()
     {
-        var (server, client) = MakeNodesWithSharedKeys(1_000_000);
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
         int newItems = 10_000;
-        for (int i = 0; i < newItems; i++) server.Insert(RandomKey());
+        for (int i = 0; i < newItems; i++) primary.Insert(RandomKey());
 
-        client.Prepare();
-        server.Prepare();
+        replica.Prepare();
+        primary.Prepare();
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
         Assert.True(sim.UsedFallback);
         Assert.Equal(newItems, sim.ItemsAdded);
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
         _output.WriteLine($"Trie fallback – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
     }
 
     [Fact]
-    public void Perf_Add_EmptyClient_FullTransfer()
+    public void Perf_Add_EmptyReplica_FullTransfer()
     {
-        var server = new SyncableNode();
+        var primary = new SyncableNode();
         int items = 10_000;
-        for (int i = 0; i < items; i++) server.Insert(RandomKey());
+        for (int i = 0; i < items; i++) primary.Insert(RandomKey());
 
-        var client = new SyncableNode();
-        var sim = new SyncSimulator(client, server);
+        var replica = new SyncableNode();
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(items, sim.ItemsAdded);
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
-        _output.WriteLine($"Empty client – Trips: {sim.RoundTrips}, Items: {sim.ItemsAdded}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        _output.WriteLine($"Empty replica – Trips: {sim.RoundTrips}, Items: {sim.ItemsAdded}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
     }
 
     // ── Delete-path ───────────────────────────────────────────────────────────
@@ -127,15 +127,15 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     [Fact]
     public void Perf_Delete_LargeAddsAndDeletes()
     {
-        var (server, client) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(50_000).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(50_000).ToList();
 
-        server.DeleteBulk(sharedKeys);
-        for (int i = 0; i < 50_000; i++) server.Insert(RandomKey());
-        server.Prepare();
-        client.Prepare();
+        primary.DeleteBulk(sharedKeys);
+        for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
+        primary.Prepare();
+        replica.Prepare();
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
@@ -150,91 +150,91 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     [Fact]
     public void Perf_Epoch_TinyResync_AfterCompaction()
     {
-        var (server, client) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(5_001).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(5_001).ToList();
 
-        server.DeleteBulk(sharedKeys.Take(5_000));
-        server.Prepare(); client.Prepare();
-        Assert.True(new SyncSimulator(client, server).TrySync(_output));
+        primary.DeleteBulk(sharedKeys.Take(5_000));
+        primary.Prepare(); replica.Prepare();
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
-        server.Delete(sharedKeys[5_000]);
-        server.Insert(RandomKey());
-        server.CompactDeleteStore();
+        primary.Delete(sharedKeys[5_000]);
+        primary.Insert(RandomKey());
+        primary.CompactDeleteStore();
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
         _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
     }
 
     [Fact]
     public void Perf_Epoch_LargeResync_AfterCompaction()
     {
-        var (server, client) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(55_000).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(55_000).ToList();
 
-        server.DeleteBulk(sharedKeys.Take(5_000));
-        server.Prepare(); client.Prepare();
-        Assert.True(new SyncSimulator(client, server).TrySync(_output));
+        primary.DeleteBulk(sharedKeys.Take(5_000));
+        primary.Prepare(); replica.Prepare();
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
-        server.DeleteBulk(sharedKeys.Skip(5_000).Take(50_000));
-        for (int i = 0; i < 50_000; i++) server.Insert(RandomKey());
-        server.CompactDeleteStore();
+        primary.DeleteBulk(sharedKeys.Skip(5_000).Take(50_000));
+        for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
+        primary.CompactDeleteStore();
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
         _output.WriteLine($"Epoch large – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
     }
 
     [Fact]
     public void Perf_Epoch_OnlyAdds_AfterCompaction()
     {
-        var (server, client) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(5_000).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(5_000).ToList();
 
-        server.DeleteBulk(sharedKeys);
-        server.Prepare(); client.Prepare();
-        Assert.True(new SyncSimulator(client, server).TrySync(_output));
+        primary.DeleteBulk(sharedKeys);
+        primary.Prepare(); replica.Prepare();
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
-        for (int i = 0; i < 10_000; i++) server.Insert(RandomKey());
-        server.CompactDeleteStore();
+        for (int i = 0; i < 10_000; i++) primary.Insert(RandomKey());
+        primary.CompactDeleteStore();
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
         _output.WriteLine($"Epoch adds-only – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
     }
 
     [Fact]
     public void Perf_Epoch_DeletesBeforeAndAfterCompaction()
     {
-        var (server, client) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(25_000).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).Take(25_000).ToList();
 
-        server.DeleteBulk(sharedKeys.Take(5_000));
-        server.Prepare(); client.Prepare();
-        Assert.True(new SyncSimulator(client, server).TrySync(_output));
+        primary.DeleteBulk(sharedKeys.Take(5_000));
+        primary.Prepare(); replica.Prepare();
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
-        server.DeleteBulk(sharedKeys.Skip(5_000).Take(10_000));
-        server.CompactDeleteStore();
-        server.DeleteBulk(sharedKeys.Skip(15_000).Take(10_000)); // new deletes post-compact
+        primary.DeleteBulk(sharedKeys.Skip(5_000).Take(10_000));
+        primary.CompactDeleteStore();
+        primary.DeleteBulk(sharedKeys.Skip(15_000).Take(10_000)); // new deletes post-compact
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
         _output.WriteLine($"Epoch delete-after – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived}, Tx: {sim.BytesSent}");
     }
 }

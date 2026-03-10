@@ -20,17 +20,17 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         return b;
     }
 
-    private static (SyncableNode server, SyncableNode client) MakeNodesWithSharedKeys(int count)
+    private static (SyncableNode primary, SyncableNode replica) MakeNodesWithSharedKeys(int count)
     {
-        var server = new SyncableNode();
-        var client = new SyncableNode();
+        var primary = new SyncableNode();
+        var replica = new SyncableNode();
         for (int i = 0; i < count; i++)
         {
             var k = RandomKey();
-            server.Insert(k);
-            client.Insert(k);
+            primary.Insert(k);
+            replica.Insert(k);
         }
-        return (server, client);
+        return (primary, replica);
     }
 
     // ── Add-only ─────────────────────────────────────────────────────────────
@@ -38,50 +38,50 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     [Fact]
     public void Add_Identical_IsNoop()
     {
-        var (server, client) = MakeNodesWithSharedKeys(50);
-        var sim = new SyncSimulator(client, server);
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        var sim = new SyncNodes(replica, primary);
 
         Assert.True(sim.TrySync(_output));
         Assert.Equal(0, sim.ItemsAdded);
         Assert.Equal(0, sim.ItemsDeleted);
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
     }
 
     [Fact]
-    public void Add_SmallDiff_ClientReceivesExactMissingKeys()
+    public void Add_SmallDiff_replicaReceivesExactMissingKeys()
     {
-        var (server, client) = MakeNodesWithSharedKeys(50);
-        for (int i = 0; i < 5; i++) server.Insert(RandomKey());
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        for (int i = 0; i < 5; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(5, sim.ItemsAdded);
         Assert.Equal(0, sim.ItemsDeleted);
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
-        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
     }
 
     [Fact]
-    public void Add_EmptyClient_ReceivesAllServerKeys()
+    public void Add_Emptyreplica_ReceivesAllprimaryKeys()
     {
-        var server = new SyncableNode();
-        var client = new SyncableNode();
-        for (int i = 0; i < 200; i++) server.Insert(RandomKey());
+        var primary = new SyncableNode();
+        var replica = new SyncableNode();
+        for (int i = 0; i < 200; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(200, sim.ItemsAdded);
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
-        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
     }
 
     [Fact]
     public void Add_MinimalRoundTrips_IdenticalStores()
     {
-        var (server, client) = MakeNodesWithSharedKeys(50);
-        var sim = new SyncSimulator(client, server);
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        var sim = new SyncNodes(replica, primary);
 
         Assert.True(sim.TrySync(_output));
 
@@ -95,34 +95,34 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     // ── Delete (no compaction) ────────────────────────────────────────────────
 
     [Fact]
-    public void Delete_ClientReceivesTombstonesAfterSync()
+    public void Delete_replicaReceivesTombstonesAfterSync()
     {
-        var (server, client) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
 
-        server.DeleteBulk(sharedKeys.Take(10));
+        primary.DeleteBulk(sharedKeys.Take(10));
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(10, sim.ItemsDeleted);
-        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
-        Assert.Equal(server.DeleteStore.Count(), client.DeleteStore.Count());
+        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
+        Assert.Equal(primary.DeleteStore.Count(), replica.DeleteStore.Count());
     }
 
     [Fact]
     public void Delete_EffectiveSetExcludesDeletedKeys()
     {
-        var (server, client) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
 
-        server.DeleteBulk(sharedKeys.Take(10));
+        primary.DeleteBulk(sharedKeys.Take(10));
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         // Effective set sum must match on both sides.
-        Assert.Equal(server.Sum(), client.Sum());
+        Assert.Equal(primary.Sum(), replica.Sum());
     }
 
     [Fact]
@@ -130,146 +130,146 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     {
         // Deleting a key that was never inserted is harmless — it should not
         // appear in the effective set, and the sum should still agree.
-        var (server, client) = MakeNodesWithSharedKeys(20);
+        var (primary, replica) = MakeNodesWithSharedKeys(20);
         var phantom = RandomKey(); // never inserted anywhere
-        server.Delete(phantom);
+        primary.Delete(phantom);
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(server.Sum(), client.Sum());
-        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
     }
 
     [Fact]
     public void Insert_AfterDelete_RemovesTombstoneAndKeyIsVisible()
     {
         // must clear its tombstone so it reappears in the effective set.
-        var server = new SyncableNode();
+        var primary = new SyncableNode();
         var key = RandomKey();
 
-        server.Insert(key);
-        server.Delete(key);
-        Assert.True(server.DeleteStore.Contains(key), "tombstone should exist after Delete");
+        primary.Insert(key);
+        primary.Delete(key);
+        Assert.True(primary.DeleteStore.Contains(key), "tombstone should exist after Delete");
 
-        server.Insert(key);
-        Assert.False(server.DeleteStore.Contains(key), "tombstone should be cleared after re-Insert");
+        primary.Insert(key);
+        Assert.False(primary.DeleteStore.Contains(key), "tombstone should be cleared after re-Insert");
 
         // Key should count in the effective set.
         var emptyNode = new SyncableNode();
-        Assert.NotEqual(emptyNode.Sum(), server.Sum());
+        Assert.NotEqual(emptyNode.Sum(), primary.Sum());
     }
 
     [Fact]
-    public void Insert_AfterDelete_SyncsCorrectlyToClient()
+    public void Insert_AfterDelete_SyncsCorrectlyToreplica()
     {
-        var (server, client) = MakeNodesWithSharedKeys(20);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var (primary, replica) = MakeNodesWithSharedKeys(20);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
         var targetKey = sharedKeys[0];
 
-        server.Delete(targetKey);
-        server.Insert(targetKey); // re-insert clears the tombstone
+        primary.Delete(targetKey);
+        primary.Insert(targetKey); // re-insert clears the tombstone
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(server.Sum(), client.Sum());
-        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
     }
 
     // ── Epoch / compaction ────────────────────────────────────────────────────
 
     [Fact]
-    public void Epoch_FreshClient_ConnectsToCompactedServer()
+    public void Epoch_Freshreplica_ConnectsToCompactedprimary()
     {
-        // A brand-new client (DeleteEpoch = 0) connecting to a server that has
+        // A brand-new replica (DeleteEpoch = 0) connecting to a primary that has
         // already compacted once. The epoch mismatch recovery should be a no-op
-        // on the client side (nothing to materialize) before normal sync proceeds.
-        var server = new SyncableNode();
+        // on the replica side (nothing to materialize) before normal sync proceeds.
+        var primary = new SyncableNode();
         var sharedKeys = new List<byte[]>();
         for (int i = 0; i < 50; i++)
         {
             var k = RandomKey();
             sharedKeys.Add(k);
-            server.Insert(k);
+            primary.Insert(k);
         }
 
-        server.DeleteBulk(sharedKeys.Take(5));
-        server.CompactDeleteStore(); // epoch → 1
+        primary.DeleteBulk(sharedKeys.Take(5));
+        primary.CompactDeleteStore(); // epoch → 1
 
-        var client = new SyncableNode(); // epoch = 0, empty stores
+        var replica = new SyncableNode(); // epoch = 0, empty stores
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
-        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
-        Assert.Equal(server.DeleteEpoch, client.DeleteEpoch);
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.DeleteEpoch, replica.DeleteEpoch);
     }
 
     [Fact]
-    public void Epoch_Mismatch_ClientDropsStaleKeys()
+    public void Epoch_Mismatch_replicaDropsStaleKeys()
     {
-        // Client syncs, server then compacts. On the next sync the client must
-        // drop the keys the server has already removed from its AddStore.
-        var (server, client) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        // replica syncs, primary then compacts. On the next sync the replica must
+        // drop the keys the primary has already removed from its AddStore.
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
 
-        server.DeleteBulk(sharedKeys.Take(10));
-        Assert.True(new SyncSimulator(client, server).TrySync(_output)); // client gets tombstones
+        primary.DeleteBulk(sharedKeys.Take(10));
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output)); // replica gets tombstones
 
-        server.CompactDeleteStore(); // wipes DeleteStore, bumps epoch
+        primary.CompactDeleteStore(); // wipes DeleteStore, bumps epoch
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
-        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
-        Assert.Equal(server.DeleteEpoch, client.DeleteEpoch);
-        Assert.Equal(0, server.DeleteStore.Count()); // server delete store is empty post-compact
-        Assert.Equal(0, client.DeleteStore.Count()); // client wiped its own on epoch recovery
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.DeleteEpoch, replica.DeleteEpoch);
+        Assert.Equal(0, primary.DeleteStore.Count()); // primary delete store is empty post-compact
+        Assert.Equal(0, replica.DeleteStore.Count()); // replica wiped its own on epoch recovery
     }
 
     [Fact]
     public void Epoch_Mismatch_WithNewAddsAndDeletes_ConvergesCorrectly()
     {
-        // After compaction the server has both new adds and new deletes in the
-        // current epoch. The client must handle all of them in one sync.
-        var (server, client) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = server.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        // After compaction the primary has both new adds and new deletes in the
+        // current epoch. The replica must handle all of them in one sync.
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
 
-        server.DeleteBulk(sharedKeys.Take(5));
-        Assert.True(new SyncSimulator(client, server).TrySync(_output));
+        primary.DeleteBulk(sharedKeys.Take(5));
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
-        server.DeleteBulk(sharedKeys.Skip(5).Take(5)); // 5 more deletes before compact
-        server.CompactDeleteStore();
+        primary.DeleteBulk(sharedKeys.Skip(5).Take(5)); // 5 more deletes before compact
+        primary.CompactDeleteStore();
 
-        for (int i = 0; i < 8; i++) server.Insert(RandomKey()); // new adds in new epoch
-        server.DeleteBulk(sharedKeys.Skip(10).Take(3));         // new deletes in new epoch
+        for (int i = 0; i < 8; i++) primary.Insert(RandomKey()); // new adds in new epoch
+        primary.DeleteBulk(sharedKeys.Skip(10).Take(3));         // new deletes in new epoch
 
-        var sim = new SyncSimulator(client, server);
+        var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(server.AddStore.Sum(), client.AddStore.Sum());
-        Assert.Equal(server.AddStore.Count(), client.AddStore.Count());
-        Assert.Equal(server.DeleteStore.Sum(), client.DeleteStore.Sum());
-        Assert.Equal(server.DeleteEpoch, client.DeleteEpoch);
-        Assert.Equal(server.Sum(), client.Sum());
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
+        Assert.Equal(primary.DeleteEpoch, replica.DeleteEpoch);
+        Assert.Equal(primary.Sum(), replica.Sum());
     }
 
     [Fact]
     public void Epoch_SumInvariant_HoldsAcrossCompaction()
     {
-        // Compacting must not change the effective sum of the server.
-        var server = new SyncableNode();
+        // Compacting must not change the effective sum of the primary.
+        var primary = new SyncableNode();
         var keys = new List<byte[]>();
-        for (int i = 0; i < 30; i++) { var k = RandomKey(); keys.Add(k); server.Insert(k); }
+        for (int i = 0; i < 30; i++) { var k = RandomKey(); keys.Add(k); primary.Insert(k); }
 
-        server.DeleteBulk(keys.Take(10));
-        var sumBefore = server.Sum();
+        primary.DeleteBulk(keys.Take(10));
+        var sumBefore = primary.Sum();
 
-        server.CompactDeleteStore();
+        primary.CompactDeleteStore();
 
-        Assert.Equal(sumBefore, server.Sum());
+        Assert.Equal(sumBefore, primary.Sum());
     }
 }
