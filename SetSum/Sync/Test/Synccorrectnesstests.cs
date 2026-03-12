@@ -272,4 +272,66 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         Assert.Equal(sumBefore, primary.Sum());
     }
+
+    // ── SortedKeyStore.Remove (single-key pending-delete path) ───────────────
+
+    [Fact]
+    public void SortedKeyStore_Remove_KeyIsNoLongerContained()
+    {
+        var store = new SortedKeyStore();
+        var key = RandomKey();
+        store.Add(key, Setsum.Hash(key));
+
+        store.Remove(key);
+
+        Assert.False(store.Contains(key));
+    }
+
+    [Fact]
+    public void SortedKeyStore_Remove_ReducesCount()
+    {
+        var store = new SortedKeyStore();
+        var keys = Enumerable.Range(0, 5).Select(_ => RandomKey()).ToArray();
+        foreach (var k in keys)
+            store.Add(k, Setsum.Hash(k));
+
+        store.Remove(keys[2]);
+
+        Assert.Equal(4, store.Count());
+        Assert.False(store.Contains(keys[2]));
+        Assert.True(store.Contains(keys[0]));
+    }
+
+    [Fact]
+    public void SortedKeyStore_Remove_NonExistentKey_IsNoop()
+    {
+        var store = new SortedKeyStore();
+        var key = RandomKey();
+        store.Add(key, Setsum.Hash(key));
+
+        store.Remove(RandomKey()); // never inserted
+
+        Assert.Equal(1, store.Count());
+        Assert.True(store.Contains(key));
+    }
+
+    [Fact]
+    public void SortedKeyStore_Remove_MultipleKeys_QueuedBeforeFlush()
+    {
+        // Queue several removes before any query triggers EnsureSorted.
+        var store = new SortedKeyStore();
+        var keys = Enumerable.Range(0, 10).Select(_ => RandomKey()).ToArray();
+        foreach (var k in keys)
+            store.Add(k, Setsum.Hash(k));
+
+        store.Remove(keys[0]);
+        store.Remove(keys[5]);
+        store.Remove(keys[9]);
+
+        Assert.Equal(7, store.Count());
+        Assert.False(store.Contains(keys[0]));
+        Assert.False(store.Contains(keys[5]));
+        Assert.False(store.Contains(keys[9]));
+        Assert.True(store.Contains(keys[3]));
+    }
 }
