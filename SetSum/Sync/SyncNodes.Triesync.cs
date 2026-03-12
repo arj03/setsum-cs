@@ -67,7 +67,10 @@ public partial class SyncNodes
         string label)
     {
         var missingItems = new List<byte[]>();
-        var currentLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
+
+        // BFS node carries replica store bounds [ReplicaStart, ReplicaEnd) so child splits
+        // can reuse the parent's bounds instead of re-running binary searches from scratch.
+        var currentLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount, int ReplicaStart, int ReplicaEnd)>();
 
         // ---- Root query -------------------------------------------------
         // Replica sends root prefix (0 bytes on the wire).
@@ -77,7 +80,8 @@ public partial class SyncNodes
 
         var rxRootPrefix = ParsePrefixQuery(rootReq, 0);
         var (_, rootPrimaryCount) = primary.GetPrefixInfo(rxRootPrefix);
-        var (_, rootReplicaCount) = replica.GetPrefixInfo(BitPrefix.Root);
+        var (rootReplicaStart, rootReplicaEnd) = replica.GetRootBounds();
+        int rootReplicaCount = rootReplicaEnd - rootReplicaStart;
 
         var rootResp = BuildCountResponse(rootPrimaryCount);
         BytesReceived += rootResp.Length;
@@ -87,24 +91,25 @@ public partial class SyncNodes
 
         if (rxRootPrimaryCount == 0) return missingItems;
 
-        currentLevel.Add((BitPrefix.Root, 0, rxRootPrimaryCount, rootReplicaCount));
+        currentLevel.Add((BitPrefix.Root, 0, rxRootPrimaryCount, rootReplicaCount, rootReplicaStart, rootReplicaEnd));
 
         // ---- BFS loop ---------------------------------------------------
         while (currentLevel.Count > 0)
         {
-            var prefixesToSync = new List<(BitPrefix Prefix, int Depth)>();
-            var toExpand = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
+            var prefixesToSync = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount, int ReplicaStart, int ReplicaEnd)>();
+            var toExpand = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount, int ReplicaStart, int ReplicaEnd)>();
 
-            foreach (var (prefix, depth, primaryCount, replicaCount) in currentLevel)
+            foreach (var node in currentLevel)
             {
+                var (prefix, depth, primaryCount, replicaCount, replicaStart, replicaEnd) = node;
                 int missingCount = primaryCount - replicaCount;
                 // Unidirectional invariant: equal counts ⟹ identical subtree.
                 if (missingCount == 0) continue;
 
                 if (replicaCount == 0 || missingCount <= LeafThreshold || depth >= MaxPrefixDepth)
-                    prefixesToSync.Add((prefix, depth));
+                    prefixesToSync.Add(node);
                 else
-                    toExpand.Add((prefix, depth, primaryCount, replicaCount));
+                    toExpand.Add(node);
             }
 
             // ---- Leaf resolution round trip -----------------------------
@@ -112,9 +117,10 @@ public partial class SyncNodes
             {
                 RoundTrips++;
 
-                foreach (var (prefix, depth) in prefixesToSync)
+                foreach (var (prefix, depth, primaryCount, replicaCount, replicaStart, replicaEnd) in prefixesToSync)
                 {
-                    var (replicaPrefixSum, _) = replica.GetPrefixInfo(prefix);
+                    // Use pre-computed bounds — no binary search on replica store.
+                    var (replicaPrefixSum, _) = replica.GetInfoByIndex(replicaStart, replicaEnd);
 
                     // Replica serializes (prefix bytes ‖ replica's sum) and sends.
                     var req = BuildPrefixSetsumRequest(prefix, replicaPrefixSum);
@@ -133,10 +139,7 @@ public partial class SyncNodes
                     }
                     else if (result.Outcome == ReconcileOutcome.Fallback)
                     {
-                        var (_, pc) = primary.GetPrefixInfo(prefix);
-                        var (_, rc) = replica.GetPrefixInfo(prefix);
-                        RoundTrips++;
-
+                        // Counts are already known from currentLevel — no extra GetPrefixInfo needed.
                         if (prefix.Length >= MaxPrefixDepth)
                         {
                             // At maximum depth: pull everything under this prefix.
@@ -144,11 +147,12 @@ public partial class SyncNodes
                             var resp = BuildKeysResponse(items);
                             BytesReceived += resp.Length;
                             missingItems.AddRange(ParseKeysResponse(resp));
-                            RoundTrips++;
                         }
                         else
                         {
-                            toExpand.Add((prefix, prefix.Length, pc, rc));
+                            // Re-queue for expansion; no extra round trip charged here —
+                            // the expansion below will count its own RT.
+                            toExpand.Add((prefix, depth, primaryCount, replicaCount, replicaStart, replicaEnd));
                         }
                     }
                 }
@@ -161,7 +165,7 @@ public partial class SyncNodes
             int batchReqSize = toExpand.Sum(e => e.Prefix.NetworkSize);
             var batchReq = new byte[batchReqSize];
             int batchOff = 0;
-            foreach (var (prefix, _, _, _) in toExpand)
+            foreach (var (prefix, _, _, _, _, _) in toExpand)
             {
                 prefix.Serialize(batchReq, batchOff);
                 batchOff += prefix.NetworkSize;
@@ -180,17 +184,19 @@ public partial class SyncNodes
 
             RoundTrips++;
 
-            var nextLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount)>();
+            var nextLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount, int ReplicaStart, int ReplicaEnd)>(toExpand.Count * 2);
             for (int i = 0; i < toExpand.Count; i++)
             {
-                var (expPrefix, depth, _, _) = toExpand[i];
+                var (expPrefix, depth, _, _, rsStart, rsEnd) = toExpand[i];
                 var (c0, _, c1, _) = primaryResponses[i];
                 var (rxPc0, rxPc1) = countPairs[i]; // counts as received over wire
-                var (rc0, rc1) = replica.GetChildrenCounts(expPrefix, depth);
+
+                // Split replica bounds at this depth — O(log range) instead of O(log N).
+                var (split, rc0, rc1) = replica.SplitByIndex(rsStart, rsEnd, depth);
 
                 // Only descend into subtrees where primary has more items than replica.
-                if (rxPc0 > rc0) nextLevel.Add((c0, depth + 1, rxPc0, rc0));
-                if (rxPc1 > rc1) nextLevel.Add((c1, depth + 1, rxPc1, rc1));
+                if (rxPc0 > rc0) nextLevel.Add((c0, depth + 1, rxPc0, rc0, rsStart, split));
+                if (rxPc1 > rc1) nextLevel.Add((c1, depth + 1, rxPc1, rc1, split, rsEnd));
             }
 
             currentLevel = nextLevel;

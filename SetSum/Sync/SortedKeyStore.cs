@@ -157,16 +157,50 @@ public class SortedKeyStore
         _prefixSumsDirty = true;
     }
 
-    public (Setsum Hash, int Count) RangeInfo(byte[] lo, byte[] hi)
+    public (Setsum Hash, int Count) RangeInfo(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi)
     {
         Prepare();
 
-        int start = LowerBound(lo), end = UpperBound(hi), count = end - start;
+        int start = LowerBound(lo, 0, _count), end = UpperBound(hi), count = end - start;
         if (count <= 0)
             return (new Setsum(), 0);
         else
             return (_prefixSums[end] - _prefixSums[start], count);
     }
+
+    /// <summary>
+    /// Returns (hash, count) for a range specified by pre-computed [start, end) indices.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal (Setsum Hash, int Count) RangeInfoByIndex(int start, int end)
+    {
+        int count = end - start;
+        if (count <= 0) return (new Setsum(), 0);
+        return (_prefixSums[end] - _prefixSums[start], count);
+    }
+
+    /// <summary>
+    /// Computes [start, end) bounds for the given [lo, hi] range.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal (int Start, int End) GetBounds(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi)
+        => (LowerBound(lo, 0, _count), UpperBound(hi));
+
+    /// <summary>
+    /// Returns the full [0, count) bounds after ensuring the store is prepared.
+    /// </summary>
+    internal (int Start, int End) GetRootBounds()
+    {
+        Prepare();
+        return (0, _count);
+    }
+
+    /// <summary>
+    /// Finds the split index within [start, end) at the given bit depth.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal int FindSplitPointByIndex(int start, int end, int depth)
+        => FindSplitPoint(start, end, depth);
 
     /// <summary>
     /// Returns the hash and count for the entire store.
@@ -178,11 +212,11 @@ public class SortedKeyStore
         return (_prefixSums[_count], _count);
     }
 
-    public (Setsum Hash0, int Count0, Setsum Hash1, int Count1) RangeInfoSplit(byte[] lo, byte[] hi, int depth)
+    public (Setsum Hash0, int Count0, Setsum Hash1, int Count1) RangeInfoSplit(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi, int depth)
     {
         Prepare();
 
-        int start = LowerBound(lo), end = UpperBound(hi);
+        int start = LowerBound(lo, 0, _count), end = UpperBound(hi);
         if (start >= end) return (new Setsum(), 0, new Setsum(), 0);
 
         int split = FindSplitPoint(start, end, depth);
@@ -192,11 +226,15 @@ public class SortedKeyStore
                 c1 > 0 ? _prefixSums[end] - _prefixSums[split] : new Setsum(), c1);
     }
 
-    public IEnumerable<byte[]> Range(byte[] lo, byte[] hi)
+    public IEnumerable<byte[]> Range(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi)
     {
         EnsureSorted();
+        int start = LowerBound(lo, 0, _count), end = UpperBound(hi);
+        return RangeByIndex(start, end);
+    }
 
-        int start = LowerBound(lo), end = UpperBound(hi);
+    internal IEnumerable<byte[]> RangeByIndex(int start, int end)
+    {
         for (int i = start; i < end; i++)
             yield return KeyAt(_data, i).ToArray();
     }
@@ -214,11 +252,20 @@ public class SortedKeyStore
     /// - missingCount == 2: tries all O(n²) pairs, only when range has ≤ maxCountForPairPeel items.
     /// Returns null if no match found or range too large for pair peeling.
     /// </summary>
-    public List<byte[]>? TryPeelRange(byte[] lo, byte[] hi, Setsum diff, int maxCountForPairPeel)
+    public List<byte[]>? TryPeelRange(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi, Setsum diff, int maxCountForPairPeel)
     {
         Prepare();
+        int start = LowerBound(lo, 0, _count), end = UpperBound(hi);
+        return TryPeelRangeByIndex(start, end, diff, maxCountForPairPeel);
+    }
 
-        int start = LowerBound(lo), end = UpperBound(hi), count = end - start;
+    /// <summary>
+    /// Scans the pre-computed range [start, end) for items whose hashes peel against diff.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal List<byte[]>? TryPeelRangeByIndex(int start, int end, Setsum diff, int maxCountForPairPeel)
+    {
+        int count = end - start;
         if (count == 0) return null;
 
         // missingCount == 1: one linear scan, no allocations until match found
@@ -394,7 +441,7 @@ public class SortedKeyStore
         return ~lo;
     }
 
-    private int LowerBound(byte[] t) => LowerBound((ReadOnlySpan<byte>)t, 0, _count);
+    private int LowerBound(ReadOnlySpan<byte> t) => LowerBound(t, 0, _count);
 
     private int LowerBound(ReadOnlySpan<byte> t, int lo, int hi)
     {
@@ -407,14 +454,13 @@ public class SortedKeyStore
         return lo;
     }
 
-    private int UpperBound(byte[] t)
+    private int UpperBound(ReadOnlySpan<byte> t)
     {
-        var s = (ReadOnlySpan<byte>)t;
         int lo = 0, hi = _count;
         while (lo < hi)
         {
             int mid = (lo + hi) >> 1;
-            if (KeyAt(_data, mid).SequenceCompareTo(s) <= 0) lo = mid + 1;
+            if (KeyAt(_data, mid).SequenceCompareTo(t) <= 0) lo = mid + 1;
             else hi = mid;
         }
         return lo;

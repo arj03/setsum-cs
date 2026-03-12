@@ -73,7 +73,18 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
         const int KeyBytes = Setsum.DigestSize;
         var lo = new byte[KeyBytes];
         var hi = new byte[KeyBytes];
-        Array.Fill(hi, (byte)0xFF);
+        FillKeyRange(lo, hi);
+        return (lo, hi);
+    }
+
+    /// <summary>
+    /// Fills caller-supplied spans with the [lo, hi] key range for this prefix.
+    /// Use with stackalloc to avoid heap allocation in hot paths.
+    /// </summary>
+    public void FillKeyRange(Span<byte> lo, Span<byte> hi)
+    {
+        lo.Clear();
+        hi.Fill(0xFF);
 
         int fullBytes = Length / 8;
         int remainder = Length % 8;
@@ -93,8 +104,6 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
             lo[fullBytes] = prefixPart;
             hi[fullBytes] = (byte)(prefixPart | (~mask & 0xFF));
         }
-
-        return (lo, hi);
     }
 
     public override string ToString()

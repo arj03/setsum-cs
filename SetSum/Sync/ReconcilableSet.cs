@@ -107,7 +107,9 @@ public class ReconcilableSet
     public (Setsum Hash, int Count) GetPrefixInfo(BitPrefix prefix)
     {
         if (prefix.Length == 0) return _store.TotalInfo();
-        var (lo, hi) = prefix.KeyRange();
+        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
+        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
+        prefix.FillKeyRange(lo, hi);
         return _store.RangeInfo(lo, hi);
     }
 
@@ -120,9 +122,11 @@ public class ReconcilableSet
         GetChildrenCountsBatch(IReadOnlyList<(BitPrefix Prefix, int Depth)> requests)
     {
         var results = new List<(BitPrefix, int, BitPrefix, int)>(requests.Count);
+        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
+        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
         foreach (var (prefix, depth) in requests)
         {
-            var (lo, hi) = prefix.KeyRange();
+            prefix.FillKeyRange(lo, hi);
             var (_, c0, _, c1) = _store.RangeInfoSplit(lo, hi, depth);
             results.Add((prefix.Extend(0), c0, prefix.Extend(1), c1));
         }
@@ -135,15 +139,42 @@ public class ReconcilableSet
     /// </summary>
     public (int Count0, int Count1) GetChildrenCounts(BitPrefix prefix, int depth)
     {
-        var (lo, hi) = prefix.KeyRange();
+        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
+        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
+        prefix.FillKeyRange(lo, hi);
         var (_, c0, _, c1) = _store.RangeInfoSplit(lo, hi, depth);
         return (c0, c1);
     }
 
+    /// <summary>
+    /// Returns (hash, count) for a pre-computed index range.
+    /// Caller must have already called Prepare() on the underlying store.
+    /// </summary>
+    internal (Setsum Hash, int Count) GetInfoByIndex(int start, int end)
+        => _store.RangeInfoByIndex(start, end);
+
+    /// <summary>
+    /// Splits [start, end) at the given bit depth and returns the split index plus child counts.
+    /// Avoids binary search — the parent bounds are already known.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal (int Split, int Count0, int Count1) SplitByIndex(int start, int end, int depth)
+    {
+        int split = _store.FindSplitPointByIndex(start, end, depth);
+        return (split, split - start, end - split);
+    }
+
+    /// <summary>
+    /// Ensures the store is prepared and returns the full [0, count) bounds.
+    /// </summary>
+    internal (int Start, int End) GetRootBounds() => _store.GetRootBounds();
+
     public IEnumerable<byte[]> GetItemsWithPrefix(BitPrefix prefix)
     {
         if (prefix.Length == 0) return _store.All();
-        var (lo, hi) = prefix.KeyRange();
+        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
+        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
+        prefix.FillKeyRange(lo, hi);
         return _store.Range(lo, hi);
     }
 
@@ -156,17 +187,24 @@ public class ReconcilableSet
     /// </summary>
     public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum replicaPrefixSum)
     {
-        var (primaryPrefixSum, _) = GetPrefixInfo(prefix);
+        _store.Prepare();
+
+        // Compute [lo, hi] bounds once; reuse for RangeInfoByIndex and TryPeelRangeByIndex
+        // to avoid the double binary-search that separate GetPrefixInfo + TryPeelRange would incur.
+        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
+        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
+        prefix.FillKeyRange(lo, hi);
+
+        var (start, end) = _store.GetBounds(lo, hi);
+        var (primaryPrefixSum, _) = _store.RangeInfoByIndex(start, end);
         if (primaryPrefixSum == replicaPrefixSum) return ReconcileResult.Identical();
 
         // replicaPrefixSum == Zero means the replica has nothing here — send everything.
         if (replicaPrefixSum.IsEmpty())
-            return ReconcileResult.Found(GetItemsWithPrefix(prefix).ToList());
+            return ReconcileResult.Found(_store.RangeByIndex(start, end).ToList());
 
         var diff = primaryPrefixSum - replicaPrefixSum;
-
-        var (lo, hi) = prefix.KeyRange();
-        var found = _store.TryPeelRange(lo, hi, diff, MaxPrimaryCountForPairPeel);
+        var found = _store.TryPeelRangeByIndex(start, end, diff, MaxPrimaryCountForPairPeel);
 
         return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
     }
