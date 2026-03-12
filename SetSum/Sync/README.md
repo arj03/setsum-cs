@@ -65,7 +65,7 @@ sequenceDiagram
 
 A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each trie node covers all keys sharing a common bit-prefix. The replica and primary exchange subtree counts, recursing only into subtrees where the primary has more items than the replica, until each differing subtree is small enough to resolve via Setsum peeling.
 
-Because the protocol is unidirectional, **counts alone are sufficient to prune the trie** — no hashes are exchanged during BFS traversal. `primaryCount == replicaCount` guarantees the subtrees are identical; `primaryCount > replicaCount` means the primary has items the replica is missing.
+Because the protocol is unidirectional, **counts alone are sufficient to prune the trie** — no hashes are exchanged during normal BFS traversal. `primaryCount == replicaCount` guarantees the subtrees are identical (primary is always a superset, so equal counts imply equal sets); `primaryCount > replicaCount` means the primary has items the replica is missing.
 
 ```mermaid
 flowchart TD
@@ -127,7 +127,7 @@ diff = primaryPrefixSum - replicaPrefixSum
 
 **missingCount == 1:** `diff` equals exactly one item's hash. The primary does one linear scan over its items under that prefix and returns the matching key. No key list is exchanged — only the 32-byte summary goes up and the single key comes back.
 
-**missingCount == 2:** `diff` equals the sum of exactly two items' hashes. The primary tries all O(n²) pairs of items under the prefix, checking whether `hash[i] + hash[j] == diff`. This is only attempted when the primary holds at most `MaxPrimaryCountForPairPeel` (256) items under that prefix, keeping the search space bounded (≤ 65,536 pairs). If the prefix is larger the primary returns `Fallback` and the replica descends further.
+**missingCount == 2:** `diff` equals the sum of exactly two items' hashes. The primary tries all O(n²) pairs of items under the prefix, checking whether `hash[i] + hash[j] == diff`. This is only attempted when the primary holds at most `MaxPrimaryCountForPairPeel` (512) items under that prefix, keeping the search space bounded (≤ 262,144 pairs). If the prefix is larger the primary returns `Fallback` and the replica descends further.
 
 For `replicaCount == 0` the primary simply returns all its items under the prefix directly, since there is no replica sum to subtract from.
 
@@ -158,7 +158,7 @@ graph LR
 
 **Pending buffer**: New insertions go into an unsorted `_pending` buffer. It is radix-sorted and merged into the main store lazily on the next query — avoiding repeated O(N log N) sorts during bulk inserts.
 
-**Radix sort**: Two-pass LSB radix sort on key bytes 0–1, followed by insertion sort within same-prefix buckets (~15 items each, all in L1 cache). This achieves O(N) sort with sequential memory access.
+**Radix sort**: Four-pass LSB radix sort on key bytes 0–3, followed by insertion sort within same-prefix buckets (average <1 item for N ≤ 4 billion, so effectively a no-op). This achieves O(N) sort with sequential memory access.
 
 ---
 
@@ -251,9 +251,11 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 | Sets are identical | 1 | 33–37 | Sum (32) + varint(Count) sent; Identical returned |
 | Replica missing ≤ 3 items | 1 | ~130 | 33–37 sent + ~96 received (missing keys) |
 | Replica missing 4–10 items | 1 | ~355 | 33–37 sent + ~320 received (missing keys) |
-| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) + D × 32) | Trie BFS (counts only) + Setsum leaf peeling; per-node cost is ⌈depth/8⌉ prefix bytes + 1–5 varint count bytes |
+| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) + D × 32) | Level-batched BFS (counts only) + Setsum leaf peeling; per-node cost is ⌈depth/8⌉ prefix bytes + 1–5 varint count bytes |
 
-For a case of D=10,000 missing items in N=1,000,000 total: roughly ~500 round trips, ~600 KB transferred. The raw diff is 320 KB; total store size is 32 MB. BFS traversal overhead is low because prefix length is implicit (depth is tracked in lockstep, so no length byte is sent), and counts are varint-encoded (1–3 bytes at typical trie depths) rather than 32-byte hashes.
+All nodes at the same BFS depth are queried in a **single batched round trip**, so the total trip count is bounded by the trie depth — O(log N) — not by the number of differing items. For D=10,000 missing items in N=1,000,000 total: ~35 round trips and ~575 KB transferred. The raw diff is 320 KB; total store size is 32 MB. BFS traversal overhead is low because prefix length is implicit (depth is tracked in lockstep), and counts are varint-encoded (1–3 bytes at typical trie depths) rather than 32-byte hashes.
+
+The BFS nodes carry pre-computed `(ReplicaStart, ReplicaEnd)` store indices through each level. Child splits reuse the parent's bounds via a single O(log range) scan rather than a full O(log N) binary search from scratch, eliminating all replica-side binary searches during traversal.
 
 ---
 
@@ -323,7 +325,9 @@ sequenceDiagram
     P-->>R: Missing tombstones
 ```
 
-The repair phase uses the same binary-prefix trie traversal as normal sync, but identifies keys the replica holds that the primary no longer does — the inverse of the usual direction. Because this is the only place where the replica can be *ahead* of the primary (holding keys the primary has already compacted out), it is handled as a special authoritative repair pass rather than through the normal unidirectional protocol.
+The repair phase uses a **bidirectional** binary-prefix trie traversal that handles both directions in a single BFS pass: keys the replica is missing (primary added new items) and keys the replica holds that the primary has compacted away. Because the primary is the authority after compaction, its view of `AddStore` is definitive.
+
+Unlike the normal unidirectional BFS which exchanges counts only, the epoch repair BFS exchanges `(hash, count)` per node — hashes are required to detect divergence when counts are equal but items differ (i.e. an equal number of adds and removes under a prefix). Each BFS level uses a single round trip that batches both leaf resolution and child expansion together.
 
 ---
 
