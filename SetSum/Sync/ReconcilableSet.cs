@@ -9,14 +9,13 @@ namespace Setsum.Sync;
 /// </summary>
 public class ReconcilableSet
 {
-    private const int HistorySize = 128;
-    private const int MaxDiffForFullScan = 3;
+    private const int HistorySize = 256;
     private const int MaxDiffForRecentScan = 10;
-    private const int RecentScanLimit = 20;
+    private const int RecentScanLimit = 40;
 
-    // Maximum primary-side prefix item count for which we attempt O(n²) pair peeling.
-    // At 256 items the search space is 256² = 65,536 pairs — cheap enough to do inline.
-    private const int MaxPrimaryCountForPairPeel = 256;
+    // 512² = 262,144 pairs. Higher cap needed because LeafThreshold=3 means
+    // TryReconcilePrefix is called one level higher, where primaryCount is larger.
+    private const int MaxPrimaryCountForPairPeel = 512;
 
     public Setsum Sum() => _store.TotalInfo().Hash;
 
@@ -31,12 +30,17 @@ public class ReconcilableSet
     private int _head = 0;
     private int _historyCount = 0;
 
+    // Hash index: Setsum → ring slot. Enables O(1) k=1 and O(n) k=2 reconcile.
+    // Last-writer-wins on collision — no correctness issue, just a Fallback at worst.
+    private readonly Dictionary<Setsum, int> _hashIndex;
+
     private readonly SortedKeyStore _store;
 
     public ReconcilableSet()
     {
         _historyKeys = new byte[HistorySize][];
         _historyHashes = new Setsum[HistorySize];
+        _hashIndex = new Dictionary<Setsum, int>(HistorySize);
         _store = new SortedKeyStore();
     }
 
@@ -166,7 +170,12 @@ public class ReconcilableSet
 
     /// <summary>
     /// Called by the primary: given the replica's (Sum, Count), return what it's missing.
-    /// Uses Setsum peeling — works for small diffs only, otherwise returns Fallback.
+    ///
+    /// Complexity by missing count k:
+    ///   k == 1 : O(1)   — direct hash-index lookup
+    ///   k == 2 : O(n)   — complement scan via hash index (was O(n²) recursive)
+    ///   k == 3 : O(n²)  — for each pair (i,j), look up the required third via index
+    ///   k  > 3 : Fallback
     /// </summary>
     public ReconcileResult TryReconcile(Setsum replicaSum, long replicaCount)
     {
@@ -180,16 +189,83 @@ public class ReconcilableSet
         if (missingCount is <= 0 or > MaxDiffForRecentScan)
             return ReconcileResult.Fallback();
 
-        int searchLimit = Math.Min(
-            missingCount <= MaxDiffForFullScan ? HistorySize : RecentScanLimit,
-            _historyCount);
+        int searchLimit = missingCount switch
+        {
+            1 => _historyCount,                 // O(1) via index — limit irrelevant
+            2 => Math.Min(128, _historyCount),  // scan 128 for idxA; complement found anywhere in 256-slot index
+            3 => Math.Min(128, _historyCount),  // same reasoning for outer loop
+            _ => Math.Min(RecentScanLimit, _historyCount)
+        };
 
         var diff = localSum - replicaSum;
-        var result = new List<byte[]>(missingCount);
-        var found = SolveRecursive(diff, missingCount, searchLimit, result,
-            new HashSet<byte[]>(ReferenceEqualityComparer.Instance));
 
-        return found ? ReconcileResult.Found(result) : ReconcileResult.Fallback();
+        // k == 1: the diff IS the missing hash — single index probe.
+        if (missingCount == 1)
+        {
+            if (!_hashIndex.TryGetValue(diff, out int slot)) return ReconcileResult.Fallback();
+            var key = _historyKeys[slot];
+            if (key is null || _historyHashes[slot] != diff) return ReconcileResult.Fallback();
+            return ReconcileResult.Found([key]);
+        }
+
+        // k == 2: for each h_i, the required partner is (diff - h_i).
+        // One index probe per entry.
+        if (missingCount == 2)
+        {
+            for (int offset = 0; offset < searchLimit; offset++)
+            {
+                int idxA = ((_head - 1 - offset) % HistorySize + HistorySize) % HistorySize;
+                var keyA = _historyKeys[idxA];
+                if (keyA is null) break;
+
+                var need = diff - _historyHashes[idxA];
+                if (!_hashIndex.TryGetValue(need, out int idxB)) continue;
+
+                var keyB = _historyKeys[idxB];
+                if (keyB is null || keyB == keyA || _historyHashes[idxB] != need) continue;
+
+                return ReconcileResult.Found([keyA, keyB]);
+            }
+            return ReconcileResult.Fallback();
+        }
+
+        // k == 3: for each pair (i, j), the required third hash is (diff - h_i - h_j).
+        // O(n²) pairs but each lookup is O(1), so O(n²) total.
+        if (missingCount == 3)
+        {
+            for (int oi = 0; oi < searchLimit; oi++)
+            {
+                int idxA = ((_head - 1 - oi) % HistorySize + HistorySize) % HistorySize;
+                var keyA = _historyKeys[idxA];
+                if (keyA is null) break;
+                var remainAB = diff - _historyHashes[idxA];
+
+                for (int oj = oi + 1; oj < searchLimit; oj++)
+                {
+                    int idxB = ((_head - 1 - oj) % HistorySize + HistorySize) % HistorySize;
+                    var keyB = _historyKeys[idxB];
+                    if (keyB is null) break;
+                    if (keyB == keyA) continue;
+
+                    var need = remainAB - _historyHashes[idxB];
+                    if (!_hashIndex.TryGetValue(need, out int idxC)) continue;
+
+                    var keyC = _historyKeys[idxC];
+                    if (keyC is null || keyC == keyA || keyC == keyB) continue;
+                    if (_historyHashes[idxC] != need) continue;
+
+                    return ReconcileResult.Found([keyA, keyB, keyC]);
+                }
+            }
+
+            return ReconcileResult.Fallback();
+        }
+
+        // k > 3: fall back to the original recursive solver.
+        var result = new List<byte[]>(missingCount);
+        var foundRecursive = SolveRecursive(diff, missingCount, searchLimit, result,
+            new HashSet<byte[]>(ReferenceEqualityComparer.Instance));
+        return foundRecursive ? ReconcileResult.Found(result) : ReconcileResult.Fallback();
     }
 
     // -------------------------------------------------------------------------
@@ -198,8 +274,10 @@ public class ReconcilableSet
 
     private void RecordHistory(byte[] key, Setsum hash)
     {
-        _historyKeys[_head] = key;
-        _historyHashes[_head] = hash;
+        int slot = _head;
+        _historyKeys[slot] = key;
+        _historyHashes[slot] = hash;
+        _hashIndex[hash] = slot; // last-writer-wins; stale hits caught by slot verification in TryReconcile
         _head = (_head + 1) % HistorySize;
         _historyCount = Math.Min(_historyCount + 1, HistorySize);
     }
