@@ -36,7 +36,8 @@ public partial class SyncNodes
 
         var rxRootPrefix = ParsePrefixQuery(rootReq, 0);
         var (primaryRootHash, primaryRootCount) = _primary.AddStore.GetPrefixInfo(rxRootPrefix);
-        var (replicaRootHash, replicaRootCount) = _replica.AddStore.GetPrefixInfo(BitPrefix.Root);
+        var (replicaRootStart, replicaRootEnd) = _replica.AddStore.GetRootBounds();
+        var (replicaRootHash, replicaRootCount) = _replica.AddStore.GetInfoByIndex(replicaRootStart, replicaRootEnd);
 
         var rootResp = BuildHashCountResponse(primaryRootHash, primaryRootCount);
         BytesReceived += rootResp.Length;
@@ -47,13 +48,17 @@ public partial class SyncNodes
         if (rxPrimaryRootHash == replicaRootHash && rxPrimaryRootCount == replicaRootCount)
             return (0, 0);
 
+        // BFS node carries replica store bounds [ReplicaStart, ReplicaEnd) so child splits
+        // can reuse the parent's bounds instead of re-running binary searches from scratch.
         var currentLevel = new List<(BitPrefix Prefix, int Depth,
                                      Setsum PrimaryHash, int PrimaryCount,
-                                     Setsum ReplicaHash, int ReplicaCount)>
+                                     Setsum ReplicaHash, int ReplicaCount,
+                                     int ReplicaStart, int ReplicaEnd)>
         {
             (BitPrefix.Root, 0,
              rxPrimaryRootHash, rxPrimaryRootCount,
-             replicaRootHash, replicaRootCount)
+             replicaRootHash, replicaRootCount,
+             replicaRootStart, replicaRootEnd)
         };
 
         // ---- BFS loop ---------------------------------------------------
@@ -61,10 +66,11 @@ public partial class SyncNodes
         {
             var leaves = new List<(BitPrefix Prefix, int Depth,
                                      int PrimaryCount, int ReplicaCount,
-                                     Setsum PrimaryHash, Setsum ReplicaHash)>();
-            var toExpand = new List<(BitPrefix Prefix, int Depth)>();
+                                     Setsum PrimaryHash, Setsum ReplicaHash,
+                                     int ReplicaStart, int ReplicaEnd)>();
+            var toExpand = new List<(BitPrefix Prefix, int Depth, int ReplicaStart, int ReplicaEnd)>();
 
-            foreach (var (prefix, depth, primaryHash, primaryCount, replicaHash, replicaCount)
+            foreach (var (prefix, depth, primaryHash, primaryCount, replicaHash, replicaCount, rsStart, rsEnd)
                      in currentLevel)
             {
                 if (primaryHash == replicaHash && primaryCount == replicaCount)
@@ -73,8 +79,8 @@ public partial class SyncNodes
                 if (primaryCount == 0)
                 {
                     // Free: primaryCount==0 is already known from the expansion that produced
-                    // this node — no extra round trip needed.
-                    var stale = _replica.AddStore.GetItemsWithPrefix(prefix).ToList();
+                    // this node — no extra round trip needed. Use pre-computed bounds.
+                    var stale = _replica.AddStore.GetItemsByIndex(rsStart, rsEnd).ToList();
                     pendingRemoves.AddRange(stale);
                     removed += stale.Count;
                 }
@@ -82,11 +88,11 @@ public partial class SyncNodes
                       || depth >= MaxPrefixDepth
                       || Math.Abs(primaryCount - replicaCount) <= LeafThreshold)
                 {
-                    leaves.Add((prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash));
+                    leaves.Add((prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash, rsStart, rsEnd));
                 }
                 else
                 {
-                    toExpand.Add((prefix, depth));
+                    toExpand.Add((prefix, depth, rsStart, rsEnd));
                 }
             }
 
@@ -97,7 +103,7 @@ public partial class SyncNodes
             RoundTrips++;
 
             // --- Leaf resolution ---
-            foreach (var (prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash)
+            foreach (var (prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash, rsStart, rsEnd)
                      in leaves)
             {
                 if (replicaCount == 0)
@@ -130,9 +136,17 @@ public partial class SyncNodes
                     BytesSent += req.Length;
 
                     var (rxPrefix, rxSum) = ParsePrefixSetsumRequest(req, prefix.Length);
-                    var result = primaryAhead
-                        ? _primary.AddStore.TryReconcilePrefix(rxPrefix, rxSum)
-                        : _replica.AddStore.TryReconcilePrefix(rxPrefix, rxSum);
+                    ReconcileResult result;
+                    if (primaryAhead)
+                    {
+                        // Primary resolves — no cached primary bounds available.
+                        result = _primary.AddStore.TryReconcilePrefix(rxPrefix, rxSum);
+                    }
+                    else
+                    {
+                        // Replica resolves — use pre-computed bounds to skip binary search.
+                        result = _replica.AddStore.TryReconcilePrefixByIndex(rsStart, rsEnd, rxSum);
+                    }
 
                     if (result.Outcome == ReconcileOutcome.Found)
                     {
@@ -157,7 +171,7 @@ public partial class SyncNodes
                     // Expand in the same RT's expansion pass below — no extra trip.
                     if (depth < MaxPrefixDepth)
                     {
-                        toExpand.Add((prefix, depth));
+                        toExpand.Add((prefix, depth, rsStart, rsEnd));
                         continue;
                     }
                     // At max depth: fall through to full key exchange.
@@ -165,7 +179,7 @@ public partial class SyncNodes
                 else if (depth < MaxPrefixDepth)
                 {
                     // Equal counts, different hash — items swapped. Descend to isolate.
-                    toExpand.Add((prefix, depth));
+                    toExpand.Add((prefix, depth, rsStart, rsEnd));
                     continue;
                 }
 
@@ -198,7 +212,7 @@ public partial class SyncNodes
             // Each expanded node contributes exactly two children; their lengths
             // are depth+1 which both sides know from the BFS level counter.
             var childPrefixes = new List<(BitPrefix Child, int Length)>(toExpand.Count * 2);
-            foreach (var (prefix, depth) in toExpand)
+            foreach (var (prefix, depth, _, _) in toExpand)
             {
                 childPrefixes.Add((prefix.Extend(0), depth + 1));
                 childPrefixes.Add((prefix.Extend(1), depth + 1));
@@ -232,21 +246,23 @@ public partial class SyncNodes
 
             var nextLevel = new List<(BitPrefix Prefix, int Depth,
                                       Setsum PrimaryHash, int PrimaryCount,
-                                      Setsum ReplicaHash, int ReplicaCount)>(toExpand.Count * 2);
+                                      Setsum ReplicaHash, int ReplicaCount,
+                                      int ReplicaStart, int ReplicaEnd)>(toExpand.Count * 2);
 
             for (int i = 0; i < toExpand.Count; i++)
             {
-                var (prefix, depth) = toExpand[i];
+                var (prefix, depth, rsStart, rsEnd) = toExpand[i];
                 var c0 = prefix.Extend(0);
                 var c1 = prefix.Extend(1);
 
                 var (ph0, pc0) = rxChildInfos[i * 2];
                 var (ph1, pc1) = rxChildInfos[i * 2 + 1];
-                var (rh0, rc0) = _replica.AddStore.GetPrefixInfo(c0);
-                var (rh1, rc1) = _replica.AddStore.GetPrefixInfo(c1);
 
-                if (pc0 != rc0 || ph0 != rh0) nextLevel.Add((c0, depth + 1, ph0, pc0, rh0, rc0));
-                if (pc1 != rc1 || ph1 != rh1) nextLevel.Add((c1, depth + 1, ph1, pc1, rh1, rc1));
+                // Split replica bounds — no binary search, just O(log range) FindSplitPoint.
+                var (rSplit, rh0, rc0, rh1, rc1) = _replica.AddStore.SplitWithHashesByIndex(rsStart, rsEnd, depth);
+
+                if (pc0 != rc0 || ph0 != rh0) nextLevel.Add((c0, depth + 1, ph0, pc0, rh0, rc0, rsStart, rSplit));
+                if (pc1 != rc1 || ph1 != rh1) nextLevel.Add((c1, depth + 1, ph1, pc1, rh1, rc1, rSplit, rsEnd));
             }
 
             currentLevel = nextLevel;

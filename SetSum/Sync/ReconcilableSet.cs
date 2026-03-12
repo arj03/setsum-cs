@@ -165,9 +165,47 @@ public class ReconcilableSet
     }
 
     /// <summary>
+    /// Splits [start, end) at the given bit depth and returns the split index, child hashes, and child counts.
+    /// Use in bidirectional BFS where both hash and count are needed for each child.
+    /// Avoids binary search — the parent bounds are already known.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal (int Split, Setsum Hash0, int Count0, Setsum Hash1, int Count1) SplitWithHashesByIndex(int start, int end, int depth)
+    {
+        int split = _store.FindSplitPointByIndex(start, end, depth);
+        var (h0, c0) = _store.RangeInfoByIndex(start, split);
+        var (h1, c1) = _store.RangeInfoByIndex(split, end);
+        return (split, h0, c0, h1, c1);
+    }
+
+    /// <summary>
+    /// Leaf resolution using pre-computed [start, end) bounds — skips binary search entirely.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal ReconcileResult TryReconcilePrefixByIndex(int start, int end, Setsum replicaPrefixSum)
+    {
+        _store.Prepare();
+        var (primaryPrefixSum, _) = _store.RangeInfoByIndex(start, end);
+        if (primaryPrefixSum == replicaPrefixSum) return ReconcileResult.Identical();
+
+        if (replicaPrefixSum.IsEmpty())
+            return ReconcileResult.Found(_store.RangeByIndex(start, end).ToList());
+
+        var diff = primaryPrefixSum - replicaPrefixSum;
+        var found = _store.TryPeelRangeByIndex(start, end, diff, MaxPrimaryCountForPairPeel);
+        return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
+    }
+
+    /// <summary>
     /// Ensures the store is prepared and returns the full [0, count) bounds.
     /// </summary>
     internal (int Start, int End) GetRootBounds() => _store.GetRootBounds();
+
+    /// <summary>
+    /// Returns items in the pre-computed index range — no binary search.
+    /// Caller must have already called Prepare().
+    /// </summary>
+    internal IEnumerable<byte[]> GetItemsByIndex(int start, int end) => _store.RangeByIndex(start, end);
 
     public IEnumerable<byte[]> GetItemsWithPrefix(BitPrefix prefix)
     {
