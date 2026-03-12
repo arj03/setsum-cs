@@ -134,19 +134,6 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Returns child counts only — no hashes computed.
-    /// Use during BFS traversal where only counts are needed to decide whether to descend.
-    /// </summary>
-    public (int Count0, int Count1) GetChildrenCounts(BitPrefix prefix, int depth)
-    {
-        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
-        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
-        prefix.FillKeyRange(lo, hi);
-        var (_, c0, _, c1) = _store.RangeInfoSplit(lo, hi, depth);
-        return (c0, c1);
-    }
-
-    /// <summary>
     /// Returns (hash, count) for a pre-computed index range.
     /// Caller must have already called Prepare() on the underlying store.
     /// </summary>

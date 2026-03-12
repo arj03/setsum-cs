@@ -103,8 +103,7 @@ public partial class SyncNodes
             RoundTrips++;
 
             // --- Leaf resolution ---
-            foreach (var (prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash, rsStart, rsEnd)
-                     in leaves)
+            foreach (var (prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash, rsStart, rsEnd) in leaves)
             {
                 if (replicaCount == 0)
                 {
@@ -187,6 +186,7 @@ public partial class SyncNodes
                 // Replica sends its key list; primary replies with symmetric diff.
                 var replicaItems = _replica.AddStore.GetItemsWithPrefix(prefix).ToList();
                 var fullExchReq = BuildKeysResponse(replicaItems);
+
                 // Include the prefix bytes in the sent count (primary needs to know scope).
                 var prefixBytes = BuildPrefixQuery(prefix);
                 BytesSent += prefixBytes.Length + fullExchReq.Length;

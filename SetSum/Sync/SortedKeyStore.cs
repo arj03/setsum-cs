@@ -192,6 +192,7 @@ public class SortedKeyStore
     internal (int Start, int End) GetRootBounds()
     {
         Prepare();
+
         return (0, _count);
     }
 
@@ -244,19 +245,6 @@ public class SortedKeyStore
         EnsureSorted();
         for (int i = 0; i < _count; i++)
             yield return KeyAt(_data, i).ToArray();
-    }
-
-    /// <summary>
-    /// Scans the range [lo, hi) for items whose stored hashes peel against diff.
-    /// - missingCount == 1: returns the single key whose hash == diff.
-    /// - missingCount == 2: tries all O(n²) pairs, only when range has ≤ maxCountForPairPeel items.
-    /// Returns null if no match found or range too large for pair peeling.
-    /// </summary>
-    public List<byte[]>? TryPeelRange(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi, Setsum diff, int maxCountForPairPeel)
-    {
-        Prepare();
-        int start = LowerBound(lo, 0, _count), end = UpperBound(hi);
-        return TryPeelRangeByIndex(start, end, diff, maxCountForPairPeel);
     }
 
     /// <summary>
@@ -440,8 +428,6 @@ public class SortedKeyStore
         }
         return ~lo;
     }
-
-    private int LowerBound(ReadOnlySpan<byte> t) => LowerBound(t, 0, _count);
 
     private int LowerBound(ReadOnlySpan<byte> t, int lo, int hi)
     {

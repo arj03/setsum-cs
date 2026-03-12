@@ -246,8 +246,7 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     /// Primary → Replica: for each queried prefix, the (hash, count) pair.
     /// Wire: [Setsum (32 B)] [count (varint)], repeated per entry.
     /// </summary>
-    private static byte[] BuildHashCountsBatchResponse(
-        IReadOnlyList<(Setsum Hash, int Count)> responses)
+    private static byte[] BuildHashCountsBatchResponse(IReadOnlyList<(Setsum Hash, int Count)> responses)
     {
         int size = 0;
         foreach (var (_, count) in responses) size += SetsumSize + VarInt.Size(count);
