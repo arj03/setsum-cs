@@ -254,7 +254,20 @@ public class SortedKeyStore
             GrowScratch(ref _scratch, n * KeySize);
             GrowScratch(ref _scratchHashes, n);
             SortPending(_pending, _pendingHashes, n, _scratch, _scratchHashes);
-            MergeSorted(_pending, _pendingHashes, n);
+
+            if (_count == 0)
+            {
+                // Fast path: the store was empty — adopt the sorted pending buffer directly
+                // instead of copying all n items through MergeSorted's scratch buffer.
+                (_data, _pending) = (_pending, _data);
+                (_hashes, _pendingHashes) = (_pendingHashes, _hashes);
+                _count = n;
+                _prefixSumsDirty = true;
+            }
+            else
+            {
+                MergeSorted(_pending, _pendingHashes, n);
+            }
         }
 
         if (_pendingDeleteCount > 0)
@@ -271,12 +284,16 @@ public class SortedKeyStore
     }
 
     /// <summary>
-    /// Two-pass LSB radix sort on bytes 0–1, then insertion sort within same-prefix buckets.
+    /// Four-pass LSB radix sort on bytes 0–3, then insertion sort within same-prefix buckets.
+    /// Four bytes reduces average bucket size to &lt;1 item for any N ≤ 4 billion,
+    /// making the insertion sort a near-no-op for typical crypto/hash keys.
     /// Works for both inserts (real hashes) and deletes (dummy hashes — keys only).
     /// Result lands back in <paramref name="keys"/>/<paramref name="hashes"/>.
     /// </summary>
     private void SortPending(byte[] keys, Setsum[] hashes, int n, byte[] scratch, Setsum[] scratchHashes)
     {
+        RadixPass(keys, hashes, n, byteIndex: 3, scratch, scratchHashes);
+        RadixPass(scratch, scratchHashes, n, byteIndex: 2, keys, hashes);
         RadixPass(keys, hashes, n, byteIndex: 1, scratch, scratchHashes);
         RadixPass(scratch, scratchHashes, n, byteIndex: 0, keys, hashes);
         FinishSort(keys, hashes, n);
@@ -303,8 +320,9 @@ public class SortedKeyStore
     }
 
     /// <summary>
-    /// Insertion sort within buckets of keys sharing the same first two bytes.
-    /// After two radix passes each bucket is ~15 items — small enough for L1.
+    /// Insertion sort within buckets of keys sharing the same first four bytes.
+    /// After four radix passes the average bucket contains &lt;1 item for N ≤ 4 billion,
+    /// so this is effectively a no-op for typical 32-byte hash/crypto keys.
     /// </summary>
     private static void FinishSort(byte[] keys, Setsum[] hashes, int n)
     {
@@ -313,12 +331,16 @@ public class SortedKeyStore
         int start = 0;
         while (start < n)
         {
-            byte b0 = keys[start * KeySize], b1 = keys[start * KeySize + 1];
+            byte b0 = keys[start * KeySize],     b1 = keys[start * KeySize + 1];
+            byte b2 = keys[start * KeySize + 2], b3 = keys[start * KeySize + 3];
             int end = start + 1;
-            while (end < n && keys[end * KeySize] == b0 && keys[end * KeySize + 1] == b1)
+            while (end < n
+                   && keys[end * KeySize]     == b0 && keys[end * KeySize + 1] == b1
+                   && keys[end * KeySize + 2] == b2 && keys[end * KeySize + 3] == b3)
                 end++;
 
-            // Insertion sort [start, end) by bytes 2..31
+            // Insertion sort [start, end) by bytes 4..31 — runs only when the first
+            // four bytes collide, which has probability ~N²/2³³ ≈ 0 for any N ≤ 4 billion.
             for (int i = start + 1; i < end; i++)
             {
                 keys.AsSpan(i * KeySize, KeySize).CopyTo(tmp);

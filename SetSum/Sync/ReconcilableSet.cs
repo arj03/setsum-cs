@@ -17,6 +17,12 @@ public class ReconcilableSet
     // TryReconcilePrefix is called one level higher, where primaryCount is larger.
     private const int MaxPrimaryCountForPairPeel = 512;
 
+    // Flat open-addressing table: maps Setsum.GetHashCode() → ring slot.
+    // Deliberately larger than HistorySize to minimise collisions (~6% load factor).
+    // Last-writer-wins on collision — stale hits are caught by _historyHashes verification.
+    private const int HashTableSize = 4096;
+    private const int HashTableMask = HashTableSize - 1;
+
     public Setsum Sum() => _store.TotalInfo().Hash;
 
     public int Count() => _store.Count();
@@ -30,9 +36,9 @@ public class ReconcilableSet
     private int _head = 0;
     private int _historyCount = 0;
 
-    // Hash index: Setsum → ring slot. Enables O(1) k=1 and O(n) k=2 reconcile.
-    // Last-writer-wins on collision — no correctness issue, just a Fallback at worst.
-    private readonly Dictionary<Setsum, int> _hashIndex;
+    // Hash index: Setsum.GetHashCode() & HashTableMask → ring slot.
+    // Replaces Dictionary<Setsum,int> to avoid unbounded growth and cache thrashing.
+    private readonly int[] _hashTable;
 
     private readonly SortedKeyStore _store;
 
@@ -40,7 +46,8 @@ public class ReconcilableSet
     {
         _historyKeys = new byte[HistorySize][];
         _historyHashes = new Setsum[HistorySize];
-        _hashIndex = new Dictionary<Setsum, int>(HistorySize);
+        _hashTable = new int[HashTableSize];
+        Array.Fill(_hashTable, -1);
         _store = new SortedKeyStore();
     }
 
@@ -202,7 +209,8 @@ public class ReconcilableSet
         // k == 1: the diff IS the missing hash — single index probe.
         if (missingCount == 1)
         {
-            if (!_hashIndex.TryGetValue(diff, out int slot)) return ReconcileResult.Fallback();
+            int slot = _hashTable[diff.GetHashCode() & HashTableMask];
+            if (slot < 0) return ReconcileResult.Fallback();
             var key = _historyKeys[slot];
             if (key is null || _historyHashes[slot] != diff) return ReconcileResult.Fallback();
             return ReconcileResult.Found([key]);
@@ -219,7 +227,8 @@ public class ReconcilableSet
                 if (keyA is null) break;
 
                 var need = diff - _historyHashes[idxA];
-                if (!_hashIndex.TryGetValue(need, out int idxB)) continue;
+                int idxB = _hashTable[need.GetHashCode() & HashTableMask];
+                if (idxB < 0) continue;
 
                 var keyB = _historyKeys[idxB];
                 if (keyB is null || keyB == keyA || _historyHashes[idxB] != need) continue;
@@ -248,7 +257,8 @@ public class ReconcilableSet
                     if (keyB == keyA) continue;
 
                     var need = remainAB - _historyHashes[idxB];
-                    if (!_hashIndex.TryGetValue(need, out int idxC)) continue;
+                    int idxC = _hashTable[need.GetHashCode() & HashTableMask];
+                    if (idxC < 0) continue;
 
                     var keyC = _historyKeys[idxC];
                     if (keyC is null || keyC == keyA || keyC == keyB) continue;
@@ -277,7 +287,7 @@ public class ReconcilableSet
         int slot = _head;
         _historyKeys[slot] = key;
         _historyHashes[slot] = hash;
-        _hashIndex[hash] = slot; // last-writer-wins; stale hits caught by slot verification in TryReconcile
+        _hashTable[hash.GetHashCode() & HashTableMask] = slot; // last-writer-wins; stale hits caught by _historyHashes verification
         _head = (_head + 1) % HistorySize;
         _historyCount = Math.Min(_historyCount + 1, HistorySize);
     }
