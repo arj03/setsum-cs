@@ -22,7 +22,8 @@ public partial class SyncNodes
         ReconcilableSet primary,
         ReconcilableSet replica,
         ITestOutputHelper output,
-        string label)
+        string label,
+        int? knownPrimaryRootCount = null)
     {
         var missingItems = new List<byte[]>();
 
@@ -31,21 +32,31 @@ public partial class SyncNodes
         var currentLevel = new List<(BitPrefix Prefix, int Depth, int PrimaryCount, int ReplicaCount,
                                      int PrimaryStart, int PrimaryEnd, int ReplicaStart, int ReplicaEnd)>();
 
-        // ---- Root query -------------------------------------------------
-        var rootReq = BuildPrefixQuery(BitPrefix.Root);
-        BytesSent += rootReq.Length;
-
-        var rxRootPrefix = ParsePrefixQuery(rootReq, 0);
-        var (_, rootPrimaryCount) = primary.GetPrefixInfo(rxRootPrefix);
+        // ---- Root -------------------------------------------------------
         var (rootPrimaryStart, rootPrimaryEnd) = primary.GetRootBounds();
         var (rootReplicaStart, rootReplicaEnd) = replica.GetRootBounds();
         int rootReplicaCount = rootReplicaEnd - rootReplicaStart;
+        int rxRootPrimaryCount;
 
-        var rootResp = BuildCountResponse(rootPrimaryCount);
-        BytesReceived += rootResp.Length;
-        int rxRootPrimaryCount = ParseCountResponse(rootResp);
+        if (knownPrimaryRootCount.HasValue)
+        {
+            // Root count already received in combined response — no separate RT.
+            rxRootPrimaryCount = knownPrimaryRootCount.Value;
+        }
+        else
+        {
+            var rootReq = BuildPrefixQuery(BitPrefix.Root);
+            BytesSent += rootReq.Length;
 
-        RoundTrips++;
+            var rxRootPrefix = ParsePrefixQuery(rootReq, 0);
+            var (_, rootPrimaryCount) = primary.GetPrefixInfo(rxRootPrefix);
+
+            var rootResp = BuildCountResponse(rootPrimaryCount);
+            BytesReceived += rootResp.Length;
+            rxRootPrimaryCount = ParseCountResponse(rootResp);
+
+            RoundTrips++;
+        }
 
         if (rxRootPrimaryCount == 0) return missingItems;
 

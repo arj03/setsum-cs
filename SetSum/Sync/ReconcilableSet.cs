@@ -153,6 +153,26 @@ public class ReconcilableSet
     }
 
     /// <summary>
+    /// Batched (hash, count) version using pre-computed [start, end) bounds.
+    /// Returns child (hash, count) pairs for each node — no binary search.
+    /// Used in bidirectional epoch repair BFS where both hash and count are needed.
+    /// </summary>
+    public List<(BitPrefix C0, Setsum H0, int Sc0, BitPrefix C1, Setsum H1, int Sc1)>
+        GetChildrenHashCountsBatchByIndex(
+            IReadOnlyList<(BitPrefix Prefix, int Depth, int Start, int End)> requests)
+    {
+        var results = new List<(BitPrefix, Setsum, int, BitPrefix, Setsum, int)>(requests.Count);
+        foreach (var (prefix, depth, start, end) in requests)
+        {
+            int split = _store.FindSplitPointByIndex(start, end, depth);
+            var (h0, c0) = _store.RangeInfoByIndex(start, split);
+            var (h1, c1) = _store.RangeInfoByIndex(split, end);
+            results.Add((prefix.Extend(0), h0, c0, prefix.Extend(1), h1, c1));
+        }
+        return results;
+    }
+
+    /// <summary>
     /// Returns (hash, count) for a pre-computed index range.
     /// Caller must have already called Prepare() on the underlying store.
     /// </summary>

@@ -246,12 +246,14 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 | Replica missing ≤ 3 items | 1 | ~170 | Combined RT; fast-path resolves both stores |
 | Replica missing 4–10 items | 1 | ~390 | Combined RT; fast-path resolves both stores |
 | Large diff (D missing, N total) | 1 + O(log N) | O(D × log(N/D) + D × 32) | 1 combined RT (epoch + fast-path fallback) + level-batched BFS with 1 RT per depth level |
+| Epoch mismatch (empty del store) | 1 + O(log N) | O(D × 32) | 1 combined RT (returns root info) + epoch repair BFS; delete store skipped |
+| Epoch mismatch (non-empty del store) | 1 + O(log N) + O(log N) | O(D × 32) | 1 combined RT + epoch repair BFS + delete store BFS (root piggybacked) |
 
-The epoch handshake and both store fast-paths are pipelined into a **single combined round trip**. The replica sends `[epoch, addSum, addCount, delSum, delCount]` and the primary responds with `[epoch, addOutcome, addPayload, delOutcome, delPayload]`. If both stores resolve via fast-path, the entire sync completes in 1 RT. If either store falls back, only that store enters BFS.
+The epoch handshake and both store fast-paths are pipelined into a **single combined round trip**. The replica sends `[epoch, addSum, addCount, delSum, delCount]` and the primary responds with either `[epoch, addOutcome, addPayload, delOutcome, delPayload]` (epoch match) or `[epoch, addRootHash, addRootCount, delRootHash, delRootCount]` (epoch mismatch). If both stores resolve via fast-path, the entire sync completes in 1 RT. If either store falls back, only that store enters BFS. On epoch mismatch, the root info for both stores is piggybacked onto the response, eliminating separate root query round trips.
 
 Within the BFS, leaf resolution and child-count expansion are combined into a **single RT per depth level**, so the total trip count is bounded by the trie depth — O(log N) — not by the number of differing items. For D=10,000 missing items in N=1,000,000 total: ~22 round trips and ~575 KB transferred. The raw diff is 320 KB; total store size is 32 MB.
 
-The BFS nodes carry pre-computed store indices for **both** primary `(PrimaryStart, PrimaryEnd)` and replica `(ReplicaStart, ReplicaEnd)` through each level. Child splits reuse the parent's bounds via a single O(log range) scan rather than a full O(log N) binary search from scratch, eliminating binary searches on both sides during traversal.
+Both the unidirectional trie sync and the bidirectional epoch repair BFS carry pre-computed store indices for **both** primary `(PrimaryStart, PrimaryEnd)` and replica `(ReplicaStart, ReplicaEnd)` through each level. Child splits reuse the parent's bounds via a single O(log range) scan rather than a full O(log N) binary search from scratch, eliminating binary searches on both sides during traversal.
 
 ---
 
@@ -308,21 +310,30 @@ sequenceDiagram
     participant P as Primary
 
     R->>P: [epoch, addSum, addCount, delSum, delCount]
-    P-->>R: [epoch, addOutcome, addPayload, delOutcome, delPayload]
+    Note over P: Epoch mismatch detected —<br/>skip fast-paths, send root info instead
+    P-->>R: [epoch, addRootHash, addRootCount, delRootHash, delRootCount]
 
-    alt Epoch mismatch (discard fast-path results)
-        Note over R: Materialize local DeleteStore<br/>into AddStore
-        R->>P: Authoritative add-store repair<br/>(bidirectional prefix-diff BFS)
+    Note over R: Materialize local DeleteStore<br/>into AddStore, then wipe DeleteStore
+
+    loop Epoch repair BFS (root info already available — no extra RT)
+        R->>P: Bidirectional prefix-diff
         P-->>R: Keys to add/remove
-        Note over R: Wipe local DeleteStore<br/>Set DeleteEpoch = primary.DeleteEpoch
     end
 
-    Note over R: Delete store sync continues<br/>via fast-path result or BFS fallback
+    Note over R: Set DeleteEpoch = primary.DeleteEpoch
+
+    alt Primary DeleteStore empty (just compacted)
+        Note over R: Skip — both delete stores empty
+    else Primary DeleteStore has items
+        Note over R: Trie sync for DeleteStore<br/>(root count already available — no extra RT)
+    end
 ```
+
+When the primary detects an epoch mismatch in the combined request, it **skips fast-path evaluation** (the results would be discarded anyway) and instead responds with the root `(hash, count)` for both stores. This saves 2 round trips: the epoch repair root query and the delete store root query are both eliminated. If the primary's delete store is empty after compaction (the common case), the delete store sync is skipped entirely.
 
 The repair phase uses a **bidirectional** binary-prefix trie traversal that handles both directions in a single BFS pass: keys the replica is missing (primary added new items) and keys the replica holds that the primary has compacted away. Because the primary is the authority after compaction, its view of `AddStore` is definitive.
 
-Unlike the normal unidirectional BFS which exchanges counts only, the epoch repair BFS exchanges `(hash, count)` per node — hashes are required to detect divergence when counts are equal but items differ (i.e. an equal number of adds and removes under a prefix). Each BFS level uses a single round trip that batches both leaf resolution and child expansion together.
+Unlike the normal unidirectional BFS which exchanges counts only, the epoch repair BFS exchanges `(hash, count)` per node — hashes are required to detect divergence when counts are equal but items differ (i.e. an equal number of adds and removes under a prefix). Each BFS level uses a single round trip that batches both leaf resolution and child expansion together. Both primary and replica store bounds are carried through the BFS, eliminating binary searches on both sides.
 
 ---
 

@@ -51,7 +51,7 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         BytesSent = 0;
         BytesReceived = 0;
 
-        // ---- Combined round trip: epoch + both fast-paths ----
+        // ---- Combined round trip: epoch + both fast-paths (or root info on mismatch) ----
         // Replica sends: [replicaEpoch (4B)] [addSum (32B)] [addCount (varint)] [delSum (32B)] [delCount (varint)]
         var combinedReq = BuildCombinedRequest(
             _replica.DeleteEpoch,
@@ -59,40 +59,79 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
             _replica.DeleteStore.Sum(), _replica.DeleteStore.Count());
         BytesSent += combinedReq.Length;
 
-        // Primary parses and responds.
+        // Primary parses.
         var (rxEpoch, rxAddSum, rxAddCount, rxDelSum, rxDelCount) = ParseCombinedRequest(combinedReq);
 
-        // Primary evaluates both fast-paths.
-        var addFastResult = _primary.AddStore.TryReconcile(rxAddSum, rxAddCount);
-        var delFastResult = _primary.DeleteStore.TryReconcile(rxDelSum, rxDelCount);
+        // Primary checks epoch and responds accordingly.
+        bool epochMatch = rxEpoch == _primary.DeleteEpoch;
 
-        // Primary sends: [primaryEpoch (4B)] [addOutcome (1B)] [addPayload...] [delOutcome (1B)] [delPayload...]
-        var combinedResp = BuildCombinedResponse(
-            _primary.DeleteEpoch, addFastResult, delFastResult);
-        BytesReceived += combinedResp.Length;
-
-        // Replica parses.
-        var (rxPrimaryEpoch, rxAddOutcome, rxAddItems, rxDelOutcome, rxDelItems) =
-            ParseCombinedResponse(combinedResp);
-
-        RoundTrips++;
-
-        // ---- Epoch mismatch: discard fast-path results, run epoch repair ----
-        if (rxEpoch != rxPrimaryEpoch)
+        if (!epochMatch)
         {
+            // ---- Epoch mismatch: skip fast-paths, respond with root info for both stores ----
+            // This saves 2 RTs (epoch repair root query + delete store root query).
+            var (addRootHash, addRootCount) = _primary.AddStore.GetPrefixInfo(BitPrefix.Root);
+            var (delRootHash, delRootCount) = _primary.DeleteStore.GetPrefixInfo(BitPrefix.Root);
+
+            var resp = BuildEpochMismatchResponse(
+                _primary.DeleteEpoch, addRootHash, addRootCount, delRootHash, delRootCount);
+            BytesReceived += resp.Length;
+
+            var (_, rxAddRootHash, rxAddRootCount, _, rxDelRootCount) =
+                ParseEpochMismatchResponse(resp);
+
+            RoundTrips++;
+
             output.WriteLine("Delete store epoch mismatch - materializing local tombstones before reset");
             int epochRepairRemoved = _replica.MaterializeLocalDeleteStore();
             _replica.WipeDeleteStore();
 
+            // Repair add store using pre-fetched root info (saves 1 RT).
             output.WriteLine("Delete store epoch mismatch - repairing add store by authoritative prefix sync");
-            var (repairAdded, repairRemoved) = RepairAddStoreAfterEpoch(output);
+            var (repairAdded, repairRemoved) = RepairAddStoreAfterEpoch(
+                output, rxAddRootHash, rxAddRootCount);
             ItemsAdded = repairAdded;
             ItemsDeleted = epochRepairRemoved + repairRemoved;
 
             _replica.DeleteEpoch = _primary.DeleteEpoch;
+
+            // Delete store sync using pre-fetched root count (saves 1 RT).
+            // After wipe, replica delete store is empty.
+            // If primary delete store is also empty (just compacted), skip entirely.
+            if (rxDelRootCount > 0)
+            {
+                output.WriteLine("delete store: trie sync (root count from combined response)");
+                UsedFallback = true;
+                var newDeletes = PerformTrieSync(
+                    _primary.DeleteStore, _replica.DeleteStore, output, "delete",
+                    knownPrimaryRootCount: rxDelRootCount);
+                if (newDeletes.Count > 0)
+                {
+                    newDeletes.Sort(ByteComparer.Instance);
+                    _replica.DeleteStore.InsertBulkPresorted(newDeletes);
+                    _replica.DeleteStore.Prepare();
+                    ItemsDeleted += newDeletes.Count;
+                }
+            }
+            else
+            {
+                output.WriteLine("delete store: both empty after epoch repair, skipped");
+            }
         }
         else
         {
+            // ---- Normal path: evaluate fast-paths ----
+            var addFastResult = _primary.AddStore.TryReconcile(rxAddSum, rxAddCount);
+            var delFastResult = _primary.DeleteStore.TryReconcile(rxDelSum, rxDelCount);
+
+            var combinedResp = BuildCombinedResponse(
+                _primary.DeleteEpoch, addFastResult, delFastResult);
+            BytesReceived += combinedResp.Length;
+
+            var (_, rxAddOutcome, rxAddItems, rxDelOutcome, rxDelItems) =
+                ParseCombinedResponse(combinedResp);
+
+            RoundTrips++;
+
             // ---- Add store ----
             output.WriteLine($"add store fast path: {rxAddOutcome}");
             if (rxAddOutcome == ReconcileOutcome.Found && rxAddItems != null)
@@ -118,33 +157,33 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
                 }
             }
             // else Identical — nothing to do
-        }
 
-        // ---- Delete store ----
-        output.WriteLine($"delete store fast path: {rxDelOutcome}");
-        if (rxDelOutcome == ReconcileOutcome.Found && rxDelItems != null)
-        {
-            if (rxDelItems.Count > 0)
+            // ---- Delete store ----
+            output.WriteLine($"delete store fast path: {rxDelOutcome}");
+            if (rxDelOutcome == ReconcileOutcome.Found && rxDelItems != null)
             {
-                rxDelItems.Sort(ByteComparer.Instance);
-                _replica.DeleteStore.InsertBulkPresorted(rxDelItems);
-                _replica.DeleteStore.Prepare();
-                ItemsDeleted += rxDelItems.Count;
+                if (rxDelItems.Count > 0)
+                {
+                    rxDelItems.Sort(ByteComparer.Instance);
+                    _replica.DeleteStore.InsertBulkPresorted(rxDelItems);
+                    _replica.DeleteStore.Prepare();
+                    ItemsDeleted += rxDelItems.Count;
+                }
             }
-        }
-        else if (rxDelOutcome == ReconcileOutcome.Fallback)
-        {
-            UsedFallback = true;
-            var newDeletes = PerformTrieSync(_primary.DeleteStore, _replica.DeleteStore, output, "delete");
-            if (newDeletes.Count > 0)
+            else if (rxDelOutcome == ReconcileOutcome.Fallback)
             {
-                newDeletes.Sort(ByteComparer.Instance);
-                _replica.DeleteStore.InsertBulkPresorted(newDeletes);
-                _replica.DeleteStore.Prepare();
-                ItemsDeleted += newDeletes.Count;
+                UsedFallback = true;
+                var newDeletes = PerformTrieSync(_primary.DeleteStore, _replica.DeleteStore, output, "delete");
+                if (newDeletes.Count > 0)
+                {
+                    newDeletes.Sort(ByteComparer.Instance);
+                    _replica.DeleteStore.InsertBulkPresorted(newDeletes);
+                    _replica.DeleteStore.Prepare();
+                    ItemsDeleted += newDeletes.Count;
+                }
             }
+            // else Identical — nothing to do
         }
-        // else Identical — nothing to do
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
@@ -189,6 +228,39 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         var delSum = new Setsum(buf.AsSpan(off)); off += SetsumSize;
         int delCount = VarInt.Read(buf, ref off);
         return (epoch, addSum, addCount, delSum, delCount);
+    }
+
+    // ---- Epoch-mismatch response: root info for both stores -----------------
+
+    /// <summary>
+    /// Primary → Replica (epoch mismatch detected — fast-paths skipped).
+    /// Wire: [epoch (4B)] [addRootHash (32B)] [addRootCount (varint)] [delRootHash (32B)] [delRootCount (varint)]
+    /// Saves 2 RTs: epoch repair root query + delete store root query.
+    /// </summary>
+    private static byte[] BuildEpochMismatchResponse(
+        int epoch, Setsum addRootHash, int addRootCount, Setsum delRootHash, int delRootCount)
+    {
+        int size = EpochSize + SetsumSize + VarInt.Size(addRootCount) + SetsumSize + VarInt.Size(delRootCount);
+        var buf = new byte[size];
+        int off = 0;
+        BitConverter.TryWriteBytes(buf.AsSpan(off), epoch); off += EpochSize;
+        addRootHash.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
+        VarInt.Write(buf, ref off, addRootCount);
+        delRootHash.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
+        VarInt.Write(buf, ref off, delRootCount);
+        return buf;
+    }
+
+    private static (int Epoch, Setsum AddRootHash, int AddRootCount, Setsum DelRootHash, int DelRootCount)
+        ParseEpochMismatchResponse(byte[] buf)
+    {
+        int off = 0;
+        int epoch = BitConverter.ToInt32(buf, off); off += EpochSize;
+        var addHash = new Setsum(buf.AsSpan(off)); off += SetsumSize;
+        int addCount = VarInt.Read(buf, ref off);
+        var delHash = new Setsum(buf.AsSpan(off)); off += SetsumSize;
+        int delCount = VarInt.Read(buf, ref off);
+        return (epoch, addHash, addCount, delHash, delCount);
     }
 
     // ---- Combined response: epoch + both fast-path outcomes -----------------
