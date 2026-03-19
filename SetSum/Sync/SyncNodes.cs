@@ -51,19 +51,39 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         BytesSent = 0;
         BytesReceived = 0;
 
-        // Step 1: epoch handshake — each side sends its 4-byte epoch integer.
-        BytesSent += EpochSize;
-        BytesReceived += EpochSize;
+        // ---- Combined round trip: epoch + both fast-paths ----
+        // Replica sends: [replicaEpoch (4B)] [addSum (32B)] [addCount (varint)] [delSum (32B)] [delCount (varint)]
+        var combinedReq = BuildCombinedRequest(
+            _replica.DeleteEpoch,
+            _replica.AddStore.Sum(), _replica.AddStore.Count(),
+            _replica.DeleteStore.Sum(), _replica.DeleteStore.Count());
+        BytesSent += combinedReq.Length;
+
+        // Primary parses and responds.
+        var (rxEpoch, rxAddSum, rxAddCount, rxDelSum, rxDelCount) = ParseCombinedRequest(combinedReq);
+
+        // Primary evaluates both fast-paths.
+        var addFastResult = _primary.AddStore.TryReconcile(rxAddSum, rxAddCount);
+        var delFastResult = _primary.DeleteStore.TryReconcile(rxDelSum, rxDelCount);
+
+        // Primary sends: [primaryEpoch (4B)] [addOutcome (1B)] [addPayload...] [delOutcome (1B)] [delPayload...]
+        var combinedResp = BuildCombinedResponse(
+            _primary.DeleteEpoch, addFastResult, delFastResult);
+        BytesReceived += combinedResp.Length;
+
+        // Replica parses.
+        var (rxPrimaryEpoch, rxAddOutcome, rxAddItems, rxDelOutcome, rxDelItems) =
+            ParseCombinedResponse(combinedResp);
+
         RoundTrips++;
 
-        if (_replica.DeleteEpoch != _primary.DeleteEpoch)
+        // ---- Epoch mismatch: discard fast-path results, run epoch repair ----
+        if (rxEpoch != rxPrimaryEpoch)
         {
             output.WriteLine("Delete store epoch mismatch - materializing local tombstones before reset");
             int epochRepairRemoved = _replica.MaterializeLocalDeleteStore();
             _replica.WipeDeleteStore();
 
-            // Merged bidirectional repair: handles both stale key removal and new key adds
-            // in one trie pass, replacing the separate add sync that would follow.
             output.WriteLine("Delete store epoch mismatch - repairing add store by authoritative prefix sync");
             var (repairAdded, repairRemoved) = RepairAddStoreAfterEpoch(output);
             ItemsAdded = repairAdded;
@@ -73,26 +93,58 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         }
         else
         {
-            // Step 2: sync add store (primary -> replica, unidirectional).
-            var added = SyncStore(_primary.AddStore, _replica.AddStore, output, "add");
-            ItemsAdded = added.Count;
-            if (added.Count > 0)
+            // ---- Add store ----
+            output.WriteLine($"add store fast path: {rxAddOutcome}");
+            if (rxAddOutcome == ReconcileOutcome.Found && rxAddItems != null)
             {
-                added.Sort(ByteComparer.Instance);
-                _replica.AddStore.InsertBulkPresorted(added);
-                _replica.AddStore.Prepare();
+                ItemsAdded = rxAddItems.Count;
+                if (rxAddItems.Count > 0)
+                {
+                    rxAddItems.Sort(ByteComparer.Instance);
+                    _replica.AddStore.InsertBulkPresorted(rxAddItems);
+                    _replica.AddStore.Prepare();
+                }
             }
+            else if (rxAddOutcome == ReconcileOutcome.Fallback)
+            {
+                UsedFallback = true;
+                var added = PerformTrieSync(_primary.AddStore, _replica.AddStore, output, "add");
+                ItemsAdded = added.Count;
+                if (added.Count > 0)
+                {
+                    added.Sort(ByteComparer.Instance);
+                    _replica.AddStore.InsertBulkPresorted(added);
+                    _replica.AddStore.Prepare();
+                }
+            }
+            // else Identical — nothing to do
         }
 
-        // Step 3: sync delete store (primary -> replica, unidirectional).
-        var newDeletes = SyncStore(_primary.DeleteStore, _replica.DeleteStore, output, "delete");
-        if (newDeletes.Count > 0)
+        // ---- Delete store ----
+        output.WriteLine($"delete store fast path: {rxDelOutcome}");
+        if (rxDelOutcome == ReconcileOutcome.Found && rxDelItems != null)
         {
-            newDeletes.Sort(ByteComparer.Instance);
-            _replica.DeleteStore.InsertBulkPresorted(newDeletes);
-            _replica.DeleteStore.Prepare();
-            ItemsDeleted += newDeletes.Count;
+            if (rxDelItems.Count > 0)
+            {
+                rxDelItems.Sort(ByteComparer.Instance);
+                _replica.DeleteStore.InsertBulkPresorted(rxDelItems);
+                _replica.DeleteStore.Prepare();
+                ItemsDeleted += rxDelItems.Count;
+            }
         }
+        else if (rxDelOutcome == ReconcileOutcome.Fallback)
+        {
+            UsedFallback = true;
+            var newDeletes = PerformTrieSync(_primary.DeleteStore, _replica.DeleteStore, output, "delete");
+            if (newDeletes.Count > 0)
+            {
+                newDeletes.Sort(ByteComparer.Instance);
+                _replica.DeleteStore.InsertBulkPresorted(newDeletes);
+                _replica.DeleteStore.Prepare();
+                ItemsDeleted += newDeletes.Count;
+            }
+        }
+        // else Identical — nothing to do
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
@@ -108,26 +160,119 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     // manual arithmetic.
     // =========================================================================
 
-    // ---- Fast-path request: replica's (Setsum, count) -----------------------
+    // ---- Combined request: epoch + both fast-paths --------------------------
 
     /// <summary>
     /// Replica → Primary.
-    /// Wire: [Setsum (32 B)] [count (varint)]
+    /// Wire: [epoch (4B)] [addSum (32B)] [addCount (varint)] [delSum (32B)] [delCount (varint)]
     /// </summary>
-    private static byte[] BuildFastPathRequest(Setsum replicaSum, int replicaCount)
+    private static byte[] BuildCombinedRequest(int epoch, Setsum addSum, int addCount, Setsum delSum, int delCount)
     {
-        var buf = new byte[SetsumSize + VarInt.Size(replicaCount)];
-        replicaSum.CopyDigest(buf);
-        int off = SetsumSize;
-        VarInt.Write(buf, ref off, replicaCount);
+        int size = EpochSize + SetsumSize + VarInt.Size(addCount) + SetsumSize + VarInt.Size(delCount);
+        var buf = new byte[size];
+        int off = 0;
+        BitConverter.TryWriteBytes(buf.AsSpan(off), epoch); off += EpochSize;
+        addSum.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
+        VarInt.Write(buf, ref off, addCount);
+        delSum.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
+        VarInt.Write(buf, ref off, delCount);
         return buf;
     }
 
-    private static (Setsum Sum, int Count) ParseFastPathRequest(byte[] buf)
+    private static (int Epoch, Setsum AddSum, int AddCount, Setsum DelSum, int DelCount)
+        ParseCombinedRequest(byte[] buf)
     {
-        var sum = new Setsum(buf);
-        int off = SetsumSize;
-        return (sum, VarInt.Read(buf, ref off));
+        int off = 0;
+        int epoch = BitConverter.ToInt32(buf, off); off += EpochSize;
+        var addSum = new Setsum(buf.AsSpan(off)); off += SetsumSize;
+        int addCount = VarInt.Read(buf, ref off);
+        var delSum = new Setsum(buf.AsSpan(off)); off += SetsumSize;
+        int delCount = VarInt.Read(buf, ref off);
+        return (epoch, addSum, addCount, delSum, delCount);
+    }
+
+    // ---- Combined response: epoch + both fast-path outcomes -----------------
+
+    /// <summary>
+    /// Primary → Replica.
+    /// Wire: [epoch (4B)] [addOutcome (1B)] [addPayload...] [delOutcome (1B)] [delPayload...]
+    /// Outcome byte: 0=Identical, 1=Found (followed by key count varint + keys), 2=Fallback
+    /// </summary>
+    private static byte[] BuildCombinedResponse(int epoch, ReconcileResult addResult, ReconcileResult delResult)
+    {
+        // Calculate size
+        int size = EpochSize;
+        size += 1 + OutcomePayloadSize(addResult);
+        size += 1 + OutcomePayloadSize(delResult);
+
+        var buf = new byte[size];
+        int off = 0;
+        BitConverter.TryWriteBytes(buf.AsSpan(off), epoch); off += EpochSize;
+        WriteOutcome(buf, ref off, addResult);
+        WriteOutcome(buf, ref off, delResult);
+        return buf;
+
+        static int OutcomePayloadSize(ReconcileResult r)
+        {
+            if (r.Outcome == ReconcileOutcome.Found && r.MissingItems != null)
+                return VarInt.Size(r.MissingItems.Count) + r.MissingItems.Count * KeySize;
+            return 0;
+        }
+
+        static void WriteOutcome(byte[] b, ref int o, ReconcileResult r)
+        {
+            b[o++] = r.Outcome switch
+            {
+                ReconcileOutcome.Identical => 0,
+                ReconcileOutcome.Found => 1,
+                _ => 2
+            };
+            if (r.Outcome == ReconcileOutcome.Found && r.MissingItems != null)
+            {
+                VarInt.Write(b, ref o, r.MissingItems.Count);
+                foreach (var key in r.MissingItems)
+                {
+                    key.CopyTo(b, o);
+                    o += KeySize;
+                }
+            }
+        }
+    }
+
+    private static (int Epoch, ReconcileOutcome AddOutcome, List<byte[]>? AddItems,
+                     ReconcileOutcome DelOutcome, List<byte[]>? DelItems)
+        ParseCombinedResponse(byte[] buf)
+    {
+        int off = 0;
+        int epoch = BitConverter.ToInt32(buf, off); off += EpochSize;
+        var (addOutcome, addItems) = ReadOutcome(buf, ref off);
+        var (delOutcome, delItems) = ReadOutcome(buf, ref off);
+        return (epoch, addOutcome, addItems, delOutcome, delItems);
+
+        static (ReconcileOutcome, List<byte[]>?) ReadOutcome(byte[] b, ref int o)
+        {
+            byte tag = b[o++];
+            return tag switch
+            {
+                0 => (ReconcileOutcome.Identical, null),
+                1 => (ReconcileOutcome.Found, ReadKeys(b, ref o)),
+                _ => (ReconcileOutcome.Fallback, null)
+            };
+        }
+
+        static List<byte[]> ReadKeys(byte[] b, ref int o)
+        {
+            int count = VarInt.Read(b, ref o);
+            var keys = new List<byte[]>(count);
+            for (int i = 0; i < count; i++)
+            {
+                var key = new byte[KeySize];
+                Buffer.BlockCopy(b, o, key, 0, KeySize);
+                o += KeySize;
+                keys.Add(key);
+            }
+            return keys;
+        }
     }
 
     // ---- Plain prefix query (replica sends prefix, primary sends count) ------

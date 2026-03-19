@@ -134,6 +134,25 @@ public class ReconcilableSet
     }
 
     /// <summary>
+    /// Batched count-only version using pre-computed [start, end) bounds.
+    /// Returns child counts for each node — no binary search on the primary store.
+    /// </summary>
+    public List<(BitPrefix C0, int Sc0, BitPrefix C1, int Sc1)>
+        GetChildrenCountsBatchByIndex(
+            IReadOnlyList<(BitPrefix Prefix, int Depth, int Start, int End)> requests)
+    {
+        var results = new List<(BitPrefix, int, BitPrefix, int)>(requests.Count);
+        foreach (var (prefix, depth, start, end) in requests)
+        {
+            int split = _store.FindSplitPointByIndex(start, end, depth);
+            var (_, c0) = _store.RangeInfoByIndex(start, split);
+            var (_, c1) = _store.RangeInfoByIndex(split, end);
+            results.Add((prefix.Extend(0), c0, prefix.Extend(1), c1));
+        }
+        return results;
+    }
+
+    /// <summary>
     /// Returns (hash, count) for a pre-computed index range.
     /// Caller must have already called Prepare() on the underlying store.
     /// </summary>

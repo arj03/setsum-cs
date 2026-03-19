@@ -48,7 +48,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
-        Assert.Equal(3, sim.RoundTrips);
+        Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(3, sim.ItemsAdded);
         _output.WriteLine($"Small diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
@@ -64,7 +64,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
-        Assert.Equal(3, sim.RoundTrips);
+        Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(8, sim.ItemsAdded);
         Assert.True(sw.ElapsedMilliseconds < 100);
         _output.WriteLine($"Medium diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");

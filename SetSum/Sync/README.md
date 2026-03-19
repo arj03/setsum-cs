@@ -14,8 +14,8 @@ The protocol is **unidirectional** — the primary node transfers items it has t
 
 The library solves this in two escalating strategies:
 
-1. **Fast Path** — Setsum peeling (1 round-trip, works for tiny diffs)
-2. **Trie Fallback** — binary-prefix trie traversal for large diffs (O(log N) round-trips)
+1. **Fast Path** — Setsum peeling (works for tiny diffs, evaluated as part of the combined epoch+fast-path round trip)
+2. **Trie Fallback** — binary-prefix trie traversal for large diffs (1 RT per BFS depth level)
 
 ---
 
@@ -90,7 +90,7 @@ A node becomes a leaf when:
 - `missingCount <= 2` — at most two items are missing; resolved via Setsum peeling (see below), or
 - `prefix.Length >= MaxPrefixDepth` — maximum trie depth reached.
 
-All leaf resolutions are batched into a single round trip per BFS level. If a leaf's primary-side prefix is too large for pair peeling, it is re-enqueued through the partition check for further descent rather than dropped.
+All leaf resolutions and child-count expansions are batched into a **single combined round trip per BFS level** — leaf resolution and expansion happen in the same RT rather than two separate ones. If a leaf's primary-side prefix is too large for pair peeling, it is deferred to the expansion pass within the same round trip rather than dropped.
 
 ```mermaid
 sequenceDiagram
@@ -100,20 +100,14 @@ sequenceDiagram
     R->>P: GetPrefixInfo(Root)
     P-->>R: rootCount
 
-    loop BFS — one round trip per depth level
-        R->>P: GetChildrenCounts(prefix1, prefix2, ...) [batched]
-        P-->>R: (primaryCount0, primaryCount1) per prefix
-        Note over R: Fetch replicaCount0, replicaCount1 locally<br/>Skip children where primaryCount == replicaCount
-        Note over R: Mark as leaf if replicaCount==0<br/>or missingCount<=2
+    loop BFS — one round trip per depth level (combined leaf + expansion)
+        Note over R: Classify nodes: leaves vs interior
+        R->>P: Leaf: prefixSum [batched]<br/>Interior: GetChildrenCounts [batched]
+        Note over P: Leaves: diff = primarySum - replicaSum<br/>Interior: split and return child counts
+        P-->>R: Leaf results + child counts
+        Note over R: Peel failures deferred to expansion in same RT<br/>Skip children where primaryCount == replicaCount
     end
 
-    loop One round trip for all leaves at this level
-        R->>P: prefixSum [batched]
-        Note over P: diff = primarySum - replicaSum<br/>missingCount==1: scan for Hash(key)==diff<br/>missingCount==2: scan pairs for Hash(i)+Hash(j)==diff
-        P-->>R: [1 or 2 missing items]
-    end
-
-    Note over R: Repeat if any prefixes fell back to further descent
     R->>R: Sort and insert received items
 ```
 
@@ -248,14 +242,16 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 
 | Scenario | Round Trips | Bytes | Notes |
 |---|---|---|---|
-| Sets are identical | 1 | 33–37 | Sum (32) + varint(Count) sent; Identical returned |
-| Replica missing ≤ 3 items | 1 | ~130 | 33–37 sent + ~96 received (missing keys) |
-| Replica missing 4–10 items | 1 | ~355 | 33–37 sent + ~320 received (missing keys) |
-| Large diff (D missing, N total) | O(log N) | O(D × log(N/D) + D × 32) | Level-batched BFS (counts only) + Setsum leaf peeling; per-node cost is ⌈depth/8⌉ prefix bytes + 1–5 varint count bytes |
+| Sets are identical | 1 | ~70 | Combined epoch + both fast-paths in single RT |
+| Replica missing ≤ 3 items | 1 | ~170 | Combined RT; fast-path resolves both stores |
+| Replica missing 4–10 items | 1 | ~390 | Combined RT; fast-path resolves both stores |
+| Large diff (D missing, N total) | 1 + O(log N) | O(D × log(N/D) + D × 32) | 1 combined RT (epoch + fast-path fallback) + level-batched BFS with 1 RT per depth level |
 
-All nodes at the same BFS depth are queried in a **single batched round trip**, so the total trip count is bounded by the trie depth — O(log N) — not by the number of differing items. For D=10,000 missing items in N=1,000,000 total: ~35 round trips and ~575 KB transferred. The raw diff is 320 KB; total store size is 32 MB. BFS traversal overhead is low because prefix length is implicit (depth is tracked in lockstep), and counts are varint-encoded (1–3 bytes at typical trie depths) rather than 32-byte hashes.
+The epoch handshake and both store fast-paths are pipelined into a **single combined round trip**. The replica sends `[epoch, addSum, addCount, delSum, delCount]` and the primary responds with `[epoch, addOutcome, addPayload, delOutcome, delPayload]`. If both stores resolve via fast-path, the entire sync completes in 1 RT. If either store falls back, only that store enters BFS.
 
-The BFS nodes carry pre-computed `(ReplicaStart, ReplicaEnd)` store indices through each level. Child splits reuse the parent's bounds via a single O(log range) scan rather than a full O(log N) binary search from scratch, eliminating all replica-side binary searches during traversal.
+Within the BFS, leaf resolution and child-count expansion are combined into a **single RT per depth level**, so the total trip count is bounded by the trie depth — O(log N) — not by the number of differing items. For D=10,000 missing items in N=1,000,000 total: ~22 round trips and ~575 KB transferred. The raw diff is 320 KB; total store size is 32 MB.
+
+The BFS nodes carry pre-computed store indices for **both** primary `(PrimaryStart, PrimaryEnd)` and replica `(ReplicaStart, ReplicaEnd)` through each level. Child splits reuse the parent's bounds via a single O(log range) scan rather than a full O(log N) binary search from scratch, eliminating binary searches on both sides during traversal.
 
 ---
 
@@ -289,16 +285,18 @@ sequenceDiagram
     participant R as Replica
     participant P as Primary
 
-    R->>P: AddStore (Sum, Count)
-    P-->>R: Missing add keys
-    R->>R: Insert into AddStore
+    R->>P: [epoch, addSum, addCount, delSum, delCount]
+    Note over P: Evaluate both fast-paths
+    P-->>R: [epoch, addOutcome, addPayload, delOutcome, delPayload]
 
-    R->>P: DeleteStore (Sum, Count)
-    P-->>R: Missing tombstones
-    R->>R: Insert into DeleteStore
+    alt Both Identical or Found
+        R->>R: Insert any missing keys
+    else Either store returns Fallback
+        Note over R: Enter BFS trie sync for that store
+    end
 ```
 
-After both stores sync, the effective set (`AddStore − DeleteStore`) is consistent at query time. Tombstones are not physically applied to `AddStore` on the normal path — the subtraction is computed dynamically.
+The epoch handshake and both store fast-paths are pipelined into a single round trip. After both stores sync, the effective set (`AddStore − DeleteStore`) is consistent at query time. Tombstones are not physically applied to `AddStore` on the normal path — the subtraction is computed dynamically.
 
 ### Epoch-Mismatch Recovery
 
@@ -309,20 +307,17 @@ sequenceDiagram
     participant R as Replica
     participant P as Primary
 
-    R->>P: replica.DeleteEpoch
-    P-->>R: primary.DeleteEpoch
+    R->>P: [epoch, addSum, addCount, delSum, delCount]
+    P-->>R: [epoch, addOutcome, addPayload, delOutcome, delPayload]
 
-    alt Epoch mismatch
+    alt Epoch mismatch (discard fast-path results)
         Note over R: Materialize local DeleteStore<br/>into AddStore
-        R->>P: Authoritative add-store repair<br/>(prefix-diff to remove stale keys)
-        P-->>R: Keys to remove
+        R->>P: Authoritative add-store repair<br/>(bidirectional prefix-diff BFS)
+        P-->>R: Keys to add/remove
         Note over R: Wipe local DeleteStore<br/>Set DeleteEpoch = primary.DeleteEpoch
     end
 
-    R->>P: Normal AddStore sync
-    P-->>R: Missing add keys
-    R->>P: Normal DeleteStore sync
-    P-->>R: Missing tombstones
+    Note over R: Delete store sync continues<br/>via fast-path result or BFS fallback
 ```
 
 The repair phase uses a **bidirectional** binary-prefix trie traversal that handles both directions in a single BFS pass: keys the replica is missing (primary added new items) and keys the replica holds that the primary has compacted away. Because the primary is the authority after compaction, its view of `AddStore` is definitive.

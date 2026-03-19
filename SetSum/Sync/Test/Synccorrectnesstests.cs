@@ -85,11 +85,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         Assert.True(sim.TrySync(_output));
 
-        // Exactly 3 round trips for a fully-identical sync:
-        //   1. epoch handshake
-        //   2. add store fast-path  (Identical → no trie)
-        //   3. delete store fast-path (Identical → no trie)
-        Assert.Equal(3, sim.RoundTrips);
+        // Exactly 1 round trip for a fully-identical sync:
+        //   Combined: epoch handshake + add fast-path + delete fast-path
+        Assert.Equal(1, sim.RoundTrips);
     }
 
     // ── Delete (no compaction) ────────────────────────────────────────────────
