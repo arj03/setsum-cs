@@ -142,7 +142,7 @@ public partial class SyncNodes
             var expandByIndex = toExpand
                 .Select(e => (e.Prefix, e.Depth, e.PrimaryStart, e.PrimaryEnd))
                 .ToList();
-            var primaryResponses = primary.GetChildrenCountsBatchByIndex(expandByIndex);
+            var primaryResponses = primary.GetChildrenInfoBatchByIndex(expandByIndex);
 
             var batchResp = BuildChildCountsBatchResponse(primaryResponses);
             BytesReceived += batchResp.Length;
@@ -154,12 +154,12 @@ public partial class SyncNodes
             for (int i = 0; i < toExpand.Count; i++)
             {
                 var (expPrefix, depth, _, _, psStart, psEnd, rsStart, rsEnd) = toExpand[i];
-                var (c0, _, c1, _) = primaryResponses[i];
+                var (c0, _, _, c1, _, _) = primaryResponses[i];
                 var (rxPc0, rxPc1) = countPairs[i];
 
                 // Split both primary and replica bounds — O(log range), no O(log N).
-                var (pSplit, pc0, pc1) = primary.SplitByIndex(psStart, psEnd, depth);
-                var (rSplit, rc0, rc1) = replica.SplitByIndex(rsStart, rsEnd, depth);
+                var (pSplit, _, _, _, _) = primary.SplitByIndex(psStart, psEnd, depth);
+                var (rSplit, _, rc0, _, rc1) = replica.SplitByIndex(rsStart, rsEnd, depth);
 
                 // Only descend into subtrees where primary has more items than replica.
                 if (rxPc0 > rc0) nextLevel.Add((c0, depth + 1, rxPc0, rc0, psStart, pSplit, rsStart, rSplit));

@@ -53,14 +53,14 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 
         // ---- Combined round trip: epoch + both fast-paths (or root info on mismatch) ----
         // Replica sends: [replicaEpoch (4B)] [addSum (32B)] [addCount (varint)] [delSum (32B)] [delCount (varint)]
-        var combinedReq = BuildCombinedRequest(
+        var combinedReq = BuildEpochStoreInfo(
             _replica.DeleteEpoch,
             _replica.AddStore.Sum(), _replica.AddStore.Count(),
             _replica.DeleteStore.Sum(), _replica.DeleteStore.Count());
         BytesSent += combinedReq.Length;
 
         // Primary parses.
-        var (rxEpoch, rxAddSum, rxAddCount, rxDelSum, rxDelCount) = ParseCombinedRequest(combinedReq);
+        var (rxEpoch, rxAddSum, rxAddCount, rxDelSum, rxDelCount) = ParseEpochStoreInfo(combinedReq);
 
         // Primary checks epoch and responds accordingly.
         bool epochMatch = rxEpoch == _primary.DeleteEpoch;
@@ -72,12 +72,12 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
             var (addRootHash, addRootCount) = _primary.AddStore.GetPrefixInfo(BitPrefix.Root);
             var (delRootHash, delRootCount) = _primary.DeleteStore.GetPrefixInfo(BitPrefix.Root);
 
-            var resp = BuildEpochMismatchResponse(
+            var resp = BuildEpochStoreInfo(
                 _primary.DeleteEpoch, addRootHash, addRootCount, delRootHash, delRootCount);
             BytesReceived += resp.Length;
 
             var (_, rxAddRootHash, rxAddRootCount, _, rxDelRootCount) =
-                ParseEpochMismatchResponse(resp);
+                ParseEpochStoreInfo(resp);
 
             RoundTrips++;
 
@@ -95,8 +95,6 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
             _replica.DeleteEpoch = _primary.DeleteEpoch;
 
             // Delete store sync using pre-fetched root count (saves 1 RT).
-            // After wipe, replica delete store is empty.
-            // If primary delete store is also empty (just compacted), skip entirely.
             if (rxDelRootCount > 0)
             {
                 output.WriteLine("delete store: trie sync (root count from combined response)");
@@ -104,13 +102,8 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
                 var newDeletes = PerformTrieSync(
                     _primary.DeleteStore, _replica.DeleteStore, output, "delete",
                     knownPrimaryRootCount: rxDelRootCount);
-                if (newDeletes.Count > 0)
-                {
-                    newDeletes.Sort(ByteComparer.Instance);
-                    _replica.DeleteStore.InsertBulkPresorted(newDeletes);
-                    _replica.DeleteStore.Prepare();
-                    ItemsDeleted += newDeletes.Count;
-                }
+                ApplyItems(_replica.DeleteStore, newDeletes);
+                ItemsDeleted += newDeletes.Count;
             }
             else
             {
@@ -134,59 +127,49 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 
             // ---- Add store ----
             output.WriteLine($"add store fast path: {rxAddOutcome}");
-            if (rxAddOutcome == ReconcileOutcome.Found && rxAddItems != null)
-            {
-                ItemsAdded = rxAddItems.Count;
-                if (rxAddItems.Count > 0)
-                {
-                    rxAddItems.Sort(ByteComparer.Instance);
-                    _replica.AddStore.InsertBulkPresorted(rxAddItems);
-                    _replica.AddStore.Prepare();
-                }
-            }
-            else if (rxAddOutcome == ReconcileOutcome.Fallback)
-            {
-                UsedFallback = true;
-                var added = PerformTrieSync(_primary.AddStore, _replica.AddStore, output, "add");
-                ItemsAdded = added.Count;
-                if (added.Count > 0)
-                {
-                    added.Sort(ByteComparer.Instance);
-                    _replica.AddStore.InsertBulkPresorted(added);
-                    _replica.AddStore.Prepare();
-                }
-            }
-            // else Identical — nothing to do
+            ItemsAdded = SyncStore(rxAddOutcome, rxAddItems, _primary.AddStore, _replica.AddStore, output, "add");
 
             // ---- Delete store ----
             output.WriteLine($"delete store fast path: {rxDelOutcome}");
-            if (rxDelOutcome == ReconcileOutcome.Found && rxDelItems != null)
-            {
-                if (rxDelItems.Count > 0)
-                {
-                    rxDelItems.Sort(ByteComparer.Instance);
-                    _replica.DeleteStore.InsertBulkPresorted(rxDelItems);
-                    _replica.DeleteStore.Prepare();
-                    ItemsDeleted += rxDelItems.Count;
-                }
-            }
-            else if (rxDelOutcome == ReconcileOutcome.Fallback)
-            {
-                UsedFallback = true;
-                var newDeletes = PerformTrieSync(_primary.DeleteStore, _replica.DeleteStore, output, "delete");
-                if (newDeletes.Count > 0)
-                {
-                    newDeletes.Sort(ByteComparer.Instance);
-                    _replica.DeleteStore.InsertBulkPresorted(newDeletes);
-                    _replica.DeleteStore.Prepare();
-                    ItemsDeleted += newDeletes.Count;
-                }
-            }
-            // else Identical — nothing to do
+            ItemsDeleted += SyncStore(rxDelOutcome, rxDelItems, _primary.DeleteStore, _replica.DeleteStore, output, "delete");
         }
 
         output.WriteLine($"Sync complete - added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
+    }
+
+    /// <summary>
+    /// Resolves a single store from a fast-path outcome: Found → apply items directly,
+    /// Fallback → trie sync, Identical → no-op. Returns the number of items applied.
+    /// </summary>
+    private int SyncStore(ReconcileOutcome outcome, List<byte[]>? fastPathItems,
+        ReconcilableSet primary, ReconcilableSet replica, ITestOutputHelper output, string label)
+    {
+        if (outcome == ReconcileOutcome.Found && fastPathItems != null)
+        {
+            ApplyItems(replica, fastPathItems);
+            return fastPathItems.Count;
+        }
+        if (outcome == ReconcileOutcome.Fallback)
+        {
+            UsedFallback = true;
+            var items = PerformTrieSync(primary, replica, output, label);
+            ApplyItems(replica, items);
+            return items.Count;
+        }
+        return 0; // Identical
+    }
+
+    /// <summary>
+    /// Sorts items, inserts them into the store, and rebuilds prefix sums.
+    /// No-op if the list is empty.
+    /// </summary>
+    private static void ApplyItems(ReconcilableSet store, List<byte[]> items)
+    {
+        if (items.Count == 0) return;
+        items.Sort(ByteComparer.Instance);
+        store.InsertBulkPresorted(items);
+        store.Prepare();
     }
 
     // =========================================================================
@@ -199,68 +182,35 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     // manual arithmetic.
     // =========================================================================
 
-    // ---- Combined request: epoch + both fast-paths --------------------------
+    // ---- Epoch + dual-store info (shared by request and epoch-mismatch response) --
 
     /// <summary>
-    /// Replica → Primary.
-    /// Wire: [epoch (4B)] [addSum (32B)] [addCount (varint)] [delSum (32B)] [delCount (varint)]
+    /// Wire: [epoch (4B)] [hash1 (32B)] [count1 (varint)] [hash2 (32B)] [count2 (varint)]
+    /// Used for both the combined request (replica→primary) and epoch-mismatch response (primary→replica).
     /// </summary>
-    private static byte[] BuildCombinedRequest(int epoch, Setsum addSum, int addCount, Setsum delSum, int delCount)
+    private static byte[] BuildEpochStoreInfo(int epoch, Setsum hash1, int count1, Setsum hash2, int count2)
     {
-        int size = EpochSize + SetsumSize + VarInt.Size(addCount) + SetsumSize + VarInt.Size(delCount);
+        int size = EpochSize + SetsumSize + VarInt.Size(count1) + SetsumSize + VarInt.Size(count2);
         var buf = new byte[size];
         int off = 0;
         BitConverter.TryWriteBytes(buf.AsSpan(off), epoch); off += EpochSize;
-        addSum.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
-        VarInt.Write(buf, ref off, addCount);
-        delSum.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
-        VarInt.Write(buf, ref off, delCount);
+        hash1.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
+        VarInt.Write(buf, ref off, count1);
+        hash2.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
+        VarInt.Write(buf, ref off, count2);
         return buf;
     }
 
-    private static (int Epoch, Setsum AddSum, int AddCount, Setsum DelSum, int DelCount)
-        ParseCombinedRequest(byte[] buf)
+    private static (int Epoch, Setsum Hash1, int Count1, Setsum Hash2, int Count2)
+        ParseEpochStoreInfo(byte[] buf)
     {
         int off = 0;
         int epoch = BitConverter.ToInt32(buf, off); off += EpochSize;
-        var addSum = new Setsum(buf.AsSpan(off)); off += SetsumSize;
-        int addCount = VarInt.Read(buf, ref off);
-        var delSum = new Setsum(buf.AsSpan(off)); off += SetsumSize;
-        int delCount = VarInt.Read(buf, ref off);
-        return (epoch, addSum, addCount, delSum, delCount);
-    }
-
-    // ---- Epoch-mismatch response: root info for both stores -----------------
-
-    /// <summary>
-    /// Primary → Replica (epoch mismatch detected — fast-paths skipped).
-    /// Wire: [epoch (4B)] [addRootHash (32B)] [addRootCount (varint)] [delRootHash (32B)] [delRootCount (varint)]
-    /// Saves 2 RTs: epoch repair root query + delete store root query.
-    /// </summary>
-    private static byte[] BuildEpochMismatchResponse(
-        int epoch, Setsum addRootHash, int addRootCount, Setsum delRootHash, int delRootCount)
-    {
-        int size = EpochSize + SetsumSize + VarInt.Size(addRootCount) + SetsumSize + VarInt.Size(delRootCount);
-        var buf = new byte[size];
-        int off = 0;
-        BitConverter.TryWriteBytes(buf.AsSpan(off), epoch); off += EpochSize;
-        addRootHash.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
-        VarInt.Write(buf, ref off, addRootCount);
-        delRootHash.CopyDigest(buf.AsSpan(off)); off += SetsumSize;
-        VarInt.Write(buf, ref off, delRootCount);
-        return buf;
-    }
-
-    private static (int Epoch, Setsum AddRootHash, int AddRootCount, Setsum DelRootHash, int DelRootCount)
-        ParseEpochMismatchResponse(byte[] buf)
-    {
-        int off = 0;
-        int epoch = BitConverter.ToInt32(buf, off); off += EpochSize;
-        var addHash = new Setsum(buf.AsSpan(off)); off += SetsumSize;
-        int addCount = VarInt.Read(buf, ref off);
-        var delHash = new Setsum(buf.AsSpan(off)); off += SetsumSize;
-        int delCount = VarInt.Read(buf, ref off);
-        return (epoch, addHash, addCount, delHash, delCount);
+        var hash1 = new Setsum(buf.AsSpan(off)); off += SetsumSize;
+        int count1 = VarInt.Read(buf, ref off);
+        var hash2 = new Setsum(buf.AsSpan(off)); off += SetsumSize;
+        int count2 = VarInt.Read(buf, ref off);
+        return (epoch, hash1, count1, hash2, count2);
     }
 
     // ---- Combined response: epoch + both fast-path outcomes -----------------
@@ -383,28 +333,6 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         return VarInt.Read(buf, ref off);
     }
 
-    // ---- Hash + count response ----------------------------------------------
-
-    /// <summary>
-    /// Primary → Replica.
-    /// Wire: [Setsum (32 B)] [count (varint)]
-    /// </summary>
-    private static byte[] BuildHashCountResponse(Setsum hash, int count)
-    {
-        var buf = new byte[SetsumSize + VarInt.Size(count)];
-        hash.CopyDigest(buf);
-        int off = SetsumSize;
-        VarInt.Write(buf, ref off, count);
-        return buf;
-    }
-
-    private static (Setsum Hash, int Count) ParseHashCountResponse(byte[] buf)
-    {
-        var hash = new Setsum(buf);
-        int off = SetsumSize;
-        return (hash, VarInt.Read(buf, ref off));
-    }
-
     // ---- Leaf-resolution request: prefix + replica's prefix sum -------------
 
     /// <summary>
@@ -434,13 +362,13 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     /// Wire: interleaved varints — sc0₀, sc1₀, sc0₁, sc1₁, …
     /// </summary>
     private static byte[] BuildChildCountsBatchResponse(
-        IReadOnlyList<(BitPrefix C0, int Sc0, BitPrefix C1, int Sc1)> responses)
+        IReadOnlyList<(BitPrefix C0, Setsum H0, int Sc0, BitPrefix C1, Setsum H1, int Sc1)> responses)
     {
         int size = 0;
-        foreach (var (_, sc0, _, sc1) in responses) size += VarInt.Size(sc0) + VarInt.Size(sc1);
+        foreach (var (_, _, sc0, _, _, sc1) in responses) size += VarInt.Size(sc0) + VarInt.Size(sc1);
         var buf = new byte[size];
         int off = 0;
-        foreach (var (_, sc0, _, sc1) in responses)
+        foreach (var (_, _, sc0, _, _, sc1) in responses)
         {
             VarInt.Write(buf, ref off, sc0);
             VarInt.Write(buf, ref off, sc1);

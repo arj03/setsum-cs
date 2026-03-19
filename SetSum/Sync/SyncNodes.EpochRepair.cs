@@ -216,7 +216,7 @@ public partial class SyncNodes
             var expandByIndex = toExpand
                 .Select(e => (e.Prefix, e.Depth, e.PrimaryStart, e.PrimaryEnd))
                 .ToList();
-            var primaryChildResults = _primary.AddStore.GetChildrenHashCountsBatchByIndex(expandByIndex);
+            var primaryChildResults = _primary.AddStore.GetChildrenInfoBatchByIndex(expandByIndex);
 
             // Flatten to (hash, count) array for wire serialization.
             var primaryChildInfos = new (Setsum Hash, int Count)[toExpand.Count * 2];
@@ -248,8 +248,8 @@ public partial class SyncNodes
                 var (ph1, pc1) = rxChildInfos[i * 2 + 1];
 
                 // Split both primary and replica bounds.
-                var (pSplit, _, _) = _primary.AddStore.SplitByIndex(pStart, pEnd, depth);
-                var (rSplit, rh0, rc0, rh1, rc1) = _replica.AddStore.SplitWithHashesByIndex(rsStart, rsEnd, depth);
+                var (pSplit, _, _, _, _) = _primary.AddStore.SplitByIndex(pStart, pEnd, depth);
+                var (rSplit, rh0, rc0, rh1, rc1) = _replica.AddStore.SplitByIndex(rsStart, rsEnd, depth);
 
                 if (pc0 != rc0 || ph0 != rh0) nextLevel.Add((c0, depth + 1, ph0, pc0, rh0, rc0, pStart, pSplit, rsStart, rSplit));
                 if (pc1 != rc1 || ph1 != rh1) nextLevel.Add((c1, depth + 1, ph1, pc1, rh1, rc1, pSplit, pEnd, rSplit, rsEnd));

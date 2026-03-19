@@ -114,51 +114,12 @@ public class ReconcilableSet
     }
 
     /// <summary>
-    /// Batched count-only version of GetChildrenWithHashes.
-    /// Returns child counts for each requested prefix — no hashes.
-    /// Valid for unidirectional sync where primaryCount == replicaCount implies identical subtrees.
-    /// </summary>
-    public List<(BitPrefix C0, int Sc0, BitPrefix C1, int Sc1)>
-        GetChildrenCountsBatch(IReadOnlyList<(BitPrefix Prefix, int Depth)> requests)
-    {
-        var results = new List<(BitPrefix, int, BitPrefix, int)>(requests.Count);
-        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
-        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
-        foreach (var (prefix, depth) in requests)
-        {
-            prefix.FillKeyRange(lo, hi);
-            var (_, c0, _, c1) = _store.RangeInfoSplit(lo, hi, depth);
-            results.Add((prefix.Extend(0), c0, prefix.Extend(1), c1));
-        }
-        return results;
-    }
-
-    /// <summary>
-    /// Batched count-only version using pre-computed [start, end) bounds.
-    /// Returns child counts for each node — no binary search on the primary store.
-    /// </summary>
-    public List<(BitPrefix C0, int Sc0, BitPrefix C1, int Sc1)>
-        GetChildrenCountsBatchByIndex(
-            IReadOnlyList<(BitPrefix Prefix, int Depth, int Start, int End)> requests)
-    {
-        var results = new List<(BitPrefix, int, BitPrefix, int)>(requests.Count);
-        foreach (var (prefix, depth, start, end) in requests)
-        {
-            int split = _store.FindSplitPointByIndex(start, end, depth);
-            var (_, c0) = _store.RangeInfoByIndex(start, split);
-            var (_, c1) = _store.RangeInfoByIndex(split, end);
-            results.Add((prefix.Extend(0), c0, prefix.Extend(1), c1));
-        }
-        return results;
-    }
-
-    /// <summary>
-    /// Batched (hash, count) version using pre-computed [start, end) bounds.
+    /// Batched child info using pre-computed [start, end) bounds.
     /// Returns child (hash, count) pairs for each node — no binary search.
-    /// Used in bidirectional epoch repair BFS where both hash and count are needed.
+    /// Callers needing only counts can discard the hash fields.
     /// </summary>
     public List<(BitPrefix C0, Setsum H0, int Sc0, BitPrefix C1, Setsum H1, int Sc1)>
-        GetChildrenHashCountsBatchByIndex(
+        GetChildrenInfoBatchByIndex(
             IReadOnlyList<(BitPrefix Prefix, int Depth, int Start, int End)> requests)
     {
         var results = new List<(BitPrefix, Setsum, int, BitPrefix, Setsum, int)>(requests.Count);
@@ -180,23 +141,11 @@ public class ReconcilableSet
         => _store.RangeInfoByIndex(start, end);
 
     /// <summary>
-    /// Splits [start, end) at the given bit depth and returns the split index plus child counts.
-    /// Avoids binary search — the parent bounds are already known.
-    /// Caller must have already called Prepare().
-    /// </summary>
-    internal (int Split, int Count0, int Count1) SplitByIndex(int start, int end, int depth)
-    {
-        int split = _store.FindSplitPointByIndex(start, end, depth);
-        return (split, split - start, end - split);
-    }
-
-    /// <summary>
     /// Splits [start, end) at the given bit depth and returns the split index, child hashes, and child counts.
-    /// Use in bidirectional BFS where both hash and count are needed for each child.
     /// Avoids binary search — the parent bounds are already known.
     /// Caller must have already called Prepare().
     /// </summary>
-    internal (int Split, Setsum Hash0, int Count0, Setsum Hash1, int Count1) SplitWithHashesByIndex(int start, int end, int depth)
+    internal (int Split, Setsum Hash0, int Count0, Setsum Hash1, int Count1) SplitByIndex(int start, int end, int depth)
     {
         int split = _store.FindSplitPointByIndex(start, end, depth);
         var (h0, c0) = _store.RangeInfoByIndex(start, split);
@@ -240,37 +189,6 @@ public class ReconcilableSet
         Span<byte> hi = stackalloc byte[Setsum.DigestSize];
         prefix.FillKeyRange(lo, hi);
         return _store.Range(lo, hi);
-    }
-
-    /// <summary>
-    /// Primary-side leaf resolution.
-    /// - replicaPrefixSum == 0: replica has nothing here; primary returns all items directly.
-    /// - missingCount == 1: linear scan over stored hashes; no key copies until match found.
-    /// - missingCount == 2: O(n²) pair scan, only when primary prefix has at most MaxPrimaryCountForPairPeel items.
-    /// - Otherwise: returns Fallback; caller should descend further before retrying.
-    /// </summary>
-    public ReconcileResult TryReconcilePrefix(BitPrefix prefix, Setsum replicaPrefixSum)
-    {
-        _store.Prepare();
-
-        // Compute [lo, hi] bounds once; reuse for RangeInfoByIndex and TryPeelRangeByIndex
-        // to avoid the double binary-search that separate GetPrefixInfo + TryPeelRange would incur.
-        Span<byte> lo = stackalloc byte[Setsum.DigestSize];
-        Span<byte> hi = stackalloc byte[Setsum.DigestSize];
-        prefix.FillKeyRange(lo, hi);
-
-        var (start, end) = _store.GetBounds(lo, hi);
-        var (primaryPrefixSum, _) = _store.RangeInfoByIndex(start, end);
-        if (primaryPrefixSum == replicaPrefixSum) return ReconcileResult.Identical();
-
-        // replicaPrefixSum == Zero means the replica has nothing here — send everything.
-        if (replicaPrefixSum.IsEmpty())
-            return ReconcileResult.Found(_store.RangeByIndex(start, end).ToList());
-
-        var diff = primaryPrefixSum - replicaPrefixSum;
-        var found = _store.TryPeelRangeByIndex(start, end, diff, MaxPrimaryCountForPairPeel);
-
-        return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
     }
 
     // -------------------------------------------------------------------------
