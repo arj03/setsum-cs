@@ -29,7 +29,6 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     private const int SetsumSize = Setsum.DigestSize;
     private const int EpochSize = sizeof(int);
     private const int CountSize = sizeof(int);
-    private const int FingerprintSize = sizeof(long);
 
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }

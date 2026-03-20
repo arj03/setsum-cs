@@ -12,7 +12,6 @@ public partial class SyncNodes
     ///   - Replica has items the primary doesn't → remove from replica
     ///
     /// Per BFS level: one round trip batching leaf resolution + child expansion.
-    /// Expansion uses 8-byte fingerprints instead of 32-byte Setsums (~2^-64 collision rate).
     /// </summary>
     private (int Added, int Removed) PerformBidirectionalTrieSync(
         ReconcilableSet primary,
@@ -52,13 +51,13 @@ public partial class SyncNodes
             return (0, 0);
 
         var currentLevel = new List<(BitPrefix Prefix, int Depth,
-                                     long PrimaryFingerprint, int PrimaryCount,
+                                     Setsum PrimaryHash, int PrimaryCount,
                                      Setsum ReplicaHash, int ReplicaCount,
                                      int PrimaryStart, int PrimaryEnd,
                                      int ReplicaStart, int ReplicaEnd)>
         {
             (BitPrefix.Root, 0,
-             primaryRootHash.Fingerprint64(), primaryRootCount,
+             primaryRootHash, primaryRootCount,
              replicaRootHash, replicaRootCount,
              primaryRootStart, primaryRootEnd,
              replicaRootStart, replicaRootEnd)
@@ -69,17 +68,17 @@ public partial class SyncNodes
         {
             var leaves = new List<(BitPrefix Prefix, int Depth,
                                      int PrimaryCount, int ReplicaCount,
-                                     long PrimaryFingerprint, Setsum ReplicaHash,
+                                     Setsum PrimaryHash, Setsum ReplicaHash,
                                      int PrimaryStart, int PrimaryEnd,
                                      int ReplicaStart, int ReplicaEnd)>();
             var toExpand = new List<(BitPrefix Prefix, int Depth,
                                      int PrimaryStart, int PrimaryEnd,
                                      int ReplicaStart, int ReplicaEnd)>();
 
-            foreach (var (prefix, depth, primaryFingerprint, primaryCount, replicaHash, replicaCount,
+            foreach (var (prefix, depth, primaryHash, primaryCount, replicaHash, replicaCount,
                          psStart, psEnd, rsStart, rsEnd) in currentLevel)
             {
-                if (primaryFingerprint == replicaHash.Fingerprint64() && primaryCount == replicaCount)
+                if (primaryHash == replicaHash && primaryCount == replicaCount)
                     continue;
 
                 if (primaryCount == 0)
@@ -92,7 +91,7 @@ public partial class SyncNodes
                       || depth >= MaxPrefixDepth
                       || Math.Abs(primaryCount - replicaCount) <= LeafThreshold)
                 {
-                    leaves.Add((prefix, depth, primaryCount, replicaCount, primaryFingerprint, replicaHash,
+                    leaves.Add((prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash,
                                 psStart, psEnd, rsStart, rsEnd));
                 }
                 else
@@ -108,7 +107,7 @@ public partial class SyncNodes
             RoundTrips++;
 
             // --- Leaf resolution ---
-            foreach (var (prefix, depth, primaryCount, replicaCount, primaryFingerprint, replicaHash,
+            foreach (var (prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash,
                          psStart, psEnd, rsStart, rsEnd) in leaves)
             {
                 if (replicaCount == 0)
@@ -137,36 +136,9 @@ public partial class SyncNodes
                         added += result.MissingItems!.Count;
                         continue;
                     }
-
-                    if (depth < MaxPrefixDepth)
-                    {
-                        toExpand.Add((prefix, depth, psStart, psEnd, rsStart, rsEnd));
-                        continue;
-                    }
                 }
-                else if (signedDiff < 0)
-                {
-                    // Replica ahead — request full primaryHash for local peeling.
-                    BytesSent += prefix.NetworkSize;
-                    var (primaryFullHash, _) = primary.GetInfoByIndex(psStart, psEnd);
-                    BytesReceived += SetsumSize;
 
-                    var result = replica.TryReconcilePrefixByIndex(rsStart, rsEnd, primaryFullHash);
-
-                    if (result.Outcome == ReconcileOutcome.Found)
-                    {
-                        pendingRemoves.AddRange(result.MissingItems!);
-                        removed += result.MissingItems!.Count;
-                        continue;
-                    }
-
-                    if (depth < MaxPrefixDepth)
-                    {
-                        toExpand.Add((prefix, depth, psStart, psEnd, rsStart, rsEnd));
-                        continue;
-                    }
-                }
-                else if (depth < MaxPrefixDepth)
+                if (depth < MaxPrefixDepth)
                 {
                     toExpand.Add((prefix, depth, psStart, psEnd, rsStart, rsEnd));
                     continue;
@@ -198,7 +170,7 @@ public partial class SyncNodes
                     BytesSent += prefix.ExtendN(c, BitsPerExpansion).NetworkSize;
 
             // Primary: split each parent into 2^BitsPerExpansion descendants.
-            var primaryChildInfos = new (long Fingerprint, int Count)[toExpand.Count * numChildren];
+            var primaryChildInfos = new (Setsum Hash, int Count)[toExpand.Count * numChildren];
             var primarySplitSets = new int[toExpand.Count][];
             for (int i = 0; i < toExpand.Count; i++)
             {
@@ -206,18 +178,18 @@ public partial class SyncNodes
                 var (splits, hashes, counts) = primary.GetDescendantInfoByIndex(pStart, pEnd, depth, BitsPerExpansion);
                 primarySplitSets[i] = splits;
                 for (int c = 0; c < numChildren; c++)
-                    primaryChildInfos[i * numChildren + c] = (hashes[c].Fingerprint64(), counts[c]);
+                    primaryChildInfos[i * numChildren + c] = (hashes[c], counts[c]);
             }
 
-            // Rx: varint(count) + (count > 0 ? 8B fingerprint : 0) per child
+            // Rx: varint(count) + (count > 0 ? Setsum : 0) per child
             for (int i = 0; i < primaryChildInfos.Length; i++)
             {
                 var (_, count) = primaryChildInfos[i];
-                BytesReceived += VarInt.Size(count) + (count > 0 ? FingerprintSize : 0);
+                BytesReceived += VarInt.Size(count) + (count > 0 ? SetsumSize : 0);
             }
 
             var nextLevel = new List<(BitPrefix Prefix, int Depth,
-                                      long PrimaryFingerprint, int PrimaryCount,
+                                      Setsum PrimaryHash, int PrimaryCount,
                                       Setsum ReplicaHash, int ReplicaCount,
                                       int PrimaryStart, int PrimaryEnd,
                                       int ReplicaStart, int ReplicaEnd)>(toExpand.Count * numChildren);
@@ -232,11 +204,11 @@ public partial class SyncNodes
 
                 for (int c = 0; c < numChildren; c++)
                 {
-                    var (pFp, pc) = primaryChildInfos[i * numChildren + c];
-                    if (pc != rCounts[c] || pFp != rHashes[c].Fingerprint64())
+                    var (pH, pc) = primaryChildInfos[i * numChildren + c];
+                    if (pc != rCounts[c] || pH != rHashes[c])
                     {
                         nextLevel.Add((prefix.ExtendN(c, BitsPerExpansion), newDepth,
-                                       pFp, pc, rHashes[c], rCounts[c],
+                                       pH, pc, rHashes[c], rCounts[c],
                                        pSplits[c], pSplits[c + 1],
                                        rSplits[c], rSplits[c + 1]));
                     }

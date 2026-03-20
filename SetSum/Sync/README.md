@@ -85,9 +85,7 @@ flowchart TD
 
 #### BFS traversal
 
-The BFS processes one full depth level per round trip (level-batched). For each node, the primary splits into `2^BitsPerExpansion` children and returns `(fingerprint, count)` for each. Children are enqueued only if their `(fingerprint, count)` differs between primary and replica — matching subtrees are skipped immediately.
-
-Expansion uses **truncated 64-bit fingerprints** instead of full 32-byte Setsums for mismatch detection. This is sufficient for comparison (~2^-64 false positive rate) and saves 24 bytes per entry — a significant reduction when tens of thousands of subtrees are compared. The full Setsum is only fetched on demand for leaf resolution (e.g. when the replica needs to peel locally).
+The BFS processes one full depth level per round trip (level-batched). For each node, the primary splits into `2^BitsPerExpansion` children and returns `(hash, count)` for each. Children are enqueued only if their `(hash, count)` differs between primary and replica — matching subtrees are skipped immediately.
 
 A node becomes a leaf when:
 - `primaryCount == 0` — primary has nothing here; replica's items are stale and removed locally (no RT needed), or
@@ -115,13 +113,11 @@ sequenceDiagram
 
 #### Leaf resolution via Setsum peeling
 
-Leaf resolution handles three directional cases:
+Leaf resolution handles two directional cases:
 
 **Primary ahead** (`signedDiff > 0`): The replica sends its `prefixSum` (32 bytes). The primary computes `diff = primaryPrefixSum - replicaPrefixSum` and peels the missing items from the diff.
 
-**Replica ahead** (`signedDiff < 0`): The replica requests the full primary hash (32 bytes) and peels locally — identifying items it holds that the primary doesn't. If the expansion already provided the full hash (e.g. at the root level), this resolves with zero wire traffic.
-
-**Same count, different hash** (`signedDiff == 0`): Expanded further — both sides have the same count but different content, so descending reveals where the actual differences are.
+**Replica ahead or same count, different hash** (`signedDiff <= 0`): Expanded further — descending reveals where the actual differences are. When `primaryCount == 0` at a leaf, replica items are removed locally with no wire traffic.
 
 The peeling itself works on the Setsum diff:
 
@@ -250,7 +246,7 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 
 ## Wire Protocol
 
-All messages are binary, little-endian, with VarInt-encoded counts. Key = 32 bytes, Setsum = 32 bytes, Fingerprint = 8 bytes.
+All messages are binary, little-endian, with VarInt-encoded counts. Key = 32 bytes, Setsum = 32 bytes.
 
 ### Sequence request (replica → primary)
 
@@ -295,9 +291,7 @@ Piggybacking root info for both stores saves 2 round trips vs. querying them sep
 | Field | Size |
 |---|---|
 | count | varint |
-| fingerprint | 8 B (if count > 0) |
-
-Uses truncated 64-bit fingerprints instead of full 32-byte Setsums (~2^-64 false positive rate). Saves 24 bytes per entry — significant when tens of thousands of subtrees are compared.
+| hash | 32 B (Setsum, if count > 0) |
 
 ### Leaf resolution (within the same BFS round trip)
 
@@ -305,11 +299,10 @@ Uses truncated 64-bit fingerprints instead of full 32-byte Setsums (~2^-64 false
 |---|---|---|
 | replicaCount == 0 (bulk pull) | prefix bytes | count × 32 B keys |
 | signedDiff > 0 (primary ahead) | prefix + 32 B replicaHash | count × 32 B missing keys |
-| signedDiff < 0 (replica ahead) | prefix bytes | 32 B primaryHash |
-| signedDiff == 0 (same count, different hash) | — | — (expanded further) |
+| signedDiff <= 0 (replica ahead or same count) | — | — (expanded further) |
 | depth >= MaxPrefixDepth (full exchange) | prefix + count × 32 B replicaKeys | count × 32 B primaryKeys to add |
 
-**Replica-ahead leaves** peel locally using the primary's hash — removals never travel over the wire. **Full key exchange** only returns the keys to add; the replica computes removals locally by diffing the sorted lists.
+**Full key exchange** only returns the keys to add; the replica computes removals locally by diffing the sorted lists.
 
 ---
 
@@ -423,7 +416,7 @@ This means the protocol self-heals from arbitrary replica corruption without any
 
 | File | Purpose |
 |---|---|
-| `Setsum.cs` | Commutative, invertible 256-bit hash with SIMD arithmetic and 64-bit fingerprint extraction |
+| `Setsum.cs` | Commutative, invertible 256-bit hash with SIMD arithmetic |
 | `ReconcilableSet.cs` | High-level set with sequence-based fast path, insertion-order tracking, and leaf resolution |
 | `SortedKeyStore.cs` | Flat sorted array store with O(log N) range-hash, zero-allocation peeling (k=1/2/3), and descendant splitting |
 | `BitPrefix.cs` | Bit-level trie prefix with multi-bit extension |
