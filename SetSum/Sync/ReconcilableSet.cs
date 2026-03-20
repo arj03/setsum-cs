@@ -10,9 +10,7 @@ namespace Setsum.Sync;
 /// </summary>
 public class ReconcilableSet
 {
-    private byte[][] _insertionKeys = new byte[16][];
-    private Setsum[] _insertionHashes = new Setsum[16];
-    private int _insertionCount;
+    private readonly List<byte[]> _insertionKeys = [];
     private bool _insertionOrderInvalid;
 
     private readonly SortedKeyStore _store;
@@ -25,7 +23,7 @@ public class ReconcilableSet
     public Setsum Sum() => _store.TotalInfo().Hash;
     public int Count() => _store.Count();
 
-    public int InsertionCount => _insertionCount;
+    public int InsertionCount => _insertionKeys.Count;
 
     // -------------------------------------------------------------------------
     // Insertion
@@ -37,7 +35,7 @@ public class ReconcilableSet
             throw new ArgumentException($"Item key must be {Setsum.DigestSize} bytes.");
 
         var itemHash = Setsum.Hash(itemKey);
-        AppendInsertion(itemKey, itemHash);
+        if (!_insertionOrderInvalid) _insertionKeys.Add(itemKey);
         _store.Add(itemKey, itemHash);
     }
 
@@ -47,14 +45,13 @@ public class ReconcilableSet
         Debug.Assert(IsSorted(items), "InsertBulkPresorted called with unsorted input.");
 
         int n = items.Count;
-        var keys = items.ToArray();
         var flat = new byte[n * Setsum.DigestSize];
         var hashes = new Setsum[n];
         for (int i = 0; i < n; i++)
         {
-            hashes[i] = Setsum.Hash(keys[i]);
-            AppendInsertion(keys[i], hashes[i]);
-            keys[i].CopyTo(flat, i * Setsum.DigestSize);
+            hashes[i] = Setsum.Hash(items[i]);
+            if (!_insertionOrderInvalid) _insertionKeys.Add(items[i]);
+            items[i].CopyTo(flat, i * Setsum.DigestSize);
         }
         _store.MergeSorted(flat, hashes, n);
     }
@@ -84,16 +81,8 @@ public class ReconcilableSet
     public void ResetInsertionOrder()
     {
         _store.Prepare();
-        var allItems = _store.AllWithHashes().ToArray();
-        _insertionCount = 0;
-        EnsureInsertionCapacity(allItems.Length);
-
-        for (int i = 0; i < allItems.Length; i++)
-        {
-            _insertionKeys[i] = allItems[i].Key;
-            _insertionHashes[i] = allItems[i].Hash;
-        }
-        _insertionCount = allItems.Length;
+        _insertionKeys.Clear();
+        _insertionKeys.AddRange(_store.All());
         _insertionOrderInvalid = false;
     }
 
@@ -102,24 +91,21 @@ public class ReconcilableSet
         if (_insertionOrderInvalid)
             return ReconcileResult.Fallback();
 
-        if (replicaCount == _insertionCount)
+        int count = _insertionKeys.Count;
+
+        if (replicaCount == count)
             return Sum() == replicaSum ? ReconcileResult.Identical() : ReconcileResult.Fallback();
 
-        if (replicaCount > _insertionCount || replicaCount < 0)
+        if (replicaCount > count || replicaCount < 0)
             return ReconcileResult.Fallback();
 
         var prefixSum = new Setsum();
         for (int i = 0; i < replicaCount; i++)
-            prefixSum += _insertionHashes[i];
+            prefixSum += Setsum.Hash(_insertionKeys[i]);
         if (prefixSum != replicaSum)
             return ReconcileResult.Fallback();
 
-        int tailCount = _insertionCount - replicaCount;
-        var tail = new List<byte[]>(tailCount);
-        for (int i = replicaCount; i < _insertionCount; i++)
-            tail.Add(_insertionKeys[i]);
-
-        return ReconcileResult.Found(tail);
+        return ReconcileResult.Found(_insertionKeys.GetRange(replicaCount, count - replicaCount));
     }
 
     // -------------------------------------------------------------------------
@@ -169,28 +155,6 @@ public class ReconcilableSet
     internal IEnumerable<byte[]> GetItemsByIndex(int start, int end) => _store.RangeByIndex(start, end);
 
     public IEnumerable<byte[]> GetAllItems() => _store.All();
-
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
-
-    private void AppendInsertion(byte[] key, Setsum hash)
-    {
-        if (_insertionOrderInvalid) return;
-
-        EnsureInsertionCapacity(_insertionCount + 1);
-        _insertionKeys[_insertionCount] = key;
-        _insertionHashes[_insertionCount] = hash;
-        _insertionCount++;
-    }
-
-    private void EnsureInsertionCapacity(int needed)
-    {
-        if (needed <= _insertionKeys.Length) return;
-        int newSize = Math.Max(needed, _insertionKeys.Length * 2);
-        Array.Resize(ref _insertionKeys, newSize);
-        Array.Resize(ref _insertionHashes, newSize);
-    }
 
     private static bool IsSorted(List<byte[]> items)
     {

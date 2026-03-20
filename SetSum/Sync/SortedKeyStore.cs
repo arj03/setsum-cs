@@ -196,13 +196,6 @@ public class SortedKeyStore
             yield return KeyAt(_data, i).ToArray();
     }
 
-    internal IEnumerable<(byte[] Key, Setsum Hash)> AllWithHashes()
-    {
-        EnsureSorted();
-        for (int i = 0; i < _count; i++)
-            yield return (KeyAt(_data, i).ToArray(), _hashes[i]);
-    }
-
     internal List<byte[]>? TryPeelRangeByIndex(int start, int end, Setsum diff, int maxCountForPairPeel, int maxCountForTriplePeel = 256)
     {
         int count = end - start;
