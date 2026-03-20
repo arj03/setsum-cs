@@ -120,19 +120,19 @@ All messages are binary with VarInt-encoded counts. Key = 32 B, Setsum = 32 B.
 
 | Field | Size |
 |---|---|
-| epoch | 4 B |
-| addCount | 4 B |
+| epoch | varint |
+| addCount | varint |
 | addSum | 32 B |
-| delCount | 4 B |
+| delCount | varint |
 | delSum | 32 B |
 
-**Total: 76 bytes.** Covers both stores in one round trip.
+Covers both stores in one round trip.
 
 ### Sequence response (primary → replica)
 
 | Field | Size |
 |---|---|
-| epoch | 4 B |
+| epoch | varint |
 | addOutcome | 1 B (0=Identical, 1=Found, 2=Fallback) |
 | addPayload | varint(count) + count × 32 B keys (if Found) |
 | delOutcome | 1 B |
