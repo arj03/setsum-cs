@@ -390,7 +390,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     {
         var store = new SortedKeyStore();
         var key = RandomKey();
-        store.Add(key, Setsum.Hash(key));
+        store.Add(key);
 
         store.Remove(key);
 
@@ -403,7 +403,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var store = new SortedKeyStore();
         var keys = Enumerable.Range(0, 5).Select(_ => RandomKey()).ToArray();
         foreach (var k in keys)
-            store.Add(k, Setsum.Hash(k));
+            store.Add(k);
 
         store.Remove(keys[2]);
 
@@ -417,7 +417,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     {
         var store = new SortedKeyStore();
         var key = RandomKey();
-        store.Add(key, Setsum.Hash(key));
+        store.Add(key);
 
         store.Remove(RandomKey()); // never inserted
 
@@ -432,7 +432,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var store = new SortedKeyStore();
         var keys = Enumerable.Range(0, 10).Select(_ => RandomKey()).ToArray();
         foreach (var k in keys)
-            store.Add(k, Setsum.Hash(k));
+            store.Add(k);
 
         store.Remove(keys[0]);
         store.Remove(keys[5]);

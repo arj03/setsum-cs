@@ -34,9 +34,8 @@ public class ReconcilableSet
         if (itemKey.Length != Setsum.DigestSize)
             throw new ArgumentException($"Item key must be {Setsum.DigestSize} bytes.");
 
-        var itemHash = Setsum.Hash(itemKey);
         if (!_insertionOrderInvalid) _insertionKeys.Add(itemKey);
-        _store.Add(itemKey, itemHash);
+        _store.Add(itemKey);
     }
 
     public void InsertBulkPresorted(List<byte[]> items)
@@ -46,14 +45,12 @@ public class ReconcilableSet
 
         int n = items.Count;
         var flat = new byte[n * Setsum.DigestSize];
-        var hashes = new Setsum[n];
         for (int i = 0; i < n; i++)
         {
-            hashes[i] = Setsum.Hash(items[i]);
             if (!_insertionOrderInvalid) _insertionKeys.Add(items[i]);
             items[i].CopyTo(flat, i * Setsum.DigestSize);
         }
-        _store.MergeSorted(flat, hashes, n);
+        _store.MergeSorted(flat, n);
     }
 
     public void DeleteBulkPresorted(List<byte[]> items)
