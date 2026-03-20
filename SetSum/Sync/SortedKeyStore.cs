@@ -7,7 +7,7 @@ namespace Setsum.Sync;
 /// Both arrays are indexed the same way: record i has key at _data[i*32..(i+1)*32]
 /// and hash at _hashes[i].
 ///
-/// Sorting uses a two-pass LSB radix sort on bytes 0–1 of the key, followed by an
+/// Sorting uses a four-pass LSB radix sort on bytes 0–3 of the key, followed by an
 /// insertion sort within same-prefix buckets. This gives O(N) sort with sequential
 /// memory access — the dominant cost over Array.Sort's O(N log N) with random cache misses.
 /// </summary>
@@ -29,10 +29,6 @@ public class SortedKeyStore
     private Setsum[] _pendingHashes = new Setsum[16];
     private int _pendingCount;
 
-    // Pending unsorted deletions, flushed lazily on next query — same pattern as inserts.
-    private byte[] _pendingDeletes = new byte[16 * KeySize];
-    private int _pendingDeleteCount;
-
     // Reusable scratch buffers — contents never preserved across calls
     private byte[] _scratch = new byte[16 * KeySize];
     private Setsum[] _scratchHashes = new Setsum[16];
@@ -49,7 +45,8 @@ public class SortedKeyStore
     public bool Contains(byte[] key)
     {
         EnsureSorted();
-        return BinarySearch(key) >= 0;
+        int idx = LowerBound(key, 0, _count);
+        return idx < _count && KeyAt(_data, idx).SequenceCompareTo(key) == 0;
     }
 
     public void Add(byte[] key, Setsum hash)
@@ -65,10 +62,8 @@ public class SortedKeyStore
 
     public void Remove(byte[] key)
     {
-        if (_pendingDeleteCount * KeySize >= _pendingDeletes.Length)
-            GrowPreserving(ref _pendingDeletes, _pendingDeleteCount * KeySize);
-        key.CopyTo(_pendingDeletes, _pendingDeleteCount * KeySize);
-        _pendingDeleteCount++;
+        EnsureSorted();
+        RemoveSorted(key, 1);
     }
 
     /// <summary>
@@ -287,16 +282,6 @@ public class SortedKeyStore
             }
         }
 
-        if (_pendingDeleteCount > 0)
-        {
-            int n = _pendingDeleteCount;
-            _pendingDeleteCount = 0;
-            GrowScratch(ref _scratch, n * KeySize);
-            GrowScratch(ref _scratchHashes, n);
-            var dummy = new Setsum[n];
-            SortPending(_pendingDeletes, dummy, n, _scratch, _scratchHashes);
-            RemoveSorted(_pendingDeletes, n);
-        }
     }
 
     private void SortPending(byte[] keys, Setsum[] hashes, int n, byte[] scratch, Setsum[] scratchHashes)
@@ -379,21 +364,6 @@ public class SortedKeyStore
             _prefixSums[i + 1] = _prefixSums[i] + _hashes[i];
 
         _prefixSumsDirty = false;
-    }
-
-    private int BinarySearch(byte[] key)
-    {
-        var t = (ReadOnlySpan<byte>)key;
-        int lo = 0, hi = _count - 1;
-        while (lo <= hi)
-        {
-            int mid = (lo + hi) >> 1;
-            int cmp = KeyAt(_data, mid).SequenceCompareTo(t);
-            if (cmp == 0) return mid;
-            if (cmp < 0) lo = mid + 1;
-            else hi = mid - 1;
-        }
-        return ~lo;
     }
 
     private int LowerBound(ReadOnlySpan<byte> t, int lo, int hi)
