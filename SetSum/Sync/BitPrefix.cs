@@ -24,40 +24,6 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
         return new BitPrefix(Bits | mask, Length + bits);
     }
 
-    /// <summary>
-    /// Fills caller-supplied spans with the inclusive [lo, hi] key range for this prefix.
-    /// </summary>
-    public void FillKeyRange(Span<byte> lo, Span<byte> hi)
-    {
-        lo.Clear();
-        hi.Fill(0xFF);
-
-        int fullBytes = Length / 8;
-        int remainder = Length % 8;
-
-        for (int i = 0; i < fullBytes; i++)
-        {
-            byte b = (byte)(Bits >> (56 - i * 8));
-            lo[i] = b;
-            hi[i] = b;
-        }
-
-        if (remainder > 0)
-        {
-            byte prefixByte = (byte)(Bits >> (56 - fullBytes * 8));
-            byte mask = (byte)(0xFF << (8 - remainder));
-            byte prefixPart = (byte)(prefixByte & mask);
-            lo[fullBytes] = prefixPart;
-            hi[fullBytes] = (byte)(prefixPart | (~mask & 0xFF));
-        }
-    }
-
-    public override string ToString()
-    {
-        var bits = Convert.ToString((long)Bits, 2).PadLeft(64, '0')[..Math.Min(Length, 64)];
-        return $"Prefix({bits}, {Length} bits)";
-    }
-
     public bool Equals(BitPrefix other) => Bits == other.Bits && Length == other.Length;
     public override bool Equals(object? obj) => obj is BitPrefix p && Equals(p);
     public override int GetHashCode() => HashCode.Combine(Bits, Length);

@@ -21,43 +21,4 @@ public static class VarInt
         if (value < 0x10000000) return 4;
         return 5;
     }
-
-    /// <summary>
-    /// Encodes <paramref name="value"/> into <paramref name="buf"/> at <paramref name="offset"/>
-    /// and advances <paramref name="offset"/> past the written bytes.
-    /// </summary>
-    public static void Write(byte[] buf, ref int offset, int value)
-    {
-        if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
-        while (value >= 0x80)
-        {
-            buf[offset++] = (byte)((value & 0x7F) | 0x80);
-            value >>= 7;
-        }
-        buf[offset++] = (byte)value;
-    }
-
-    /// <summary>
-    /// Decodes a varint from <paramref name="buf"/> at <paramref name="offset"/> and
-    /// advances <paramref name="offset"/> past the consumed bytes.
-    /// </summary>
-    /// <exception cref="InvalidDataException">
-    /// Thrown if the buffer ends mid-varint or the encoded value exceeds 5 bytes.
-    /// </exception>
-    public static int Read(byte[] buf, ref int offset)
-    {
-        int result = 0;
-        int shift = 0;
-        while (true)
-        {
-            if (offset >= buf.Length)
-                throw new InvalidDataException("Unexpected end of buffer while reading VarInt.");
-            byte b = buf[offset++];
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-            if (shift >= 35)
-                throw new InvalidDataException("VarInt exceeds 5 bytes — value out of range for Int32.");
-        }
-    }
 }
