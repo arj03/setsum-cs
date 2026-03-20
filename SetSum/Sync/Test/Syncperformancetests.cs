@@ -83,8 +83,8 @@ public class SyncPerformanceTests(ITestOutputHelper output)
             replica.AddStore.InsertionCount, replica.AddStore.Sum());
         sw.Stop();
 
-        Assert.Equal(ReconcileOutcome.Found, result.Outcome);
-        Assert.Equal(50_000, result.MissingItems!.Count);
+        Assert.NotNull(result);
+        Assert.Equal(50_000, result.Count);
         _output.WriteLine($"Large tail send – {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 

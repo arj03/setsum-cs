@@ -86,26 +86,21 @@ public class ReconcilableSet
         _insertionOrderInvalid = false;
     }
 
-    public ReconcileResult TryReconcileTail(int replicaCount, Setsum replicaSum)
+    // Returns null on fallback, empty list on identical, tail items on success.
+    public List<byte[]>? TryReconcileTail(int replicaCount, Setsum replicaSum)
     {
-        if (_insertionOrderInvalid)
-            return ReconcileResult.Fallback();
+        if (_insertionOrderInvalid) return null;
 
         int count = _insertionKeys.Count;
-
-        if (replicaCount == count)
-            return Sum() == replicaSum ? ReconcileResult.Identical() : ReconcileResult.Fallback();
-
-        if (replicaCount > count || replicaCount < 0)
-            return ReconcileResult.Fallback();
+        if (replicaCount == count) return Sum() == replicaSum ? [] : null;
+        if (replicaCount > count || replicaCount < 0) return null;
 
         var prefixSum = new Setsum();
         for (int i = 0; i < replicaCount; i++)
             prefixSum += Setsum.Hash(_insertionKeys[i]);
-        if (prefixSum != replicaSum)
-            return ReconcileResult.Fallback();
+        if (prefixSum != replicaSum) return null;
 
-        return ReconcileResult.Found(_insertionKeys.GetRange(replicaCount, count - replicaCount));
+        return _insertionKeys.GetRange(replicaCount, count - replicaCount);
     }
 
     // -------------------------------------------------------------------------
@@ -133,21 +128,20 @@ public class ReconcilableSet
         return (splits, hashes, counts);
     }
 
-    internal ReconcileResult TryReconcilePrefixByIndex(int start, int end, Setsum otherPrefixSum, int k)
+    internal List<byte[]>? TryReconcilePrefixByIndex(int start, int end, Setsum otherPrefixSum, int k)
     {
         var (myPrefixSum, _) = _store.RangeInfoByIndex(start, end);
-        if (myPrefixSum == otherPrefixSum) return ReconcileResult.Identical();
+        if (myPrefixSum == otherPrefixSum) return [];
 
         if (otherPrefixSum.IsEmpty())
-            return ReconcileResult.Found(_store.RangeByIndex(start, end).ToList());
+            return _store.RangeByIndex(start, end).ToList();
 
         var diff = myPrefixSum - otherPrefixSum;
         // Allow pair scan only if k>=2, triple scan only if k>=3.
         // When k=1 we know exactly 1 item differs, so skip the O(n²) scans.
-        var found = _store.TryPeelRangeByIndex(start, end, diff,
+        return _store.TryPeelRangeByIndex(start, end, diff,
             maxCountForPairPeel: k >= 2 ? 512 : 0,
             maxCountForTriplePeel: k >= 3 ? 256 : 0);
-        return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
     }
 
     internal (int Start, int End) GetRootBounds() => _store.GetRootBounds();

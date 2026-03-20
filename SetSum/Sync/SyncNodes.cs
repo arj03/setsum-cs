@@ -113,49 +113,33 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 
             RoundTrips++;
 
-            output.WriteLine($"Add store: {addResult.Outcome}");
-            ItemsAdded = ResolveStore(
-                addResult.Outcome, addResult.MissingItems,
-                _primary.AddStore, _replica.AddStore, output, "add");
-
-            output.WriteLine($"Delete store: {delResult.Outcome}");
-            ItemsDeleted = ResolveStore(
-                delResult.Outcome, delResult.MissingItems,
-                _primary.DeleteStore, _replica.DeleteStore, output, "delete");
+            ItemsAdded = ResolveStore(addResult, _primary.AddStore, _replica.AddStore, output, "add");
+            ItemsDeleted = ResolveStore(delResult, _primary.DeleteStore, _replica.DeleteStore, output, "delete");
         }
 
         output.WriteLine($"Sync complete — added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
     }
 
-    private int ResolveStore(ReconcileOutcome outcome, IReadOnlyList<byte[]>? fastPathItems,
+    private int ResolveStore(List<byte[]>? result,
         ReconcilableSet primary, ReconcilableSet replica, ITestOutputHelper output, string label)
     {
-        if (outcome == ReconcileOutcome.Found && fastPathItems != null)
+        if (result != null) // found
         {
-            if (fastPathItems.Count > 0)
+            if (result.Count > 0)
             {
-                var sorted = new List<byte[]>(fastPathItems);
-                sorted.Sort(ByteComparer.Instance);
-                replica.InsertBulkPresorted(sorted);
+                result.Sort(ByteComparer.Instance);
+                replica.InsertBulkPresorted(result);
                 replica.Prepare();
             }
-            return fastPathItems.Count;
+            return result.Count;
         }
-        if (outcome == ReconcileOutcome.Fallback)
-        {
-            UsedFallback = true;
-            var (trieAdded, _) = PerformBidirectionalTrieSync(primary, replica, output, label);
-            replica.ResetInsertionOrder();
-            return trieAdded;
-        }
-        return 0;
+        UsedFallback = true;
+        var (trieAdded, _) = PerformBidirectionalTrieSync(primary, replica, output, label);
+        replica.ResetInsertionOrder();
+        return trieAdded;
     }
 
-    private static int ResultPayloadSize(ReconcileResult r)
-    {
-        if (r.Outcome == ReconcileOutcome.Found && r.MissingItems != null)
-            return VarInt.Size(r.MissingItems.Count) + r.MissingItems.Count * KeySize;
-        return 0;
-    }
+    private static int ResultPayloadSize(List<byte[]>? r)
+        => r is { Count: > 0 } ? VarInt.Size(r.Count) + r.Count * KeySize : 0;
 }

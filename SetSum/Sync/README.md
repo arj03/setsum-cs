@@ -181,4 +181,3 @@ On epoch mismatch: `[newEpoch, addRootHash, addRootCount, delRootHash, delRootCo
 | `SyncNodes.cs` | Sync orchestration and wire-byte accounting |
 | `SyncableNode.cs` | Per-node add/delete stores, compaction, and epoch management |
 | `BitPrefix.cs` | Bit-level trie prefix with multi-bit extension |
-| `ReconcileResult.cs` | Discriminated union: `Identical / Found / Fallback` |

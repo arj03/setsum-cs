@@ -130,11 +130,11 @@ public partial class SyncNodes
                     BytesSent += prefix.NetworkSize + SetsumSize;
                     var result = primary.TryReconcilePrefixByIndex(psStart, psEnd, replicaHash, absDiff);
 
-                    if (result.Outcome == ReconcileOutcome.Found)
+                    if (result != null) // found
                     {
-                        BytesReceived += result.MissingItems!.Count * KeySize;
-                        pendingAdds.AddRange(result.MissingItems!);
-                        added += result.MissingItems!.Count;
+                        BytesReceived += result.Count * KeySize;
+                        pendingAdds.AddRange(result);
+                        added += result.Count;
                         continue;
                     }
                 }
@@ -143,10 +143,10 @@ public partial class SyncNodes
                     // Replica ahead — primaryHash already in scope from expansion; peel replica locally (zero wire cost).
                     var result = replica.TryReconcilePrefixByIndex(rsStart, rsEnd, primaryHash, absDiff);
 
-                    if (result.Outcome == ReconcileOutcome.Found)
+                    if (result != null) // found
                     {
-                        pendingRemoves.AddRange(result.MissingItems!);
-                        removed += result.MissingItems!.Count;
+                        pendingRemoves.AddRange(result);
+                        removed += result.Count;
                         continue;
                     }
                 }
