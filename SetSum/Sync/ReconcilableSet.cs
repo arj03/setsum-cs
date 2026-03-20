@@ -10,16 +10,9 @@ namespace Setsum.Sync;
 /// </summary>
 public class ReconcilableSet
 {
-
-    public Setsum Sum() => _store.TotalInfo().Hash;
-
-    public int Count() => _store.Count();
-
     private byte[][] _insertionKeys = new byte[16][];
     private Setsum[] _insertionHashes = new Setsum[16];
-    private Setsum[] _insertionPrefixSums = new Setsum[17]; // [i] = sum of hashes[0..i-1]
     private int _insertionCount;
-    private bool _insertionPrefixSumsDirty;
     private bool _insertionOrderInvalid;
 
     private readonly SortedKeyStore _store;
@@ -28,6 +21,9 @@ public class ReconcilableSet
     {
         _store = new SortedKeyStore();
     }
+
+    public Setsum Sum() => _store.TotalInfo().Hash;
+    public int Count() => _store.Count();
 
     public int InsertionCount => _insertionCount;
 
@@ -98,7 +94,6 @@ public class ReconcilableSet
             _insertionHashes[i] = allItems[i].Hash;
         }
         _insertionCount = allItems.Length;
-        _insertionPrefixSumsDirty = true;
         _insertionOrderInvalid = false;
     }
 
@@ -113,8 +108,10 @@ public class ReconcilableSet
         if (replicaCount > _insertionCount || replicaCount < 0)
             return ReconcileResult.Fallback();
 
-        RebuildInsertionPrefixSums();
-        if (_insertionPrefixSums[replicaCount] != replicaSum)
+        var prefixSum = new Setsum();
+        for (int i = 0; i < replicaCount; i++)
+            prefixSum += _insertionHashes[i];
+        if (prefixSum != replicaSum)
             return ReconcileResult.Fallback();
 
         int tailCount = _insertionCount - replicaCount;
@@ -185,7 +182,6 @@ public class ReconcilableSet
         _insertionKeys[_insertionCount] = key;
         _insertionHashes[_insertionCount] = hash;
         _insertionCount++;
-        _insertionPrefixSumsDirty = true;
     }
 
     private void EnsureInsertionCapacity(int needed)
@@ -194,20 +190,6 @@ public class ReconcilableSet
         int newSize = Math.Max(needed, _insertionKeys.Length * 2);
         Array.Resize(ref _insertionKeys, newSize);
         Array.Resize(ref _insertionHashes, newSize);
-    }
-
-    private void RebuildInsertionPrefixSums()
-    {
-        if (!_insertionPrefixSumsDirty) return;
-
-        if (_insertionPrefixSums.Length < _insertionCount + 1)
-            _insertionPrefixSums = new Setsum[Math.Max(_insertionCount + 1, _insertionPrefixSums.Length * 2)];
-
-        _insertionPrefixSums[0] = new Setsum();
-        for (int i = 0; i < _insertionCount; i++)
-            _insertionPrefixSums[i + 1] = _insertionPrefixSums[i] + _insertionHashes[i];
-
-        _insertionPrefixSumsDirty = false;
     }
 
     private static bool IsSorted(List<byte[]> items)
