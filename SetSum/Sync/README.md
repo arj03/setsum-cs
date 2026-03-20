@@ -115,25 +115,25 @@ sequenceDiagram
 
 Leaf resolution handles two directional cases:
 
-**Primary ahead** (`signedDiff > 0`): The replica sends its `prefixSum` (32 bytes). The primary computes `diff = primaryPrefixSum - replicaPrefixSum` and peels the missing items from the diff.
+**Primary ahead** (`signedDiff > 0`): The replica sends its `prefixSum` (32 bytes). The primary computes `diff = primaryPrefixSum - replicaPrefixSum` and peels the `absDiff` missing items from the diff.
 
-**Replica ahead or same count, different hash** (`signedDiff <= 0`): Expanded further — descending reveals where the actual differences are. When `primaryCount == 0` at a leaf, replica items are removed locally with no wire traffic.
+**Replica ahead** (`signedDiff < 0`): The replica peels locally — `primaryHash` is already available from the expansion response, so no additional wire traffic is needed. The replica computes `diff = replicaPrefixSum - primaryPrefixSum` and peels the `absDiff` stale items, adding them to `pendingRemoves`.
 
-The peeling itself works on the Setsum diff:
+**Same count, different hash** (`signedDiff == 0`): Expanded further — descending reveals where the actual differences are.
 
-```
-diff = primaryPrefixSum - replicaPrefixSum
-```
+When `primaryCount == 0` at a leaf, replica items are removed locally with no wire traffic.
 
-**k=1:** `diff` equals exactly one item's hash. Linear scan over items under the prefix.
+The peeling itself works on the Setsum diff. Because the caller knows `absDiff` exactly, higher-cost scan levels are skipped when they can't possibly succeed:
 
-**k=2:** `diff` equals the sum of two items' hashes. O(n²) pair scan, guarded by `MaxPrimaryCountForPairPeel` (512 items).
+**k=1:** Linear scan only. Pair and triple scans are disabled — since the diff equals exactly one item's hash, they'd fail with ~2⁻²⁵⁶ probability and would waste O(n²) time for nothing.
 
-**k=3:** O(n²) scan with a stack-allocated hash-table probe for the third item. Guarded by a count limit of 256. The temporary table is 4 KB on the stack — no heap allocation.
+**k=2:** Linear scan then O(n²) pair scan. Count ≤ 512. Triple scan disabled.
+
+**k=3:** Linear scan, then pair scan, then O(n²) scan with a stack-allocated hash-table probe for the third item. Count ≤ 256 for the triple pass. The hash table (4 KB on the stack) is built once per leaf — no heap allocation.
+
+All scans walk `_hashes[start..end]` directly — no re-hashing performed. Keys are only copied off `_data` when a match is confirmed; the miss path allocates nothing.
 
 For `replicaCount == 0` the primary simply returns all its items under the prefix directly.
-
-All scans read directly from the stored `_hashes[]` array in `SortedKeyStore` — no re-hashing of keys is performed, and no key copies are allocated until a match is confirmed.
 
 ---
 
@@ -156,7 +156,7 @@ graph LR
 
 **Range query**: `RangeInfo(lo, hi)` binary-searches for `start` and `end`, then returns `prefixSums[end] - prefixSums[start]` in O(log N).
 
-**Peeling scan**: `TryPeelRangeByIndex(start, end, diff, maxCount)` walks `_hashes[start..end]` directly for the linear (k=1), pair (k=2), and triple (k=3) scans. The k=3 scan uses a stack-allocated 4 KB hash table for O(1) third-item lookups — no heap allocation. Keys are only copied off `_data` when a match is confirmed — the miss path allocates nothing.
+**Peeling scan**: `TryPeelRangeByIndex(start, end, diff, maxCountForPairPeel, maxCountForTriplePeel)` walks `_hashes[start..end]` for up to k=3. The caller tunes `maxCountForPairPeel` and `maxCountForTriplePeel` based on the known `absDiff` to gate which scan levels run — e.g. when `absDiff == 1` both are set to 0, skipping the O(n²) scans entirely. The k=3 pass uses a stack-allocated 4 KB hash table — no heap allocation. Keys are only copied off `_data` when a match is confirmed — the miss path allocates nothing.
 
 **Descendant splits**: `GetDescendantSplits(start, end, depth, bits)` recursively bisects a range into `2^bits` sub-ranges at successive bit depths, returning boundary indices. Used by multi-bit expansion to split a parent into all children in one pass.
 
@@ -299,7 +299,8 @@ Piggybacking root info for both stores saves 2 round trips vs. querying them sep
 |---|---|---|
 | replicaCount == 0 (bulk pull) | prefix bytes | count × 32 B keys |
 | signedDiff > 0 (primary ahead) | prefix + 32 B replicaHash | count × 32 B missing keys |
-| signedDiff <= 0 (replica ahead or same count) | — | — (expanded further) |
+| signedDiff < 0 (replica ahead) | — (primaryHash already received) | — (replica peels locally) |
+| signedDiff == 0 (same count, different hash) | — | — (expanded further) |
 | depth >= MaxPrefixDepth (full exchange) | prefix + count × 32 B replicaKeys | count × 32 B primaryKeys to add |
 
 **Full key exchange** only returns the keys to add; the replica computes removals locally by diffing the sorted lists.

@@ -10,7 +10,6 @@ namespace Setsum.Sync;
 /// </summary>
 public class ReconcilableSet
 {
-    private const int MaxPrimaryCountForPairPeel = 512;
 
     public Setsum Sum() => _store.TotalInfo().Hash;
 
@@ -151,16 +150,20 @@ public class ReconcilableSet
         return (splits, hashes, counts);
     }
 
-    internal ReconcileResult TryReconcilePrefixByIndex(int start, int end, Setsum replicaPrefixSum)
+    internal ReconcileResult TryReconcilePrefixByIndex(int start, int end, Setsum otherPrefixSum, int k)
     {
-        var (primaryPrefixSum, _) = _store.RangeInfoByIndex(start, end);
-        if (primaryPrefixSum == replicaPrefixSum) return ReconcileResult.Identical();
+        var (myPrefixSum, _) = _store.RangeInfoByIndex(start, end);
+        if (myPrefixSum == otherPrefixSum) return ReconcileResult.Identical();
 
-        if (replicaPrefixSum.IsEmpty())
+        if (otherPrefixSum.IsEmpty())
             return ReconcileResult.Found(_store.RangeByIndex(start, end).ToList());
 
-        var diff = primaryPrefixSum - replicaPrefixSum;
-        var found = _store.TryPeelRangeByIndex(start, end, diff, MaxPrimaryCountForPairPeel);
+        var diff = myPrefixSum - otherPrefixSum;
+        // Allow pair scan only if k>=2, triple scan only if k>=3.
+        // When k=1 we know exactly 1 item differs, so skip the O(n²) scans.
+        var found = _store.TryPeelRangeByIndex(start, end, diff,
+            maxCountForPairPeel: k >= 2 ? 512 : 0,
+            maxCountForTriplePeel: k >= 3 ? 256 : 0);
         return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
     }
 

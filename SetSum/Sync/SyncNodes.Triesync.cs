@@ -122,18 +122,31 @@ public partial class SyncNodes
                 }
 
                 int signedDiff = primaryCount - replicaCount;
+                int absDiff = Math.Abs(signedDiff);
 
                 if (signedDiff > 0)
                 {
                     // Primary ahead — send prefix + replicaHash, primary peels.
                     BytesSent += prefix.NetworkSize + SetsumSize;
-                    var result = primary.TryReconcilePrefixByIndex(psStart, psEnd, replicaHash);
+                    var result = primary.TryReconcilePrefixByIndex(psStart, psEnd, replicaHash, absDiff);
 
                     if (result.Outcome == ReconcileOutcome.Found)
                     {
                         BytesReceived += result.MissingItems!.Count * KeySize;
                         pendingAdds.AddRange(result.MissingItems!);
                         added += result.MissingItems!.Count;
+                        continue;
+                    }
+                }
+                else if (signedDiff < 0)
+                {
+                    // Replica ahead — primaryHash already in scope from expansion; peel replica locally (zero wire cost).
+                    var result = replica.TryReconcilePrefixByIndex(rsStart, rsEnd, primaryHash, absDiff);
+
+                    if (result.Outcome == ReconcileOutcome.Found)
+                    {
+                        pendingRemoves.AddRange(result.MissingItems!);
+                        removed += result.MissingItems!.Count;
                         continue;
                     }
                 }
