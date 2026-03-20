@@ -204,6 +204,30 @@ public class SortedKeyStore
         => FindSplitPoint(start, end, depth);
 
     /// <summary>
+    /// Splits [start, end) into 2^<paramref name="bits"/> sub-ranges by recursively bisecting at
+    /// successive bit depths. Returns an array of 2^bits + 1 boundary indices.
+    /// </summary>
+    internal int[] GetDescendantSplits(int start, int end, int depth, int bits)
+    {
+        int numLeaves = 1 << bits;
+        int[] splits = new int[numLeaves + 1];
+        splits[0] = start;
+        splits[numLeaves] = end;
+        FillDescendantSplits(splits, 0, numLeaves, start, end, depth);
+        return splits;
+    }
+
+    private void FillDescendantSplits(int[] splits, int leafLo, int leafHi, int start, int end, int depth)
+    {
+        if (leafHi - leafLo <= 1) return;
+        int leafMid = (leafLo + leafHi) / 2;
+        int splitIdx = FindSplitPoint(start, end, depth);
+        splits[leafMid] = splitIdx;
+        FillDescendantSplits(splits, leafLo, leafMid, start, splitIdx, depth + 1);
+        FillDescendantSplits(splits, leafMid, leafHi, splitIdx, end, depth + 1);
+    }
+
+    /// <summary>
     /// Returns the hash and count for the entire store.
     /// </summary>
     public (Setsum Hash, int Count) TotalInfo()
@@ -248,10 +272,21 @@ public class SortedKeyStore
     }
 
     /// <summary>
+    /// Returns all (key, hash) pairs in sorted order. Avoids re-hashing — returns
+    /// the hashes already stored in the parallel <c>_hashes</c> array.
+    /// </summary>
+    internal IEnumerable<(byte[] Key, Setsum Hash)> AllWithHashes()
+    {
+        EnsureSorted();
+        for (int i = 0; i < _count; i++)
+            yield return (KeyAt(_data, i).ToArray(), _hashes[i]);
+    }
+
+    /// <summary>
     /// Scans the pre-computed range [start, end) for items whose hashes peel against diff.
     /// Caller must have already called Prepare().
     /// </summary>
-    internal List<byte[]>? TryPeelRangeByIndex(int start, int end, Setsum diff, int maxCountForPairPeel)
+    internal List<byte[]>? TryPeelRangeByIndex(int start, int end, Setsum diff, int maxCountForPairPeel, int maxCountForTriplePeel = 256)
     {
         int count = end - start;
         if (count == 0) return null;
@@ -261,15 +296,43 @@ public class SortedKeyStore
             if (_hashes[i] == diff)
                 return [KeyAt(_data, i).ToArray()];
 
-        // missingCount == 2: O(n²) scan, guarded by maxCountForPairPeel
-        if (count <= maxCountForPairPeel)
+        if (count > maxCountForPairPeel) return null;
+
+        // missingCount == 2: O(n²) pair scan
+        for (int i = start; i < end; i++)
         {
+            var remaining = diff - _hashes[i];
+            for (int j = i + 1; j < end; j++)
+                if (_hashes[j] == remaining)
+                    return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray()];
+        }
+
+        // missingCount == 3: O(n²) with temporary hash-table lookup for the third item.
+        if (count <= maxCountForTriplePeel)
+        {
+            // Build a temporary hash table over the range (count ≤ 256, table 1024 → ~25% load).
+            const int tableSize = 1024;
+            const int tableMask = tableSize - 1;
+            Span<int> table = stackalloc int[tableSize];
+            table.Fill(-1);
+
             for (int i = start; i < end; i++)
             {
-                var remaining = diff - _hashes[i];
+                int slot = _hashes[i].GetHashCode() & tableMask;
+                table[slot] = i; // last-writer-wins; stale checked by hash comparison
+            }
+
+            for (int i = start; i < end; i++)
+            {
+                var remaining2 = diff - _hashes[i];
                 for (int j = i + 1; j < end; j++)
-                    if (_hashes[j] == remaining)
-                        return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray()];
+                {
+                    var need = remaining2 - _hashes[j];
+                    int slot = need.GetHashCode() & tableMask;
+                    int k = table[slot];
+                    if (k >= start && k != i && k != j && _hashes[k] == need)
+                        return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray(), KeyAt(_data, k).ToArray()];
+                }
             }
         }
 

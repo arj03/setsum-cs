@@ -33,7 +33,10 @@ public class SyncableNode
     public void Insert(byte[] key)
     {
         if (DeleteStore.Contains(key))
+        {
             DeleteStore.DeleteBulkPresorted([key]);
+            DeleteStore.ResetInsertionOrder();
+        }
 
         AddStore.Insert(key);
     }
@@ -74,6 +77,8 @@ public class SyncableNode
     /// <summary>
     /// primary-side compaction: applies all pending deletes to AddStore,
     /// wipes DeleteStore, and bumps DeleteEpoch.
+    /// Resets insertion-order tracking on AddStore so the sequence-based
+    /// fast path starts fresh from the post-compaction state.
     /// </summary>
     public void CompactDeleteStore()
     {
@@ -83,6 +88,9 @@ public class SyncableNode
             AddStore.DeleteBulkPresorted(allDeletes);
             AddStore.Prepare();
         }
+
+        // Insertion order is invalidated by the deletes — rebuild from current store contents.
+        AddStore.ResetInsertionOrder();
 
         DeleteEpoch++;
         DeleteStore = new ReconcilableSet();

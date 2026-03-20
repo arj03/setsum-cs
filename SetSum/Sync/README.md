@@ -1,6 +1,6 @@
 # Setsum Sync
 
-A set-reconciliation library for efficiently synchronising two sets of 32-byte keys across a network. The protocol minimises round-trips by trying fast heuristic paths before falling back to a full binary-prefix trie traversal.
+A set-reconciliation library for efficiently synchronising two sets of 32-byte keys across a network. The protocol minimises round-trips by trying a sequence-based fast path before falling back to a full bidirectional binary-prefix trie traversal.
 
 This protocol assumes all participating nodes are mutually trusted. The reported counts and sums are accepted at face value. A malicious node could trigger expensive computations. The upside is that this setup allows for a lot of optimizations.
 
@@ -10,12 +10,10 @@ This protocol assumes all participating nodes are mutually trusted. The reported
 
 The core challenge: two nodes each hold a set of 32-byte keys. They want to converge to the same set with as few network round-trips as possible, without transferring keys they already share.
 
-The protocol is **unidirectional** — the primary node transfers items it has to the replica. It does not support the case where both sides are ahead of each other. The BFS uses `missingCount = primaryCount - replicaCount` to decide when to stop descending, so when both sides have extra items under a prefix the counts partially cancel — a prefix where the primary has 5 extras and the replica has 5 extras looks like `missingCount == 0` and gets skipped entirely, silently dropping all 10 differences.
-
 The library solves this in two escalating strategies:
 
-1. **Fast Path** — Setsum peeling (works for tiny diffs, evaluated as part of the combined epoch+fast-path round trip)
-2. **Trie Fallback** — binary-prefix trie traversal for large diffs (1 RT per BFS depth level)
+1. **Fast Path** — Sequence-based tail send (works for any diff size where the replica is a prefix of the primary's insertion history)
+2. **Trie Fallback** — Bidirectional binary-prefix trie traversal for arbitrary diffs (1 RT per BFS depth level)
 
 ---
 
@@ -27,45 +25,49 @@ A `Setsum` is a commutative, invertible hash over a set of items. Its key proper
 - **Invertible**: `sum(A) - sum(B) = sum(A \ B)` when B ⊆ A
 - **Order-independent**: inserting items in any order gives the same sum
 
-This allows the primary to compute what a replica is missing by subtraction alone — and at trie leaves, to identify up to 2 missing items without a key exchange.
+This allows the primary to compute what a replica is missing by subtraction alone — and at trie leaves, to identify up to 3 missing items without a full key exchange.
 
 ---
 
 ## The Two Sync Paths
 
-### Path 1: Fast Path (Setsum Peeling)
+### Path 1: Sequence-Based Fast Path
 
-The replica sends its `(Sum, Count)` tuple to primary. The primary subtracts to find the diff sum and count, then tries to identify the missing items by searching its recent insertion history.
+Every insert is numbered with a monotonically increasing sequence number. Both stores (add and delete) maintain an insertion-order array alongside the sorted key store, with prefix sums over the insertion hashes.
+
+The replica sends `(insertionCount, totalSum)` for each store. The primary verifies that `insertionPrefixSum[replicaCount] == replicaSum` — i.e. the replica holds exactly the first N items from the primary's insertion history. If verified, the primary sends the tail items `[N+1..M]`.
 
 ```mermaid
 sequenceDiagram
     participant R as Replica
     participant P as Primary
 
-    R->>P: (Sum, Count)
-    Note over P: diff = PrimarySum - ReplicaSum<br/>missingCount = PrimaryCount - ReplicaCount
-    alt Identical (diff == 0)
-        P-->>R: Identical ✓
-    Note over P: Try to peel: find items whose<br/>hashes sum to diff
-    else Found (diff peeled successfully)
-        P-->>R: [missing items]
-        R->>R: Insert missing items
-    else Fallback (diff too large or not peelable)
-        P-->>R: Fallback
+    R->>P: [epoch, addCount, addSum, delCount, delSum]
+    Note over P: For each store: check<br/>insertionPrefixSum[count] == sum
+    alt Both stores: verified tail
+        P-->>R: [epoch, addTailItems, delTailItems]
+        R->>R: Insert tail items
+    else Sum mismatch (corruption/lost item)
+        P-->>R: Fallback signal
+        Note over R: Enter bidirectional trie sync
     end
 ```
 
-**When it works:** The diff is ≤ 10 items and all missing items appear in the primary's recent history (circular buffer of 128 entries).
+**When it works:** The replica's store is an exact prefix of the primary's insertion history. This covers the common case of a replica that simply fell behind — regardless of how many items it's missing. A diff of 1 item or 100,000 items both resolve in a single round trip.
 
-**Peeling algorithm:** Recursive backtracking search over recent history. For diffs of ≤ 3 items it searches the full 128-entry history; for diffs of 4–10 items it limits to the 20 most recent entries.
+**When it fails:** If the replica has corrupted data (lost an item, gained a spurious item), the sum check fails and the protocol falls back to trie sync. After trie repair, the replica resets its insertion-order tracking from its current store contents, so future fast paths work again.
 
 ---
 
-### Path 2: Trie Fallback
+### Path 2: Bidirectional Trie Sync (Fallback)
 
-A binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each trie node covers all keys sharing a common bit-prefix. The replica and primary exchange subtree counts, recursing only into subtrees where the primary has more items than the replica, until each differing subtree is small enough to resolve via Setsum peeling.
+A bidirectional binary-prefix trie traversal. Keys are compared bit-by-bit from the most significant bit. Each trie node covers all keys sharing a common bit-prefix. The replica and primary exchange subtree `(hash, count)` pairs, recursing into subtrees where either side differs, until each differing subtree is small enough to resolve via Setsum peeling.
 
-Because the protocol is unidirectional, **counts alone are sufficient to prune the trie** — no hashes are exchanged during normal BFS traversal. `primaryCount == replicaCount` guarantees the subtrees are identical (primary is always a superset, so equal counts imply equal sets); `primaryCount > replicaCount` means the primary has items the replica is missing.
+Unlike a unidirectional trie that can only add items, the bidirectional trie handles both directions in a single BFS pass:
+- Primary has items the replica doesn't → add to replica
+- Replica has items the primary doesn't → remove from replica
+
+This makes it the universal fallback for all mismatch scenarios: sum mismatch (replica corruption), epoch mismatch (compaction), or any other inconsistency.
 
 ```mermaid
 flowchart TD
@@ -76,56 +78,66 @@ flowchart TD
     C --> F["Prefix 10"]
     C --> G["Prefix 11"]
     D --> H["..."]
-    E --> I["Leaf: Setsum peel (1 or 2 missing)"]
-    F --> J["Counts match — skip ✓"]
+    E --> I["Leaf: Setsum peel (1–3 missing)"]
+    F --> J["Hash+count match — skip ✓"]
     G --> K["..."]
 ```
 
 #### BFS traversal
 
-The BFS processes one full depth level per round trip (level-batched). For each node, the primary returns the counts for both children. Children are enqueued only if `primaryCount > replicaCount` — equal counts mean identical subtrees and are skipped immediately.
+The BFS processes one full depth level per round trip (level-batched). For each node, the primary splits into `2^BitsPerExpansion` children and returns `(fingerprint, count)` for each. Children are enqueued only if their `(fingerprint, count)` differs between primary and replica — matching subtrees are skipped immediately.
+
+Expansion uses **truncated 64-bit fingerprints** instead of full 32-byte Setsums for mismatch detection. This is sufficient for comparison (~2^-64 false positive rate) and saves 24 bytes per entry — a significant reduction when tens of thousands of subtrees are compared. The full Setsum is only fetched on demand for leaf resolution (e.g. when the replica needs to peel locally).
 
 A node becomes a leaf when:
+- `primaryCount == 0` — primary has nothing here; replica's items are stale and removed locally (no RT needed), or
 - `replicaCount == 0` — replica has nothing here; primary sends all its items directly, or
-- `missingCount <= 2` — at most two items are missing; resolved via Setsum peeling (see below), or
-- `prefix.Length >= MaxPrefixDepth` — maximum trie depth reached.
+- `|primaryCount - replicaCount| <= 3` — a small count diff; resolved via Setsum peeling (see below), or
+- `depth >= MaxPrefixDepth` — maximum trie depth reached; full key exchange.
 
-All leaf resolutions and child-count expansions are batched into a **single combined round trip per BFS level** — leaf resolution and expansion happen in the same RT rather than two separate ones. If a leaf's primary-side prefix is too large for pair peeling, it is deferred to the expansion pass within the same round trip rather than dropped.
+All leaf resolutions and child-count expansions are batched into a **single combined round trip per BFS level**. If a leaf's peeling attempt fails, it is deferred to the expansion pass within the same round trip.
 
 ```mermaid
 sequenceDiagram
     participant R as Replica
     participant P as Primary
 
-    R->>P: GetPrefixInfo(Root)
-    P-->>R: rootCount
-
     loop BFS — one round trip per depth level (combined leaf + expansion)
         Note over R: Classify nodes: leaves vs interior
-        R->>P: Leaf: prefixSum [batched]<br/>Interior: GetChildrenCounts [batched]
-        Note over P: Leaves: diff = primarySum - replicaSum<br/>Interior: split and return child counts
-        P-->>R: Leaf results + child counts
-        Note over R: Peel failures deferred to expansion in same RT<br/>Skip children where primaryCount == replicaCount
+        R->>P: Leaf: prefixSum [batched]<br/>Interior: GetChildrenInfo [batched]
+        Note over P: Leaves: diff = primarySum - replicaSum<br/>Interior: split and return child (fingerprint, count) pairs
+        P-->>R: Leaf results + child info
+        Note over R: Peel failures deferred to expansion in same RT<br/>Skip children where (fingerprint, count) matches
     end
 
-    R->>R: Sort and insert received items
+    R->>R: Sort and apply received adds/removes
 ```
 
 #### Leaf resolution via Setsum peeling
 
-At each leaf the replica sends only its `prefixSum` — 32 bytes. The primary computes:
+Leaf resolution handles three directional cases:
+
+**Primary ahead** (`signedDiff > 0`): The replica sends its `prefixSum` (32 bytes). The primary computes `diff = primaryPrefixSum - replicaPrefixSum` and peels the missing items from the diff.
+
+**Replica ahead** (`signedDiff < 0`): The replica requests the full primary hash (32 bytes) and peels locally — identifying items it holds that the primary doesn't. If the expansion already provided the full hash (e.g. at the root level), this resolves with zero wire traffic.
+
+**Same count, different hash** (`signedDiff == 0`): Expanded further — both sides have the same count but different content, so descending reveals where the actual differences are.
+
+The peeling itself works on the Setsum diff:
 
 ```
 diff = primaryPrefixSum - replicaPrefixSum
 ```
 
-**missingCount == 1:** `diff` equals exactly one item's hash. The primary does one linear scan over its items under that prefix and returns the matching key. No key list is exchanged — only the 32-byte summary goes up and the single key comes back.
+**k=1:** `diff` equals exactly one item's hash. Linear scan over items under the prefix.
 
-**missingCount == 2:** `diff` equals the sum of exactly two items' hashes. The primary tries all O(n²) pairs of items under the prefix, checking whether `hash[i] + hash[j] == diff`. This is only attempted when the primary holds at most `MaxPrimaryCountForPairPeel` (512) items under that prefix, keeping the search space bounded (≤ 262,144 pairs). If the prefix is larger the primary returns `Fallback` and the replica descends further.
+**k=2:** `diff` equals the sum of two items' hashes. O(n²) pair scan, guarded by `MaxPrimaryCountForPairPeel` (512 items).
 
-For `replicaCount == 0` the primary simply returns all its items under the prefix directly, since there is no replica sum to subtract from.
+**k=3:** O(n²) scan with a stack-allocated hash-table probe for the third item. Guarded by a count limit of 256. The temporary table is 4 KB on the stack — no heap allocation.
 
-Both scans read directly from the stored `_hashes[]` array in `SortedKeyStore` — no re-hashing of keys is performed, and no key copies are allocated until a match is confirmed.
+For `replicaCount == 0` the primary simply returns all its items under the prefix directly.
+
+All scans read directly from the stored `_hashes[]` array in `SortedKeyStore` — no re-hashing of keys is performed, and no key copies are allocated until a match is confirmed.
 
 ---
 
@@ -148,7 +160,9 @@ graph LR
 
 **Range query**: `RangeInfo(lo, hi)` binary-searches for `start` and `end`, then returns `prefixSums[end] - prefixSums[start]` in O(log N).
 
-**Peeling scan**: `TryPeelRange(lo, hi, diff, maxCount)` walks `_hashes[start..end]` directly for both the linear (missingCount==1) and pair (missingCount==2) scans. Keys are only copied off `_data` when a match is confirmed — the miss path allocates nothing.
+**Peeling scan**: `TryPeelRangeByIndex(start, end, diff, maxCount)` walks `_hashes[start..end]` directly for the linear (k=1), pair (k=2), and triple (k=3) scans. The k=3 scan uses a stack-allocated 4 KB hash table for O(1) third-item lookups — no heap allocation. Keys are only copied off `_data` when a match is confirmed — the miss path allocates nothing.
+
+**Descendant splits**: `GetDescendantSplits(start, end, depth, bits)` recursively bisects a range into `2^bits` sub-ranges at successive bit depths, returning boundary indices. Used by multi-bit expansion to split a parent into all children in one pass.
 
 **Pending buffer**: New insertions go into an unsorted `_pending` buffer. It is radix-sorted and merged into the main store lazily on the next query — avoiding repeated O(N log N) sorts during bulk inserts.
 
@@ -156,9 +170,30 @@ graph LR
 
 ---
 
-## Why Setsum Works for Trie Leaves
+## Insertion-Order Tracking
 
-The Setsums used for fast-path peeling and the Setsums used at trie leaves for `missingCount <= 2` resolution are **not independent** — they are just computed over different subsets of the data. During BFS traversal no hashes are exchanged at all; Setsums only appear at leaves where the replica sends its `prefixSum` for primary to peel against.
+`ReconcilableSet` maintains a parallel set of arrays alongside `SortedKeyStore`:
+
+```mermaid
+graph LR
+    subgraph "Insertion-order arrays"
+        direction TB
+        K["_insertionKeys [ k₀ | k₁ | k₂ | ... | kₘ ] (in insertion order)"]
+        H["_insertionHashes [ h₀ | h₁ | h₂ | ... | hₘ ]"]
+        PS["_insertionPrefixSums [ 0 | h₀ | h₀+h₁ | ... | Σhashes ]"]
+    end
+
+    K -- "parallel" --> H
+    H -- "cumulative sum" --> PS
+```
+
+The prefix sum at index N gives the total hash of the first N inserted items. This enables O(1) verification that a replica holds exactly the primary's first N items: just compare `insertionPrefixSum[N]` with the replica's reported sum.
+
+**`ResetInsertionOrder()`** rebuilds the insertion-order arrays from the current sorted store contents. Called after any operation that invalidates insertion order: compaction (keys removed from sorted store), epoch repair, trie sync fallback, or `DeleteBulkPresorted`. After reset, `InsertionCount == Count()` and future inserts resume appending normally.
+
+---
+
+## Why Setsum Works for Trie Leaves
 
 Every key `k` has exactly one per-item hash `h_k = Setsum.Hash(k)`, computed once on insertion. The trie node hash for any prefix is simply the sum of `h_k` over all keys under that prefix — recoverable in O(log N) from the prefix-sum array.
 
@@ -178,34 +213,9 @@ diff = primaryPrefixSum - replicaPrefixSum = h_missing1 + h_missing2
 
 Primary tries all pairs `(i, j)` and checks `_hashes[i] + _hashes[j] == diff`. Both scans reuse the hashes already computed on insertion — `Setsum.Hash` is never called during leaf resolution.
 
-```mermaid
-graph TD
-    subgraph "Insert(key)"
-        HK["h_k = Setsum.Hash(key) — computed once"]
-    end
-
-    subgraph "Fast-path peeling"
-        HH["_historyHashes[i] = h_k"]
-        PE["Backtracker sums candidate h_k values<br/>and checks against diff"]
-        HH --> PE
-    end
-
-    subgraph "Trie leaf resolution"
-        PS["_prefixSums: cumulative sum of h_k values"]
-        RH["diff = primaryPrefixSum - replicaPrefixSum"]
-        SC["missingCount==1: scan for _hashes[i] == diff<br/>missingCount==2: scan pairs for _hashes[i]+_hashes[j] == diff"]
-        PS --> RH --> SC
-    end
-
-    HK --> HH
-    HK --> PS
-```
-
 ### Implicit trie from a flat array
 
 Because Setsum is additive and invertible, the full binary-prefix trie is implicitly encoded in `_prefixSums` — no tree nodes are materialised. Any subtree hash is recovered in O(log N) via two binary searches to find the range boundaries, and one O(1) subtraction `prefixSums[end] - prefixSums[start]`.
-
-This is only needed at leaves: during BFS traversal counts alone drive the descent, so no subtree hashes are exchanged at all. Hashes only appear at leaves where the replica sends its `prefixSum` and the primary computes `primaryPrefixSum` for that prefix to peel against.
 
 ```mermaid
 graph LR
@@ -238,28 +248,42 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 
 ---
 
+## Wire Optimizations
+
+Several optimizations reduce the bytes transferred during trie sync:
+
+**Truncated fingerprints for expansion.** Expansion responses use 8-byte fingerprints (`Setsum.Fingerprint64()`) instead of full 32-byte Setsums. This saves 24 bytes per child entry. With ~57K entries in a typical large-diff sync, this reduces Rx by ~1.4 MB. The full Setsum is only fetched on demand when a leaf needs it for peeling (32 bytes per leaf).
+
+**Local peeling for replica-ahead leaves.** When the replica has items the primary doesn't (`signedDiff < 0`), the replica can peel locally using the primary's hash — no keys travel over the wire for removals. The only cost is fetching the full primary hash (32 bytes) when the expansion only provided a fingerprint.
+
+**Asymmetric full key exchange.** At maximum trie depth, the replica sends its keys and the primary responds with only the keys to add. The replica computes removals locally by diffing the two sorted lists. This halves the response size compared to sending both adds and removes.
+
+**Combined leaf + expansion round trips.** Leaf resolution and child expansion are batched into a single round trip per BFS level, avoiding separate network calls for each phase.
+
+---
+
 ## Complexity Summary
 
 | Scenario | Round Trips | Bytes | Notes |
 |---|---|---|---|
-| Sets are identical | 1 | ~70 | Combined epoch + both fast-paths in single RT |
-| Replica missing ≤ 3 items | 1 | ~170 | Combined RT; fast-path resolves both stores |
-| Replica missing 4–10 items | 1 | ~390 | Combined RT; fast-path resolves both stores |
-| Large diff (D missing, N total) | 1 + O(log N) | O(D × log(N/D) + D × 32) | 1 combined RT (epoch + fast-path fallback) + level-batched BFS with 1 RT per depth level |
-| Epoch mismatch (empty del store) | 1 + O(log N) | O(D × 32) | 1 combined RT (returns root info) + epoch repair BFS; delete store skipped |
-| Epoch mismatch (non-empty del store) | 1 + O(log N) + O(log N) | O(D × 32) | 1 combined RT + epoch repair BFS + delete store BFS (root piggybacked) |
+| Sets are identical | 1 | ~76 | Combined epoch + sequence check for both stores |
+| Replica behind by D items | 1 | ~76 + D×32 | Tail send — works for any D, not just small diffs |
+| Replica corrupted (sum mismatch) | 1 + O(log N) | O(D × 32) | 1 RT detects mismatch + bidirectional BFS |
+| Epoch mismatch (empty del store) | 1 + O(log N) | O(D × 32) | 1 RT (returns root info) + bidirectional BFS; delete store skipped |
+| Epoch mismatch (non-empty del store) | 1 + O(log N) + O(log N) | O(D × 32) | 1 RT + add-store BFS + delete-store BFS (root piggybacked) |
 
-The epoch handshake and both store fast-paths are pipelined into a **single combined round trip**. The replica sends `[epoch, addSum, addCount, delSum, delCount]` and the primary responds with either `[epoch, addOutcome, addPayload, delOutcome, delPayload]` (epoch match) or `[epoch, addRootHash, addRootCount, delRootHash, delRootCount]` (epoch mismatch). If both stores resolve via fast-path, the entire sync completes in 1 RT. If either store falls back, only that store enters BFS. On epoch mismatch, the root info for both stores is piggybacked onto the response, eliminating separate root query round trips.
+The epoch handshake and both store sequence checks are pipelined into a **single combined round trip**. The replica sends `[epoch, addCount, addSum, delCount, delSum]` and the primary responds with either tail items (fast path) or a fallback signal. If both stores resolve via fast path, the entire sync completes in 1 RT — regardless of diff size.
 
-Within the BFS, leaf resolution and child-count expansion are combined into a **single RT per depth level**, so the total trip count is bounded by the trie depth — O(log N) — not by the number of differing items. For D=10,000 missing items in N=1,000,000 total: ~22 round trips and ~575 KB transferred. The raw diff is 320 KB; total store size is 32 MB.
+When fallback is needed, the bidirectional trie sync uses one RT per BFS depth level, bounded by O(log N). Both primary and replica store bounds are carried through the BFS, so child splits reuse parent bounds via O(log range) scans rather than O(log N) binary searches from scratch.
 
-Both the unidirectional trie sync and the bidirectional epoch repair BFS carry pre-computed store indices for **both** primary `(PrimaryStart, PrimaryEnd)` and replica `(ReplicaStart, ReplicaEnd)` through each level. Child splits reuse the parent's bounds via a single O(log range) scan rather than a full O(log N) binary search from scratch, eliminating binary searches on both sides during traversal.
+After any trie sync, the replica resets its insertion-order tracking from its current store contents. The replica's count then equals the primary's count, so future tail sends work naturally (option B — no explicit sequence exchange needed).
 
 ---
 
 ## Delete Protocol
 
-Set reconciliation alone is not enough: a key the primary has removed should eventually disappear from replicas too. Deletes are tracked separately so removals can be synced with the same unidirectional guarantees as insertions, without complicating the trie protocol.
+Set reconciliation alone is not enough: a key the primary has removed should eventually disappear from replicas too. Deletes are tracked separately so removals can be synced with the same guarantees as insertions, without complicating the trie protocol.
+
 ### Data Model
 
 Each node owns two append-only stores:
@@ -268,7 +292,7 @@ Each node owns two append-only stores:
 - **`DeleteStore`** — tombstones for deleted keys, synced primary→replica.
 - **Effective membership** — `AddStore − DeleteStore`, computed at query time.
 
-Both stores are strictly append-only. This keeps the unidirectional trie sync valid across compactions: the primary is always a superset of the replica within each store.
+Both stores are strictly append-only. This keeps the protocol valid across compactions: the primary is always a superset of the replica within each store.
 
 ### Why Epochs Exist
 
@@ -278,7 +302,7 @@ Without epochs you must either keep tombstones forever, or risk replicas silentl
 
 ### Primary Compaction
 
-Compaction works by applying all pending tombstones to `AddStore`, wiping `DeleteStore`, and incrementing `DeleteEpoch`.
+Compaction works by applying all pending tombstones to `AddStore`, wiping `DeleteStore`, and incrementing `DeleteEpoch`. The `AddStore`'s insertion-order tracking is reset from the post-compaction state so the sequence-based fast path starts fresh.
 
 ### Normal Sync Flow (No Epoch Mismatch)
 
@@ -287,18 +311,19 @@ sequenceDiagram
     participant R as Replica
     participant P as Primary
 
-    R->>P: [epoch, addSum, addCount, delSum, delCount]
-    Note over P: Evaluate both fast-paths
-    P-->>R: [epoch, addOutcome, addPayload, delOutcome, delPayload]
-
-    alt Both Identical or Found
-        R->>R: Insert any missing keys
-    else Either store returns Fallback
-        Note over R: Enter BFS trie sync for that store
+    R->>P: [epoch, addCount, addSum, delCount, delSum]
+    Note over P: Verify sequence prefix sums
+    alt Both stores: tail verified
+        P-->>R: [epoch, addTailItems, delTailItems]
+        R->>R: Insert tail items
+    else Sum mismatch on a store
+        P-->>R: Fallback signal for that store
+        Note over R: Bidirectional trie sync for mismatched store
+        Note over R: Reset insertion order after repair
     end
 ```
 
-The epoch handshake and both store fast-paths are pipelined into a single round trip. After both stores sync, the effective set (`AddStore − DeleteStore`) is consistent at query time. Tombstones are not physically applied to `AddStore` on the normal path — the subtraction is computed dynamically.
+The epoch handshake and both store sequence checks are pipelined into a single round trip. After both stores sync, the effective set (`AddStore − DeleteStore`) is consistent at query time. Tombstones are not physically applied to `AddStore` on the normal path — the subtraction is computed dynamically.
 
 ### Epoch-Mismatch Recovery
 
@@ -309,31 +334,37 @@ sequenceDiagram
     participant R as Replica
     participant P as Primary
 
-    R->>P: [epoch, addSum, addCount, delSum, delCount]
-    Note over P: Epoch mismatch detected —<br/>skip fast-paths, send root info instead
-    P-->>R: [epoch, addRootHash, addRootCount, delRootHash, delRootCount]
+    R->>P: [epoch, addCount, addSum, delCount, delSum]
+    Note over P: Epoch mismatch detected —<br/>skip fast-path, send root info instead
+    P-->>R: [newEpoch, addRootHash, addRootCount, delRootHash, delRootCount]
 
     Note over R: Materialize local DeleteStore<br/>into AddStore, then wipe DeleteStore
 
-    loop Epoch repair BFS (root info already available — no extra RT)
-        R->>P: Bidirectional prefix-diff
+    loop Bidirectional trie sync (root info already available — no extra RT)
+        R->>P: Prefix-diff queries
         P-->>R: Keys to add/remove
     end
 
+    Note over R: Reset insertion order on AddStore
     Note over R: Set DeleteEpoch = primary.DeleteEpoch
 
     alt Primary DeleteStore empty (just compacted)
         Note over R: Skip — both delete stores empty
     else Primary DeleteStore has items
-        Note over R: Trie sync for DeleteStore<br/>(root count already available — no extra RT)
+        Note over R: Bidirectional trie sync for DeleteStore<br/>(root info already available — no extra RT)
+        Note over R: Reset insertion order on DeleteStore
     end
 ```
 
-When the primary detects an epoch mismatch in the combined request, it **skips fast-path evaluation** (the results would be discarded anyway) and instead responds with the root `(hash, count)` for both stores. This saves 2 round trips: the epoch repair root query and the delete store root query are both eliminated. If the primary's delete store is empty after compaction (the common case), the delete store sync is skipped entirely.
+When the primary detects an epoch mismatch, it **skips fast-path evaluation** and instead responds with the root `(hash, count)` for both stores. This eliminates separate root query round trips. If the primary's delete store is empty after compaction (the common case), the delete store sync is skipped entirely.
 
-The repair phase uses a **bidirectional** binary-prefix trie traversal that handles both directions in a single BFS pass: keys the replica is missing (primary added new items) and keys the replica holds that the primary has compacted away. Because the primary is the authority after compaction, its view of `AddStore` is definitive.
+The repair uses a **bidirectional** trie traversal that handles both directions in a single BFS pass: keys the replica is missing (primary added new items) and keys the replica holds that the primary has compacted away. After repair, insertion-order tracking is rebuilt on both stores so the sequence-based fast path works again.
 
-Unlike the normal unidirectional BFS which exchanges counts only, the epoch repair BFS exchanges `(hash, count)` per node — hashes are required to detect divergence when counts are equal but items differ (i.e. an equal number of adds and removes under a prefix). Each BFS level uses a single round trip that batches both leaf resolution and child expansion together. Both primary and replica store bounds are carried through the BFS, eliminating binary searches on both sides.
+### Replica Data Corruption
+
+If a replica's data becomes inconsistent (lost items, spurious items, disk corruption), the sequence-based fast path will detect the sum mismatch and signal fallback. The bidirectional trie sync then resolves all differences — adding missing keys and removing spurious ones — in a single BFS pass. After repair, insertion-order tracking is rebuilt so subsequent syncs resume using the fast path.
+
+This means the protocol self-heals from arbitrary replica corruption without any special handling: the same trie-sync fallback used for epoch mismatches handles corruption recovery.
 
 ---
 
@@ -341,9 +372,11 @@ Unlike the normal unidirectional BFS which exchanges counts only, the epoch repa
 
 | File | Purpose |
 |---|---|
-| `ReconcilableSet.cs` | High-level set with fast-path peeling, trie delegation, and leaf resolution |
-| `SortedKeyStore.cs` | Flat sorted array store with O(log N) range-hash and zero-allocation peeling scan |
-| `BitPrefix.cs` | Bit-level trie prefix for binary-prefix traversal |
+| `Setsum.cs` | Commutative, invertible 256-bit hash with SIMD arithmetic and 64-bit fingerprint extraction |
+| `ReconcilableSet.cs` | High-level set with sequence-based fast path, insertion-order tracking, trie delegation, and leaf resolution |
+| `SortedKeyStore.cs` | Flat sorted array store with O(log N) range-hash, zero-allocation peeling (k=1/2/3), and descendant splitting |
+| `BitPrefix.cs` | Bit-level trie prefix with multi-bit extension for binary-prefix traversal |
 | `ReconcileResult.cs` | Discriminated union result type (`Identical / Found / Fallback`) |
-| `SyncNodes.cs` | Syncs a primary node with a replicate, counting time, round-trips and bytes |
-| `SyncableNode.cs` | Per-node add/delete stores, compaction, and epoch management |
+| `SyncNodes.cs` | Wire protocol: sequence request/response, epoch mismatch, fingerprint expansion, byte accounting |
+| `SyncNodes.Triesync.cs` | Bidirectional trie sync BFS with combined leaf+expansion RTs and truncated fingerprints |
+| `SyncableNode.cs` | Per-node add/delete stores, compaction, tombstone materialization, and epoch management |

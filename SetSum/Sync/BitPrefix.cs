@@ -52,7 +52,7 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
     }
 
     /// <summary>
-    /// Returns a new extended bit prefix
+    /// Returns a new prefix extended by a single bit.
     /// </summary>
     public BitPrefix Extend(int bit)
     {
@@ -60,6 +60,17 @@ public readonly struct BitPrefix(ulong bits, int length) : IEquatable<BitPrefix>
         ulong newBits = Bits;
         if (bit != 0) newBits |= 1UL << (63 - Length);
         return new BitPrefix(newBits, Length + 1);
+    }
+
+    /// <summary>
+    /// Returns a new prefix extended by <paramref name="bits"/> bits from <paramref name="value"/>.
+    /// The MSB of <paramref name="value"/> becomes the first appended bit.
+    /// </summary>
+    public BitPrefix ExtendN(int value, int bits)
+    {
+        if (Length + bits > 64) throw new InvalidOperationException("Prefix too deep.");
+        ulong mask = (ulong)value << (64 - Length - bits);
+        return new BitPrefix(Bits | mask, Length + bits);
     }
 
     /// <summary>

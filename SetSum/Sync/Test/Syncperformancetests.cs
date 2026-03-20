@@ -71,22 +71,25 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void Perf_Add_LargeDiff_FastPathBailout_IsImmediate()
+    public void Perf_Add_LargeDiff_FastPathSendsTail()
     {
-        // Verifies the fast-path bails without doing expensive trie work.
+        // With sequence-based fast path, even large diffs resolve in one RT
+        // because the tail is always available. Verify it returns Found, not Fallback.
         var (primary, replica) = MakeNodesWithSharedKeys(50_000);
         for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
 
         var sw = Stopwatch.StartNew();
-        var result = primary.AddStore.TryReconcile(replica.AddStore.Sum(), replica.AddStore.Count());
+        var result = primary.AddStore.TryReconcileTail(
+            replica.AddStore.InsertionCount, replica.AddStore.Sum());
         sw.Stop();
 
-        Assert.Equal(ReconcileOutcome.Fallback, result.Outcome);
-        _output.WriteLine($"Fast-path bailout – {sw.Elapsed.TotalMilliseconds:F2} ms");
+        Assert.Equal(ReconcileOutcome.Found, result.Outcome);
+        Assert.Equal(50_000, result.MissingItems!.Count);
+        _output.WriteLine($"Large tail send – {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     [Fact]
-    public void Perf_Add_LargeDiff_TrieFallback_RecoversEfficiently()
+    public void Perf_Add_LargeDiff_FastPath_RecoversEfficiently()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
         int newItems = 10_000;
@@ -100,10 +103,12 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         Assert.True(sim.TrySync(_output));
         sw.Stop();
 
-        Assert.True(sim.UsedFallback);
+        // With sequence-based protocol, this resolves via fast path (tail send), not trie fallback.
+        Assert.False(sim.UsedFallback);
+        Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(newItems, sim.ItemsAdded);
         Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        _output.WriteLine($"Trie fallback – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Large fast path – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]

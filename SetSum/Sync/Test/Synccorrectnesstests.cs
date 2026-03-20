@@ -271,6 +271,118 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         Assert.Equal(sumBefore, primary.Sum());
     }
 
+    // ── Replica data corruption → fallback recovery ─────────────────────────
+
+    [Fact]
+    public void Corruption_ReplicaLostOneItem_FallbackRecovers()
+    {
+        // Replica silently loses a key from its AddStore (e.g. disk corruption).
+        // The sequence-based fast path should detect the sum mismatch and fall
+        // back to bidirectional trie sync, which recovers the lost key.
+        var (primary, replica) = MakeNodesWithSharedKeys(100);
+
+        // Corrupt the replica: delete one key directly from the store.
+        var replicaKeys = replica.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var lostKey = replicaKeys[42];
+        replica.AddStore.DeleteBulkPresorted([lostKey]);
+        replica.AddStore.Prepare();
+
+        var sim = new SyncNodes(replica, primary);
+        Assert.True(sim.TrySync(_output));
+
+        Assert.True(sim.UsedFallback, "sum mismatch should trigger trie fallback");
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+    }
+
+    [Fact]
+    public void Corruption_ReplicaLostMultipleItems_FallbackRecovers()
+    {
+        // Replica loses several scattered keys. The trie sync should find and
+        // recover all of them in one pass.
+        var (primary, replica) = MakeNodesWithSharedKeys(200);
+
+        var replicaKeys = replica.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var lostKeys = new[] { replicaKeys[10], replicaKeys[50], replicaKeys[100], replicaKeys[150] }
+            .OrderBy(k => k, ByteComparer.Instance).ToList();
+        replica.AddStore.DeleteBulkPresorted(lostKeys);
+        replica.AddStore.Prepare();
+
+        var sim = new SyncNodes(replica, primary);
+        Assert.True(sim.TrySync(_output));
+
+        Assert.True(sim.UsedFallback);
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+    }
+
+    [Fact]
+    public void Corruption_ReplicaHasExtraItem_FallbackRemovesIt()
+    {
+        // Replica somehow gained an extra key that the primary doesn't have.
+        // The bidirectional trie sync should detect and remove it.
+        var (primary, replica) = MakeNodesWithSharedKeys(100);
+
+        var extraKey = RandomKey();
+        replica.AddStore.Insert(extraKey);
+        replica.AddStore.Prepare();
+
+        var sim = new SyncNodes(replica, primary);
+        Assert.True(sim.TrySync(_output));
+
+        Assert.True(sim.UsedFallback);
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+    }
+
+    [Fact]
+    public void Corruption_ReplicaLostItemAndPrimaryAdded_BothResolved()
+    {
+        // Replica lost a key AND the primary added new items since the last sync.
+        // The fallback must handle both: re-adding the lost key and adding the new ones.
+        var (primary, replica) = MakeNodesWithSharedKeys(100);
+
+        // Primary adds new items.
+        for (int i = 0; i < 5; i++) primary.Insert(RandomKey());
+
+        // Corrupt the replica: lose one of the original shared keys.
+        var replicaKeys = replica.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        replica.AddStore.DeleteBulkPresorted([replicaKeys[30]]);
+        replica.AddStore.Prepare();
+
+        var sim = new SyncNodes(replica, primary);
+        Assert.True(sim.TrySync(_output));
+
+        Assert.True(sim.UsedFallback);
+        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+    }
+
+    [Fact]
+    public void Corruption_ReplicaDeleteStoreLostItem_FallbackRecovers()
+    {
+        // Replica loses a tombstone from its DeleteStore. The sync should detect
+        // the mismatch and re-deliver the tombstone via trie fallback.
+        var (primary, replica) = MakeNodesWithSharedKeys(50);
+        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+
+        // Primary deletes 10 keys, sync to replica.
+        primary.DeleteBulk(sharedKeys.Take(10));
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+
+        // Corrupt the replica's delete store: remove one tombstone.
+        var tombstones = replica.DeleteStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        replica.DeleteStore.DeleteBulkPresorted([tombstones[3]]);
+        replica.DeleteStore.Prepare();
+
+        var sim = new SyncNodes(replica, primary);
+        Assert.True(sim.TrySync(_output));
+
+        Assert.True(sim.UsedFallback);
+        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
+        Assert.Equal(primary.DeleteStore.Count(), replica.DeleteStore.Count());
+    }
+
     // ── SortedKeyStore.Remove (single-key pending-delete path) ───────────────
 
     [Fact]

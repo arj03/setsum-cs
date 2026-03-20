@@ -1,55 +1,50 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 
 namespace Setsum.Sync;
 
 /// <summary>
 /// A set of fixed-size (32-byte) keys supporting:
-///   - Fast-path reconciliation via Setsum peeling for small diffs
-///   - Binary-prefix trie sync for large diffs, using SortedKeyStore for O(log N) prefix queries
+///   - Sequence-based fast-path reconciliation: every insert is numbered, so the primary
+///     can verify a replica's state by prefix sum and send exactly the tail items it's missing.
+///   - Binary-prefix trie sync for arbitrary diffs (fallback), using SortedKeyStore for O(log N) prefix queries.
 /// </summary>
 public class ReconcilableSet
 {
-    private const int HistorySize = 256;
-    private const int MaxDiffForRecentScan = 10;
-    private const int RecentScanLimit = 40;
-
     // 512² = 262,144 pairs. Higher cap needed because LeafThreshold=3 means
     // TryReconcilePrefix is called one level higher, where primaryCount is larger.
     private const int MaxPrimaryCountForPairPeel = 512;
-
-    // Flat open-addressing table: maps Setsum.GetHashCode() → ring slot.
-    // Deliberately larger than HistorySize to minimise collisions (~6% load factor).
-    // Last-writer-wins on collision — stale hits are caught by _historyHashes verification.
-    private const int HashTableSize = 4096;
-    private const int HashTableMask = HashTableSize - 1;
 
     public Setsum Sum() => _store.TotalInfo().Hash;
 
     public int Count() => _store.Count();
 
-    // Circular buffer of recent insertions for fast-path peeling.
-    // Stores (key, hash) pairs so the peeling backtracker can verify candidates
-    // without re-hashing. The hash values here are the same h_k that live in
-    // SortedKeyStore._hashes — computed once in Insert, copied to both places.
-    private readonly byte[][] _historyKeys;
-    private readonly Setsum[] _historyHashes;
-    private int _head = 0;
-    private int _historyCount = 0;
+    // Insertion-order tracking: every insert is appended here, giving each key
+    // an implicit sequence number (its index). Prefix sums over the insertion
+    // order allow O(1) verification that a replica holds exactly our first N items.
+    private byte[][] _insertionKeys = new byte[16][];
+    private Setsum[] _insertionHashes = new Setsum[16];
+    private Setsum[] _insertionPrefixSums = new Setsum[17]; // [i] = sum of hashes[0..i-1]
+    private int _insertionCount;
+    private bool _insertionPrefixSumsDirty;
 
-    // Hash index: Setsum.GetHashCode() & HashTableMask → ring slot.
-    // Replaces Dictionary<Setsum,int> to avoid unbounded growth and cache thrashing.
-    private readonly int[] _hashTable;
+    // When true, the insertion-order arrays are stale (e.g. after DeleteBulkPresorted).
+    // TryReconcileTail returns Fallback and AppendInsertion is a no-op.
+    // ResetInsertionOrder clears this flag.
+    private bool _insertionOrderInvalid;
 
     private readonly SortedKeyStore _store;
 
     public ReconcilableSet()
     {
-        _historyKeys = new byte[HistorySize][];
-        _historyHashes = new Setsum[HistorySize];
-        _hashTable = new int[HashTableSize];
-        Array.Fill(_hashTable, -1);
         _store = new SortedKeyStore();
     }
+
+    /// <summary>
+    /// The number of items tracked in insertion order.
+    /// After a normal insert flow this equals Count(), but after
+    /// a ResetInsertionOrder call it is rebuilt from scratch.
+    /// </summary>
+    public int InsertionCount => _insertionCount;
 
     // -------------------------------------------------------------------------
     // Insertion
@@ -61,7 +56,7 @@ public class ReconcilableSet
             throw new ArgumentException($"Item key must be {Setsum.DigestSize} bytes.");
 
         var itemHash = Setsum.Hash(itemKey);
-        RecordHistory(itemKey, itemHash);
+        AppendInsertion(itemKey, itemHash);
         _store.Add(itemKey, itemHash);
     }
 
@@ -79,6 +74,8 @@ public class ReconcilableSet
 
     /// <summary>
     /// Removes multiple keys that are already sorted — single O(N) merge pass.
+    /// Invalidates the insertion-order arrays (they become stale). Call
+    /// <see cref="ResetInsertionOrder"/> when ready to rebuild them.
     /// </summary>
     public void DeleteBulkPresorted(List<byte[]> items)
     {
@@ -91,6 +88,7 @@ public class ReconcilableSet
             items[i].CopyTo(flat, i * Setsum.DigestSize);
 
         _store.RemoveSorted(flat, n);
+        _insertionOrderInvalid = true;
     }
 
     public bool Contains(byte[] key) => _store.Contains(key);
@@ -99,6 +97,66 @@ public class ReconcilableSet
     /// Sorts any pending keys and builds the prefix sum table.
     /// </summary>
     public void Prepare() => _store.Prepare();
+
+    // -------------------------------------------------------------------------
+    // Insertion-order queries (sequence-based fast path)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Rebuilds the insertion-order arrays from the current sorted store contents.
+    /// Called after epoch repair or any operation that changes the store without
+    /// going through Insert/InsertBulkPresorted (e.g. DeleteBulkPresorted during compaction).
+    /// After this call, InsertionCount == Count() and the prefix sums are consistent.
+    /// </summary>
+    public void ResetInsertionOrder()
+    {
+        _store.Prepare();
+        var allItems = _store.AllWithHashes().ToArray();
+        _insertionCount = 0;
+        EnsureInsertionCapacity(allItems.Length);
+
+        for (int i = 0; i < allItems.Length; i++)
+        {
+            _insertionKeys[i] = allItems[i].Key;
+            _insertionHashes[i] = allItems[i].Hash;
+        }
+        _insertionCount = allItems.Length;
+        _insertionPrefixSumsDirty = true;
+        _insertionOrderInvalid = false;
+    }
+
+    /// <summary>
+    /// Called by the primary: given the replica's (count, sum), check whether
+    /// the replica has exactly our first <paramref name="replicaCount"/> items.
+    /// If so, return the tail items. Otherwise signal fallback.
+    /// </summary>
+    public ReconcileResult TryReconcileTail(int replicaCount, Setsum replicaSum)
+    {
+        if (_insertionOrderInvalid)
+            return ReconcileResult.Fallback();
+
+        if (replicaCount == _insertionCount)
+        {
+            // Same count — check if sums match.
+            return Sum() == replicaSum ? ReconcileResult.Identical() : ReconcileResult.Fallback();
+        }
+
+        if (replicaCount > _insertionCount || replicaCount < 0)
+            return ReconcileResult.Fallback();
+
+        // Verify: sum of our first replicaCount items should equal replica's sum.
+        RebuildInsertionPrefixSums();
+        if (_insertionPrefixSums[replicaCount] != replicaSum)
+            return ReconcileResult.Fallback();
+
+        // Send tail items [replicaCount .. _insertionCount).
+        int tailCount = _insertionCount - replicaCount;
+        var tail = new List<byte[]>(tailCount);
+        for (int i = replicaCount; i < _insertionCount; i++)
+            tail.Add(_insertionKeys[i]);
+
+        return ReconcileResult.Found(tail);
+    }
 
     // -------------------------------------------------------------------------
     // Trie prefix queries (delegated to SortedKeyStore)
@@ -111,26 +169,6 @@ public class ReconcilableSet
         Span<byte> hi = stackalloc byte[Setsum.DigestSize];
         prefix.FillKeyRange(lo, hi);
         return _store.RangeInfo(lo, hi);
-    }
-
-    /// <summary>
-    /// Batched child info using pre-computed [start, end) bounds.
-    /// Returns child (hash, count) pairs for each node — no binary search.
-    /// Callers needing only counts can discard the hash fields.
-    /// </summary>
-    public List<(BitPrefix C0, Setsum H0, int Sc0, BitPrefix C1, Setsum H1, int Sc1)>
-        GetChildrenInfoBatchByIndex(
-            IReadOnlyList<(BitPrefix Prefix, int Depth, int Start, int End)> requests)
-    {
-        var results = new List<(BitPrefix, Setsum, int, BitPrefix, Setsum, int)>(requests.Count);
-        foreach (var (prefix, depth, start, end) in requests)
-        {
-            int split = _store.FindSplitPointByIndex(start, end, depth);
-            var (h0, c0) = _store.RangeInfoByIndex(start, split);
-            var (h1, c1) = _store.RangeInfoByIndex(split, end);
-            results.Add((prefix.Extend(0), h0, c0, prefix.Extend(1), h1, c1));
-        }
-        return results;
     }
 
     /// <summary>
@@ -154,8 +192,33 @@ public class ReconcilableSet
     }
 
     /// <summary>
+    /// Splits [start, end) into 2^<paramref name="bits"/> descendant sub-ranges and returns
+    /// boundary indices, hashes, and counts for each.
+    /// </summary>
+    internal (int[] Splits, Setsum[] Hashes, int[] Counts) GetDescendantInfoByIndex(
+        int start, int end, int depth, int bits)
+    {
+        int numChildren = 1 << bits;
+        int[] splits = _store.GetDescendantSplits(start, end, depth, bits);
+        var hashes = new Setsum[numChildren];
+        var counts = new int[numChildren];
+        for (int i = 0; i < numChildren; i++)
+        {
+            var (h, c) = _store.RangeInfoByIndex(splits[i], splits[i + 1]);
+            hashes[i] = h;
+            counts[i] = c;
+        }
+        return (splits, hashes, counts);
+    }
+
+    /// <summary>
     /// Leaf resolution using pre-computed [start, end) bounds — skips binary search entirely.
     /// Caller must have already called Prepare().
+    ///
+    /// Uses range-based peeling within the narrow prefix range. Insertion-order peeling
+    /// is not used here because this method is called from trie sync leaves where the
+    /// global backward scan over the last N insertions rarely hits items within the
+    /// specific prefix being resolved.
     /// </summary>
     internal ReconcileResult TryReconcilePrefixByIndex(int start, int end, Setsum replicaPrefixSum)
     {
@@ -167,6 +230,7 @@ public class ReconcilableSet
             return ReconcileResult.Found(_store.RangeByIndex(start, end).ToList());
 
         var diff = primaryPrefixSum - replicaPrefixSum;
+
         var found = _store.TryPeelRangeByIndex(start, end, diff, MaxPrimaryCountForPairPeel);
         return found is not null ? ReconcileResult.Found(found) : ReconcileResult.Fallback();
     }
@@ -192,124 +256,47 @@ public class ReconcilableSet
     }
 
     // -------------------------------------------------------------------------
-    // Fast-path reconciliation
+    // Insertion-order peeling
     // -------------------------------------------------------------------------
-
-    /// <summary>
-    /// Called by the primary: given the replica's (Sum, Count), return what it's missing.
-    ///
-    /// Complexity by missing count k:
-    ///   k == 1 : O(1)   — direct hash-index lookup
-    ///   k == 2 : O(n)   — complement scan via hash index (was O(n²) recursive)
-    ///   k == 3 : O(n²)  — for each pair (i,j), look up the required third via index
-    ///   k  > 3 : Fallback
-    /// </summary>
-    public ReconcileResult TryReconcile(Setsum replicaSum, long replicaCount)
-    {
-        var localSum = Sum();
-        if (localSum == replicaSum) return ReconcileResult.Identical();
-
-        long countDiff = Count() - replicaCount;
-        if (countDiff < 0) return ReconcileResult.Fallback(); // replica is ahead
-
-        int missingCount = (int)countDiff;
-        if (missingCount is <= 0 or > MaxDiffForRecentScan)
-            return ReconcileResult.Fallback();
-
-        int searchLimit = missingCount switch
-        {
-            1 => _historyCount,                 // O(1) via index — limit irrelevant
-            2 => Math.Min(128, _historyCount),  // scan 128 for idxA; complement found anywhere in 256-slot index
-            3 => Math.Min(128, _historyCount),  // same reasoning for outer loop
-            _ => Math.Min(RecentScanLimit, _historyCount)
-        };
-
-        var diff = localSum - replicaSum;
-
-        // k == 1: the diff IS the missing hash — single index probe.
-        if (missingCount == 1)
-        {
-            int slot = _hashTable[diff.GetHashCode() & HashTableMask];
-            if (slot < 0) return ReconcileResult.Fallback();
-            var key = _historyKeys[slot];
-            if (key is null || _historyHashes[slot] != diff) return ReconcileResult.Fallback();
-            return ReconcileResult.Found([key]);
-        }
-
-        // k == 2: for each h_i, the required partner is (diff - h_i).
-        // One index probe per entry.
-        if (missingCount == 2)
-        {
-            for (int offset = 0; offset < searchLimit; offset++)
-            {
-                int idxA = ((_head - 1 - offset) % HistorySize + HistorySize) % HistorySize;
-                var keyA = _historyKeys[idxA];
-                if (keyA is null) break;
-
-                var need = diff - _historyHashes[idxA];
-                int idxB = _hashTable[need.GetHashCode() & HashTableMask];
-                if (idxB < 0) continue;
-
-                var keyB = _historyKeys[idxB];
-                if (keyB is null || keyB == keyA || _historyHashes[idxB] != need) continue;
-
-                return ReconcileResult.Found([keyA, keyB]);
-            }
-            return ReconcileResult.Fallback();
-        }
-
-        // k == 3: for each pair (i, j), the required third hash is (diff - h_i - h_j).
-        // O(n²) pairs but each lookup is O(1), so O(n²) total.
-        if (missingCount == 3)
-        {
-            for (int oi = 0; oi < searchLimit; oi++)
-            {
-                int idxA = ((_head - 1 - oi) % HistorySize + HistorySize) % HistorySize;
-                var keyA = _historyKeys[idxA];
-                if (keyA is null) break;
-                var remainAB = diff - _historyHashes[idxA];
-
-                for (int oj = oi + 1; oj < searchLimit; oj++)
-                {
-                    int idxB = ((_head - 1 - oj) % HistorySize + HistorySize) % HistorySize;
-                    var keyB = _historyKeys[idxB];
-                    if (keyB is null) break;
-                    if (keyB == keyA) continue;
-
-                    var need = remainAB - _historyHashes[idxB];
-                    int idxC = _hashTable[need.GetHashCode() & HashTableMask];
-                    if (idxC < 0) continue;
-
-                    var keyC = _historyKeys[idxC];
-                    if (keyC is null || keyC == keyA || keyC == keyB) continue;
-                    if (_historyHashes[idxC] != need) continue;
-
-                    return ReconcileResult.Found([keyA, keyB, keyC]);
-                }
-            }
-
-            return ReconcileResult.Fallback();
-        }
-
-        // k > 3: fall back to the original recursive solver.
-        var result = new List<byte[]>(missingCount);
-        var foundRecursive = SolveRecursive(diff, missingCount, searchLimit, result,
-            new HashSet<byte[]>(ReferenceEqualityComparer.Instance));
-        return foundRecursive ? ReconcileResult.Found(result) : ReconcileResult.Fallback();
-    }
 
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
 
-    private void RecordHistory(byte[] key, Setsum hash)
+    private void AppendInsertion(byte[] key, Setsum hash)
     {
-        int slot = _head;
-        _historyKeys[slot] = key;
-        _historyHashes[slot] = hash;
-        _hashTable[hash.GetHashCode() & HashTableMask] = slot; // last-writer-wins; stale hits caught by _historyHashes verification
-        _head = (_head + 1) % HistorySize;
-        _historyCount = Math.Min(_historyCount + 1, HistorySize);
+        // If insertion order is invalid (after a DeleteBulkPresorted), skip appending —
+        // ResetInsertionOrder will rebuild everything from scratch when called.
+        if (_insertionOrderInvalid) return;
+
+        EnsureInsertionCapacity(_insertionCount + 1);
+        _insertionKeys[_insertionCount] = key;
+        _insertionHashes[_insertionCount] = hash;
+
+        _insertionCount++;
+        _insertionPrefixSumsDirty = true;
+    }
+
+    private void EnsureInsertionCapacity(int needed)
+    {
+        if (needed <= _insertionKeys.Length) return;
+        int newSize = Math.Max(needed, _insertionKeys.Length * 2);
+        Array.Resize(ref _insertionKeys, newSize);
+        Array.Resize(ref _insertionHashes, newSize);
+    }
+
+    private void RebuildInsertionPrefixSums()
+    {
+        if (!_insertionPrefixSumsDirty) return;
+
+        if (_insertionPrefixSums.Length < _insertionCount + 1)
+            _insertionPrefixSums = new Setsum[Math.Max(_insertionCount + 1, _insertionPrefixSums.Length * 2)];
+
+        _insertionPrefixSums[0] = new Setsum();
+        for (int i = 0; i < _insertionCount; i++)
+            _insertionPrefixSums[i + 1] = _insertionPrefixSums[i] + _insertionHashes[i];
+
+        _insertionPrefixSumsDirty = false;
     }
 
     private void InsertSortedArray(byte[][] keys)
@@ -320,32 +307,10 @@ public class ReconcilableSet
         for (int i = 0; i < n; i++)
         {
             hashes[i] = Setsum.Hash(keys[i]);
-            RecordHistory(keys[i], hashes[i]);
+            AppendInsertion(keys[i], hashes[i]);
             keys[i].CopyTo(flat, i * Setsum.DigestSize);
         }
         _store.MergeSorted(flat, hashes, n);
-    }
-
-    private bool SolveRecursive(Setsum target, int k, int maxOffset, List<byte[]> result,
-        HashSet<byte[]> seen)
-    {
-        if (k == 0) return target.IsEmpty();
-
-        for (int offset = 0; offset < maxOffset; offset++)
-        {
-            int idx = ((_head - 1 - offset) % HistorySize + HistorySize) % HistorySize;
-            var key = _historyKeys[idx];
-            if (key == null) break;
-            if (!seen.Add(key)) continue;
-
-            var h = _historyHashes[idx];
-            result.Add(key);
-            if (SolveRecursive(target - h, k - 1, maxOffset, result, seen)) return true;
-            result.RemoveAt(result.Count - 1);
-            seen.Remove(key);
-        }
-
-        return false;
     }
 
     private static bool IsSorted(List<byte[]> items)

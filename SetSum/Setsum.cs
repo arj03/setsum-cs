@@ -66,6 +66,17 @@ public readonly struct Setsum
     public Setsum RemoveHash(ReadOnlySpan<byte> hash)
         => new(Add(_state, Negate(LoadAndReduce(hash))));
 
+    /// <summary>
+    /// Returns the first 8 bytes of the digest as a 64-bit fingerprint.
+    /// Collision probability ~2^-64 — sufficient for trie node comparison.
+    /// </summary>
+    public long Fingerprint64()
+    {
+        Span<byte> buf = stackalloc byte[DigestSize];
+        CopyDigest(buf);
+        return MemoryMarshal.Read<long>(buf);
+    }
+
     public void CopyDigest(Span<byte> destination)
     {
         if (destination.Length < DigestSize)
