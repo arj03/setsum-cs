@@ -27,8 +27,6 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 
     private const int KeySize = Setsum.DigestSize;
     private const int SetsumSize = Setsum.DigestSize;
-    private const int EpochSize = sizeof(int);
-    private const int CountSize = sizeof(int);
 
     public int RoundTrips { get; private set; }
     public bool UsedFallback { get; private set; }
@@ -50,8 +48,10 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         BytesReceived = 0;
 
         // ---- Round 1: replica sends epoch + sequence info for both stores ----
-        // Wire: [epoch (4B)] [addCount (4B)] [addSum (32B)] [delCount (4B)] [delSum (32B)]
-        BytesSent += EpochSize + CountSize + SetsumSize + CountSize + SetsumSize;
+        // Wire: [epoch (varint)] [addCount (varint)] [addSum (32B)] [delCount (varint)] [delSum (32B)]
+        BytesSent += VarInt.Size(_replica.DeleteEpoch)
+                   + VarInt.Size(_replica.AddStore.InsertionCount) + SetsumSize
+                   + VarInt.Size(_replica.DeleteStore.InsertionCount) + SetsumSize;
 
         bool epochMatch = _replica.DeleteEpoch == _primary.DeleteEpoch;
 
@@ -61,8 +61,9 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
             var (addRootHash, addRootCount) = _primary.AddStore.GetRootInfo();
             var (delRootHash, delRootCount) = _primary.DeleteStore.GetRootInfo();
 
-            // Wire: [newEpoch (4B)] [addHash (32B)] [addCount (varint)] [delHash (32B)] [delCount (varint)]
-            BytesReceived += EpochSize + SetsumSize + VarInt.Size(addRootCount)
+            // Wire: [newEpoch (varint)] [addHash (32B)] [addCount (varint)] [delHash (32B)] [delCount (varint)]
+            BytesReceived += VarInt.Size(_primary.DeleteEpoch)
+                           + SetsumSize + VarInt.Size(addRootCount)
                            + SetsumSize + VarInt.Size(delRootCount);
 
             RoundTrips++;
@@ -107,8 +108,9 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
             var delResult = _primary.DeleteStore.TryReconcileTail(
                 _replica.DeleteStore.InsertionCount, _replica.DeleteStore.Sum());
 
-            // Wire: [epoch (4B)] [addOutcome (1B)] [addPayload...] [delOutcome (1B)] [delPayload...]
-            BytesReceived += EpochSize + 1 + ResultPayloadSize(addResult)
+            // Wire: [epoch (varint)] [addOutcome (1B)] [addPayload...] [delOutcome (1B)] [delPayload...]
+            BytesReceived += VarInt.Size(_primary.DeleteEpoch)
+                           + 1 + ResultPayloadSize(addResult)
                            + 1 + ResultPayloadSize(delResult);
 
             RoundTrips++;
