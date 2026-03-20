@@ -1,4 +1,4 @@
-﻿namespace Setsum.Sync;
+namespace Setsum.Sync;
 
 /// <summary>
 /// A sorted store of fixed-size (32-byte) keys with O(log N) range-hash queries via prefix sums.
@@ -46,10 +46,6 @@ public class SortedKeyStore
         return _count;
     }
 
-    // -------------------------------------------------------------------------
-    // Public API
-    // -------------------------------------------------------------------------
-
     public bool Contains(byte[] key)
     {
         EnsureSorted();
@@ -76,8 +72,7 @@ public class SortedKeyStore
     }
 
     /// <summary>
-    /// Flushes pending items and rebuilds the prefix sum table.
-    /// Call before any range query to amortise sort cost.
+    /// Flushes pending mutations and readies the store for queries.
     /// </summary>
     public void Prepare()
     {
@@ -85,9 +80,6 @@ public class SortedKeyStore
         RebuildPrefixSums();
     }
 
-    /// <summary>
-    /// Merges a pre-sorted flat key+hash buffer into the store in a single O(N) pass.
-    /// </summary>
     public void MergeSorted(byte[] keys, Setsum[] hashes, int newCount)
     {
         int total = _count + newCount;
@@ -125,10 +117,6 @@ public class SortedKeyStore
         _prefixSumsDirty = true;
     }
 
-    /// <summary>
-    /// Removes a batch of pre-sorted keys in a single O(N) merge pass.
-    /// Keys not present in the store are silently skipped.
-    /// </summary>
     public void RemoveSorted(byte[] keys, int removeCount)
     {
         if (removeCount == 0) return;
@@ -145,7 +133,7 @@ public class SortedKeyStore
             else if (cmp == 0) { i++; j++; } // drop matched key
             else { j++; }      // skip key not in store
         }
-        while (i < _count) 
+        while (i < _count)
         {
             CopyKey(_data, i, _scratch, k);
             _scratchHashes[k++] = _hashes[i++];
@@ -157,21 +145,10 @@ public class SortedKeyStore
         _prefixSumsDirty = true;
     }
 
-    public (Setsum Hash, int Count) RangeInfo(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi)
-    {
-        Prepare();
+    // -------------------------------------------------------------------------
+    // Index-based queries (used by trie sync)
+    // -------------------------------------------------------------------------
 
-        int start = LowerBound(lo, 0, _count), end = UpperBound(hi), count = end - start;
-        if (count <= 0)
-            return (new Setsum(), 0);
-        else
-            return (_prefixSums[end] - _prefixSums[start], count);
-    }
-
-    /// <summary>
-    /// Returns (hash, count) for a range specified by pre-computed [start, end) indices.
-    /// Caller must have already called Prepare().
-    /// </summary>
     internal (Setsum Hash, int Count) RangeInfoByIndex(int start, int end)
     {
         int count = end - start;
@@ -179,34 +156,12 @@ public class SortedKeyStore
         return (_prefixSums[end] - _prefixSums[start], count);
     }
 
-    /// <summary>
-    /// Computes [start, end) bounds for the given [lo, hi] range.
-    /// Caller must have already called Prepare().
-    /// </summary>
-    internal (int Start, int End) GetBounds(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi)
-        => (LowerBound(lo, 0, _count), UpperBound(hi));
-
-    /// <summary>
-    /// Returns the full [0, count) bounds after ensuring the store is prepared.
-    /// </summary>
     internal (int Start, int End) GetRootBounds()
     {
         Prepare();
-
         return (0, _count);
     }
 
-    /// <summary>
-    /// Finds the split index within [start, end) at the given bit depth.
-    /// Caller must have already called Prepare().
-    /// </summary>
-    internal int FindSplitPointByIndex(int start, int end, int depth)
-        => FindSplitPoint(start, end, depth);
-
-    /// <summary>
-    /// Splits [start, end) into 2^<paramref name="bits"/> sub-ranges by recursively bisecting at
-    /// successive bit depths. Returns an array of 2^bits + 1 boundary indices.
-    /// </summary>
     internal int[] GetDescendantSplits(int start, int end, int depth, int bits)
     {
         int numLeaves = 1 << bits;
@@ -227,35 +182,10 @@ public class SortedKeyStore
         FillDescendantSplits(splits, leafMid, leafHi, splitIdx, end, depth + 1);
     }
 
-    /// <summary>
-    /// Returns the hash and count for the entire store.
-    /// </summary>
     public (Setsum Hash, int Count) TotalInfo()
     {
         Prepare();
-
         return (_prefixSums[_count], _count);
-    }
-
-    public (Setsum Hash0, int Count0, Setsum Hash1, int Count1) RangeInfoSplit(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi, int depth)
-    {
-        Prepare();
-
-        int start = LowerBound(lo, 0, _count), end = UpperBound(hi);
-        if (start >= end) return (new Setsum(), 0, new Setsum(), 0);
-
-        int split = FindSplitPoint(start, end, depth);
-        int c0 = split - start, c1 = end - split;
-
-        return (c0 > 0 ? _prefixSums[split] - _prefixSums[start] : new Setsum(), c0,
-                c1 > 0 ? _prefixSums[end] - _prefixSums[split] : new Setsum(), c1);
-    }
-
-    public IEnumerable<byte[]> Range(ReadOnlySpan<byte> lo, ReadOnlySpan<byte> hi)
-    {
-        EnsureSorted();
-        int start = LowerBound(lo, 0, _count), end = UpperBound(hi);
-        return RangeByIndex(start, end);
     }
 
     internal IEnumerable<byte[]> RangeByIndex(int start, int end)
@@ -271,10 +201,6 @@ public class SortedKeyStore
             yield return KeyAt(_data, i).ToArray();
     }
 
-    /// <summary>
-    /// Returns all (key, hash) pairs in sorted order. Avoids re-hashing — returns
-    /// the hashes already stored in the parallel <c>_hashes</c> array.
-    /// </summary>
     internal IEnumerable<(byte[] Key, Setsum Hash)> AllWithHashes()
     {
         EnsureSorted();
@@ -282,23 +208,19 @@ public class SortedKeyStore
             yield return (KeyAt(_data, i).ToArray(), _hashes[i]);
     }
 
-    /// <summary>
-    /// Scans the pre-computed range [start, end) for items whose hashes peel against diff.
-    /// Caller must have already called Prepare().
-    /// </summary>
     internal List<byte[]>? TryPeelRangeByIndex(int start, int end, Setsum diff, int maxCountForPairPeel, int maxCountForTriplePeel = 256)
     {
         int count = end - start;
         if (count == 0) return null;
 
-        // missingCount == 1: one linear scan, no allocations until match found
+        // k=1: one linear scan
         for (int i = start; i < end; i++)
             if (_hashes[i] == diff)
                 return [KeyAt(_data, i).ToArray()];
 
         if (count > maxCountForPairPeel) return null;
 
-        // missingCount == 2: O(n²) pair scan
+        // k=2: O(n²) pair scan
         for (int i = start; i < end; i++)
         {
             var remaining = diff - _hashes[i];
@@ -307,10 +229,9 @@ public class SortedKeyStore
                     return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray()];
         }
 
-        // missingCount == 3: O(n²) with temporary hash-table lookup for the third item.
+        // k=3: O(n²) with stack-allocated hash-table probe for the third item
         if (count <= maxCountForTriplePeel)
         {
-            // Build a temporary hash table over the range (count ≤ 256, table 1024 → ~25% load).
             const int tableSize = 1024;
             const int tableMask = tableSize - 1;
             Span<int> table = stackalloc int[tableSize];
@@ -319,7 +240,7 @@ public class SortedKeyStore
             for (int i = start; i < end; i++)
             {
                 int slot = _hashes[i].GetHashCode() & tableMask;
-                table[slot] = i; // last-writer-wins; stale checked by hash comparison
+                table[slot] = i;
             }
 
             for (int i = start; i < end; i++)
@@ -355,8 +276,6 @@ public class SortedKeyStore
 
             if (_count == 0)
             {
-                // Fast path: the store was empty — adopt the sorted pending buffer directly
-                // instead of copying all n items through MergeSorted's scratch buffer.
                 (_data, _pending) = (_pending, _data);
                 (_hashes, _pendingHashes) = (_pendingHashes, _hashes);
                 _count = n;
@@ -374,20 +293,12 @@ public class SortedKeyStore
             _pendingDeleteCount = 0;
             GrowScratch(ref _scratch, n * KeySize);
             GrowScratch(ref _scratchHashes, n);
-            // Deletes don't need hashes — dummy array; FinishSort ignores hash values for ordering.
             var dummy = new Setsum[n];
             SortPending(_pendingDeletes, dummy, n, _scratch, _scratchHashes);
             RemoveSorted(_pendingDeletes, n);
         }
     }
 
-    /// <summary>
-    /// Four-pass LSB radix sort on bytes 0–3, then insertion sort within same-prefix buckets.
-    /// Four bytes reduces average bucket size to &lt;1 item for any N ≤ 4 billion,
-    /// making the insertion sort a near-no-op for typical crypto/hash keys.
-    /// Works for both inserts (real hashes) and deletes (dummy hashes — keys only).
-    /// Result lands back in <paramref name="keys"/>/<paramref name="hashes"/>.
-    /// </summary>
     private void SortPending(byte[] keys, Setsum[] hashes, int n, byte[] scratch, Setsum[] scratchHashes)
     {
         RadixPass(keys, hashes, n, byteIndex: 3, scratch, scratchHashes);
@@ -417,11 +328,6 @@ public class SortedKeyStore
         }
     }
 
-    /// <summary>
-    /// Insertion sort within buckets of keys sharing the same first four bytes.
-    /// After four radix passes the average bucket contains &lt;1 item for N ≤ 4 billion,
-    /// so this is effectively a no-op for typical 32-byte hash/crypto keys.
-    /// </summary>
     private static void FinishSort(byte[] keys, Setsum[] hashes, int n)
     {
         Span<byte> tmp = stackalloc byte[KeySize];
@@ -437,8 +343,6 @@ public class SortedKeyStore
                    && keys[end * KeySize + 2] == b2 && keys[end * KeySize + 3] == b3)
                 end++;
 
-            // Insertion sort [start, end) by bytes 4..31 — runs only when the first
-            // four bytes collide, which has probability ~N²/2³³ ≈ 0 for any N ≤ 4 billion.
             for (int i = start + 1; i < end; i++)
             {
                 keys.AsSpan(i * KeySize, KeySize).CopyTo(tmp);
@@ -498,18 +402,6 @@ public class SortedKeyStore
         {
             int mid = (lo + hi) >> 1;
             if (KeyAt(_data, mid).SequenceCompareTo(t) < 0) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo;
-    }
-
-    private int UpperBound(ReadOnlySpan<byte> t)
-    {
-        int lo = 0, hi = _count;
-        while (lo < hi)
-        {
-            int mid = (lo + hi) >> 1;
-            if (KeyAt(_data, mid).SequenceCompareTo(t) <= 0) lo = mid + 1;
             else hi = mid;
         }
         return lo;

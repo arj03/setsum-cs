@@ -96,7 +96,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Delete_replicaReceivesTombstonesAfterSync()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var sharedKeys = primary.AddStore.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
@@ -112,7 +112,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Delete_EffectiveSetExcludesDeletedKeys()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var sharedKeys = primary.AddStore.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
@@ -162,7 +162,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Insert_AfterDelete_SyncsCorrectlyToreplica()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(20);
-        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var sharedKeys = primary.AddStore.GetAllItems().ToList();
         var targetKey = sharedKeys[0];
 
         primary.Delete(targetKey);
@@ -211,7 +211,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // replica syncs, primary then compacts. On the next sync the replica must
         // drop the keys the primary has already removed from its AddStore.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var sharedKeys = primary.AddStore.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
         Assert.True(new SyncNodes(replica, primary).TrySync(_output)); // replica gets tombstones
@@ -234,7 +234,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // After compaction the primary has both new adds and new deletes in the
         // current epoch. The replica must handle all of them in one sync.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var sharedKeys = primary.AddStore.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5));
         Assert.True(new SyncNodes(replica, primary).TrySync(_output));
@@ -282,7 +282,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
 
         // Corrupt the replica: delete one key directly from the store.
-        var replicaKeys = replica.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var replicaKeys = replica.AddStore.GetAllItems().ToList();
         var lostKey = replicaKeys[42];
         replica.AddStore.DeleteBulkPresorted([lostKey]);
         replica.AddStore.Prepare();
@@ -302,7 +302,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // recover all of them in one pass.
         var (primary, replica) = MakeNodesWithSharedKeys(200);
 
-        var replicaKeys = replica.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var replicaKeys = replica.AddStore.GetAllItems().ToList();
         var lostKeys = new[] { replicaKeys[10], replicaKeys[50], replicaKeys[100], replicaKeys[150] }
             .OrderBy(k => k, ByteComparer.Instance).ToList();
         replica.AddStore.DeleteBulkPresorted(lostKeys);
@@ -346,7 +346,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         for (int i = 0; i < 5; i++) primary.Insert(RandomKey());
 
         // Corrupt the replica: lose one of the original shared keys.
-        var replicaKeys = replica.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var replicaKeys = replica.AddStore.GetAllItems().ToList();
         replica.AddStore.DeleteBulkPresorted([replicaKeys[30]]);
         replica.AddStore.Prepare();
 
@@ -364,14 +364,14 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // Replica loses a tombstone from its DeleteStore. The sync should detect
         // the mismatch and re-deliver the tombstone via trie fallback.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var sharedKeys = primary.AddStore.GetAllItems().ToList();
 
         // Primary deletes 10 keys, sync to replica.
         primary.DeleteBulk(sharedKeys.Take(10));
         Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
         // Corrupt the replica's delete store: remove one tombstone.
-        var tombstones = replica.DeleteStore.GetItemsWithPrefix(BitPrefix.Root).ToList();
+        var tombstones = replica.DeleteStore.GetAllItems().ToList();
         replica.DeleteStore.DeleteBulkPresorted([tombstones[3]]);
         replica.DeleteStore.Prepare();
 

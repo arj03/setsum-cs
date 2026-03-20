@@ -248,17 +248,68 @@ A traditional Merkle tree must store every internal node hash explicitly and reb
 
 ---
 
-## Wire Optimizations
+## Wire Protocol
 
-Several optimizations reduce the bytes transferred during trie sync:
+All messages are binary, little-endian, with VarInt-encoded counts. Key = 32 bytes, Setsum = 32 bytes, Fingerprint = 8 bytes.
 
-**Truncated fingerprints for expansion.** Expansion responses use 8-byte fingerprints (`Setsum.Fingerprint64()`) instead of full 32-byte Setsums. This saves 24 bytes per child entry. With ~57K entries in a typical large-diff sync, this reduces Rx by ~1.4 MB. The full Setsum is only fetched on demand when a leaf needs it for peeling (32 bytes per leaf).
+### Sequence request (replica → primary)
 
-**Local peeling for replica-ahead leaves.** When the replica has items the primary doesn't (`signedDiff < 0`), the replica can peel locally using the primary's hash — no keys travel over the wire for removals. The only cost is fetching the full primary hash (32 bytes) when the expansion only provided a fingerprint.
+| Field | Size |
+|---|---|
+| epoch | 4 B |
+| addCount | 4 B |
+| addSum | 32 B (Setsum) |
+| delCount | 4 B |
+| delSum | 32 B (Setsum) |
 
-**Asymmetric full key exchange.** At maximum trie depth, the replica sends its keys and the primary responds with only the keys to add. The replica computes removals locally by diffing the two sorted lists. This halves the response size compared to sending both adds and removes.
+**Total: 76 bytes.** Sent on every sync. Covers both stores in one round trip.
 
-**Combined leaf + expansion round trips.** Leaf resolution and child expansion are batched into a single round trip per BFS level, avoiding separate network calls for each phase.
+### Sequence response (primary → replica, normal path)
+
+| Field | Size |
+|---|---|
+| epoch | 4 B |
+| addOutcome | 1 B (0=Identical, 1=Found, 2=Fallback) |
+| addPayload | varint(count) + count × 32 B keys (if Found) |
+| delOutcome | 1 B |
+| delPayload | varint(count) + count × 32 B keys (if Found) |
+
+### Epoch mismatch response (primary → replica)
+
+| Field | Size |
+|---|---|
+| newEpoch | 4 B |
+| addRootHash | 32 B (Setsum) |
+| addRootCount | varint |
+| delRootHash | 32 B (Setsum) |
+| delRootCount | varint |
+
+Piggybacking root info for both stores saves 2 round trips vs. querying them separately.
+
+### Trie expansion (per BFS level)
+
+**Request** (replica → primary): child prefix bytes — `ceil(depth / 8)` bytes per child.
+
+**Response** (primary → replica): per child:
+
+| Field | Size |
+|---|---|
+| count | varint |
+| fingerprint | 8 B (if count > 0) |
+
+Uses truncated 64-bit fingerprints instead of full 32-byte Setsums (~2^-64 false positive rate). Saves 24 bytes per entry — significant when tens of thousands of subtrees are compared.
+
+### Leaf resolution (within the same BFS round trip)
+
+| Case | Request (Tx) | Response (Rx) |
+|---|---|---|
+| replicaCount == 0 (bulk pull) | prefix bytes | count × 32 B keys |
+| signedDiff > 0 (primary ahead) | prefix + 32 B replicaHash | count × 32 B missing keys |
+| signedDiff < 0 (replica ahead) | prefix bytes | 32 B primaryHash |
+| signedDiff == 0 (same count, different hash) | — | — (expanded further) |
+| depth >= MaxPrefixDepth (full exchange) | prefix + count × 32 B replicaKeys | count × 32 B primaryKeys to add |
+
+**Replica-ahead leaves** peel locally using the primary's hash — removals never travel over the wire. **Full key exchange** only returns the keys to add; the replica computes removals locally by diffing the sorted lists.
 
 ---
 
@@ -373,10 +424,10 @@ This means the protocol self-heals from arbitrary replica corruption without any
 | File | Purpose |
 |---|---|
 | `Setsum.cs` | Commutative, invertible 256-bit hash with SIMD arithmetic and 64-bit fingerprint extraction |
-| `ReconcilableSet.cs` | High-level set with sequence-based fast path, insertion-order tracking, trie delegation, and leaf resolution |
+| `ReconcilableSet.cs` | High-level set with sequence-based fast path, insertion-order tracking, and leaf resolution |
 | `SortedKeyStore.cs` | Flat sorted array store with O(log N) range-hash, zero-allocation peeling (k=1/2/3), and descendant splitting |
-| `BitPrefix.cs` | Bit-level trie prefix with multi-bit extension for binary-prefix traversal |
+| `BitPrefix.cs` | Bit-level trie prefix with multi-bit extension |
 | `ReconcileResult.cs` | Discriminated union result type (`Identical / Found / Fallback`) |
-| `SyncNodes.cs` | Wire protocol: sequence request/response, epoch mismatch, fingerprint expansion, byte accounting |
-| `SyncNodes.Triesync.cs` | Bidirectional trie sync BFS with combined leaf+expansion RTs and truncated fingerprints |
-| `SyncableNode.cs` | Per-node add/delete stores, compaction, tombstone materialization, and epoch management |
+| `SyncNodes.cs` | Sync orchestration with arithmetic wire-byte accounting |
+| `SyncNodes.Triesync.cs` | Bidirectional trie sync BFS with combined leaf+expansion round trips |
+| `SyncableNode.cs` | Per-node add/delete stores, compaction, and epoch management |
