@@ -6,14 +6,17 @@ This protocol assumes all participating nodes are mutually trusted — reported 
 
 ---
 
-## Overview
+## Data Model
 
-Two nodes each hold a set of 32-byte keys. They want to converge to the same set with as few network round-trips as possible, without transferring keys they already share.
+Each node owns two append-only stores and an epoch counter:
 
-The library solves this in two escalating strategies:
+- **`AddStore`** — all inserted keys, synced primary→replica
+- **`DeleteStore`** — tombstones for deleted keys, synced primary→replica
+- **Effective membership** — `AddStore − DeleteStore`, computed at query time
 
-1. **Fast Path** — Sequence-based tail send. Resolves any diff in 1 RT when the replica is simply behind.
-2. **Trie Fallback** — Bidirectional binary-prefix trie traversal for arbitrary diffs.
+Both stores are append-only, which keeps the protocol valid: the primary is always a superset of the replica within each store, so diffs are always non-negative within a store.
+
+**Compaction** lets the primary periodically apply tombstones to `AddStore`, wipe `DeleteStore`, and increment `DeleteEpoch`. Without it, tombstones would accumulate forever. The epoch gives replicas an unambiguous signal that this happened, so they can recover before resuming normal sync. Without epochs you must either keep tombstones forever or risk silently missing deletes that were compacted before a replica synced.
 
 ---
 
@@ -29,11 +32,9 @@ This lets the primary node compute what a replica is missing by subtraction alon
 
 ---
 
-## Path 1: Sequence-Based Fast Path
+## Sync Protocol
 
-Every insert is numbered. Both stores maintain prefix sums over their insertion hashes.
-
-The replica sends `(insertionCount, totalSum)` for each store. The primary checks that `insertionPrefixSum[replicaCount] == replicaSum` — i.e. the replica holds exactly the first N items from the primary's insertion history. If verified, the primary sends only the tail items.
+Every sync starts the same way: the replica sends its epoch and sequence state for both stores in a single message. The primary's response determines which path follows.
 
 ```mermaid
 sequenceDiagram
@@ -41,27 +42,44 @@ sequenceDiagram
     participant P as Primary
 
     R->>P: [epoch, addCount, addSum, delCount, delSum]
-    alt Both stores: tail verified
+
+    alt Epoch matches + both stores verify
         P-->>R: [epoch, addTailItems, delTailItems]
-    else Sum mismatch
+        Note over R: Insert tail items — done
+    else Epoch matches + sum mismatch on a store
         P-->>R: Fallback signal
-        Note over R: Enter bidirectional trie sync
+        Note over R: Bidirectional trie sync on that store
+    else Epoch mismatch
+        P-->>R: [newEpoch, addRootHash, addRootCount, delRootHash, delRootCount]
+        Note over R: Materialize local tombstones, wipe DeleteStore
+        Note over R: Bidirectional trie sync on AddStore (+ DeleteStore if non-empty)
     end
 ```
 
-**When it works:** The replica is an exact prefix of the primary's insertion history — regardless of how many items it's missing. A diff of 1 or 100,000 items both resolve in 1 RT.
+### Fast path
 
-**When it fails:** Any corruption or out-of-order mutation breaks the sum check and triggers trie sync. After repair the replica resets its insertion-order tracking so future fast paths work again.
+Every insert is numbered. Both stores maintain prefix sums over their insertion hashes. The primary verifies that `insertionPrefixSum[replicaCount] == replicaSum` — i.e. the replica holds exactly the first N items from the primary's history. If so, it sends only the tail.
+
+This resolves any diff in 1 RT as long as the replica is simply behind — a diff of 1 item or 100,000 items is the same cost.
+
+### Trie sync — the universal fallback
+
+The trie sync is not specific to any one failure mode. It is the single repair mechanism for all forms of divergence:
+
+- **Sum mismatch** — the replica has lost or gained items; the bidirectional trie finds and corrects all differences
+- **Epoch mismatch** — the primary has compacted; the replica first materializes its local tombstones into `AddStore`, wipes `DeleteStore`, then runs the same bidirectional trie sync to converge both stores
+
+After any trie sync, the replica resets its insertion-order tracking from its current store contents so the fast path works again on the next sync.
+
+On epoch mismatch the primary piggybacks root `(hash, count)` for both stores in its response, so the trie BFS can start immediately with no extra round trip. If the delete store is empty after compaction (the common case), its sync is skipped entirely.
 
 ---
 
-## Path 2: Bidirectional Trie Sync (Fallback)
+## Bidirectional Trie Sync
 
-A bidirectional binary-prefix trie traversal. Keys are sorted by their bit representation; each trie node covers all keys sharing a common bit-prefix. The protocol exchanges subtree `(hash, count)` pairs, recursing into subtrees where the two sides differ, until each differing subtree is small enough to resolve directly.
+Keys are sorted by their bit representation; each trie node covers all keys sharing a common bit-prefix. The protocol exchanges subtree `(hash, count)` pairs level by level, recursing into subtrees where the two sides differ, until each is small enough to resolve directly.
 
-Both directions are handled in a single BFS pass:
-- Primary has items the replica doesn't → add to replica
-- Replica has items the primary doesn't → remove from replica
+Both directions are handled in a single BFS pass — additions and removals in the same traversal:
 
 ```mermaid
 flowchart TD
@@ -72,44 +90,25 @@ flowchart TD
     C --> F["Prefix 10"]
     C --> G["Prefix 11"]
     D --> H["..."]
-    E --> I["Leaf: Setsum peel (1–3 missing)"]
+    E --> I["Leaf: Setsum peel (1–3 diff)"]
     F --> J["Hash+count match — skip ✓"]
     G --> K["..."]
 ```
 
-### BFS traversal
-
-One round trip per depth level, batching all leaf resolutions and child expansions together. A node becomes a leaf when:
+One round trip per depth level, batching all leaf resolutions and child expansions. A node becomes a leaf when:
 
 - `primaryCount == 0` — replica's items are stale; removed locally with no wire traffic
 - `replicaCount == 0` — primary sends all its items directly
 - `|primaryCount − replicaCount| ≤ 3` — resolved via Setsum peeling
 - `depth ≥ MaxPrefixDepth` — full key exchange
 
-```mermaid
-sequenceDiagram
-    participant R as Replica
-    participant P as Primary
-
-    loop BFS — one round trip per depth level
-        Note over R: Classify nodes: leaves vs interior
-        R->>P: Leaf: replicaHash [batched]<br/>Interior: child prefix queries [batched]
-        Note over P: Peel leaves, split interior nodes
-        P-->>R: Missing keys + child (hash, count) pairs
-        Note over R: Failed peels deferred to expansion in same RT
-    end
-    R->>R: Apply adds and removes
-```
-
 ### Leaf resolution via Setsum peeling
 
-**Primary ahead** (`signedDiff > 0`): Replica sends its prefix hash; primary subtracts to get the diff and identifies the 1–3 missing items by scanning its local hashes. No guessing — the diff isolates exactly which items are missing.
+**Primary ahead** (`signedDiff > 0`): Replica sends its prefix hash; primary subtracts to isolate the diff and identifies the 1–3 missing items by scanning its local hashes.
 
-**Replica ahead** (`signedDiff < 0`): The primary's hash is already in scope from the expansion response. The replica peels locally to identify its 1–3 stale items — **zero wire cost**.
+**Replica ahead** (`signedDiff < 0`): The primary's hash is already in scope from the expansion response. The replica peels locally — **zero wire cost**.
 
 **Same count, different hash** (`signedDiff == 0`): Expanded further.
-
-Because `absDiff` is known exactly, the peeling skips scan levels that can't match. For a 1-item diff only a linear scan runs; for a 2-item diff an O(n²) pair scan is added; for 3 items a hash-table probe is added on top.
 
 ---
 
@@ -139,7 +138,7 @@ All messages are binary with VarInt-encoded counts. Key = 32 B, Setsum = 32 B.
 | delOutcome | 1 B |
 | delPayload | varint(count) + count × 32 B keys (if Found) |
 
-On epoch mismatch the primary skips the fast-path evaluation and responds instead with `[newEpoch, addRootHash, addRootCount, delRootHash, delRootCount]` — piggybacking root info for both stores so the BFS can start immediately.
+On epoch mismatch: `[newEpoch, addRootHash, addRootCount, delRootHash, delRootCount]` instead.
 
 ### Trie expansion (per BFS level)
 
@@ -165,57 +164,9 @@ On epoch mismatch the primary skips the fast-path evaluation and responds instea
 |---|---|---|
 | Sets identical | 1 | Sequence check covers both stores |
 | Replica behind by D items | 1 | Tail send, any D |
-| Replica corrupted | 1 + O(log N) | 1 RT detects mismatch, BFS repairs |
+| Sum mismatch (corruption) | 1 + O(log N) | 1 RT detects mismatch, trie sync repairs |
 | Epoch mismatch (empty del store) | 1 + O(log N) | Root info piggybacked, delete store skipped |
-| Epoch mismatch (non-empty del store) | 1 + O(log N) + O(log N) | Two BFS passes, root info piggybacked |
-
----
-
-## Delete Protocol
-
-### Data Model
-
-Each node owns two append-only stores:
-
-- **`AddStore`** — all inserted keys, synced primary→replica
-- **`DeleteStore`** — tombstones for deleted keys, synced primary→replica
-- **Effective membership** — `AddStore − DeleteStore`, computed at query time
-
-Both stores are strictly append-only, which keeps the protocol valid across compactions.
-
-### Epochs
-
-`DeleteStore` tombstones would grow forever without compaction. When the primary compacts — applying all tombstones to `AddStore`, wiping `DeleteStore`, and incrementing `DeleteEpoch` — replicas detect the epoch change and recover before resuming normal sync.
-
-Without epochs you must either keep tombstones forever or risk replicas silently missing deletes that were compacted before they synced.
-
-### Epoch-Mismatch Recovery
-
-```mermaid
-sequenceDiagram
-    participant R as Replica
-    participant P as Primary
-
-    R->>P: [epoch, addCount, addSum, delCount, delSum]
-    Note over P: Epoch mismatch — send root info instead of fast-path result
-    P-->>R: [newEpoch, addRootHash, addRootCount, delRootHash, delRootCount]
-
-    Note over R: Materialize local DeleteStore into AddStore, wipe DeleteStore
-
-    loop Bidirectional trie sync on AddStore
-        R->>P: Prefix queries
-        P-->>R: Keys to add/remove
-    end
-
-    alt Primary DeleteStore non-empty
-        loop Bidirectional trie sync on DeleteStore
-            R->>P: Prefix queries
-            P-->>R: Keys to add/remove
-        end
-    end
-```
-
-The primary piggybacks root info for both stores in the mismatch response, so no extra round trips are needed to start the BFS. If the delete store is empty after compaction (the common case), its sync is skipped entirely.
+| Epoch mismatch (non-empty del store) | 1 + O(log N) + O(log N) | Two trie passes, root info piggybacked |
 
 ---
 
