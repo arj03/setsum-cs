@@ -1,13 +1,13 @@
-﻿using System.Security.Cryptography;
+using System.Security.Cryptography;
 using Xunit;
 using Xunit.Abstractions;
 
 namespace Setsum.Sync.Test;
 
 /// <summary>
-/// Correctness tests for the sync protocol. All tests use small datasets so
-/// they run fast and failures are easy to diagnose. For throughput and
-/// round-trip efficiency at scale, see <see cref="SyncPerformanceTests"/>.
+/// Correctness tests for the single-log sync protocol. All tests use small
+/// datasets so they run fast and failures are easy to diagnose. For throughput
+/// and round-trip efficiency at scale, see <see cref="SyncPerformanceTests"/>.
 /// </summary>
 public class SyncCorrectnessTests(ITestOutputHelper output)
 {
@@ -44,7 +44,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         Assert.True(sim.TrySync(_output));
         Assert.Equal(0, sim.ItemsAdded);
         Assert.Equal(0, sim.ItemsDeleted);
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
+        Assert.Equal(primary.Sum(), replica.Sum());
     }
 
     [Fact]
@@ -58,8 +58,8 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         Assert.Equal(5, sim.ItemsAdded);
         Assert.Equal(0, sim.ItemsDeleted);
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     [Fact]
@@ -73,8 +73,8 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(200, sim.ItemsAdded);
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     [Fact]
@@ -85,18 +85,17 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         Assert.True(sim.TrySync(_output));
 
-        // Exactly 1 round trip for a fully-identical sync:
-        //   Combined: epoch handshake + add fast-path + delete fast-path
+        // Exactly 1 round trip for a fully-identical sync
         Assert.Equal(1, sim.RoundTrips);
     }
 
     // ── Delete (no compaction) ────────────────────────────────────────────────
 
     [Fact]
-    public void Delete_replicaReceivesTombstonesAfterSync()
+    public void Delete_replicaReceivesDeletesAfterSync()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
@@ -104,15 +103,15 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(10, sim.ItemsDeleted);
-        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
-        Assert.Equal(primary.DeleteStore.Count(), replica.DeleteStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     [Fact]
     public void Delete_EffectiveSetExcludesDeletedKeys()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
@@ -121,37 +120,41 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         // Effective set sum must match on both sides.
         Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(40, primary.EffectiveCount());
+        Assert.Equal(40, replica.EffectiveCount());
     }
 
     [Fact]
     public void Delete_PhantomTombstone_DoesNotCorruptEffectiveSet()
     {
-        // Deleting a key that was never inserted is harmless — it should not
-        // appear in the effective set, and the sum should still agree.
+        // Deleting a key that was never inserted is a no-op — the effective
+        // set and sum should be unchanged.
         var (primary, replica) = MakeNodesWithSharedKeys(20);
+        var sumBefore = primary.Sum();
         var phantom = RandomKey(); // never inserted anywhere
         primary.Delete(phantom);
+
+        Assert.Equal(sumBefore, primary.Sum()); // phantom delete is a no-op
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
     }
 
     [Fact]
-    public void Insert_AfterDelete_RemovesTombstoneAndKeyIsVisible()
+    public void Insert_AfterDelete_KeyIsVisible()
     {
-        // must clear its tombstone so it reappears in the effective set.
+        // Re-inserting a deleted key makes it reappear in the effective set.
         var primary = new SyncableNode();
         var key = RandomKey();
 
         primary.Insert(key);
         primary.Delete(key);
-        Assert.True(primary.DeleteStore.Contains(key), "tombstone should exist after Delete");
+        Assert.Equal(0, primary.EffectiveCount());
 
         primary.Insert(key);
-        Assert.False(primary.DeleteStore.Contains(key), "tombstone should be cleared after re-Insert");
+        Assert.Equal(1, primary.EffectiveCount());
 
         // Key should count in the effective set.
         var emptyNode = new SyncableNode();
@@ -162,17 +165,17 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Insert_AfterDelete_SyncsCorrectlyToreplica()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(20);
-        var sharedKeys = primary.AddStore.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
         var targetKey = sharedKeys[0];
 
         primary.Delete(targetKey);
-        primary.Insert(targetKey); // re-insert clears the tombstone
+        primary.Insert(targetKey); // re-insert
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     // ── Epoch / compaction ────────────────────────────────────────────────────
@@ -180,9 +183,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     [Fact]
     public void Epoch_Freshreplica_ConnectsToCompactedprimary()
     {
-        // A brand-new replica (DeleteEpoch = 0) connecting to a primary that has
-        // already compacted once. The epoch mismatch recovery should be a no-op
-        // on the replica side (nothing to materialize) before normal sync proceeds.
+        // A brand-new replica (Epoch = 0) connecting to a primary that has
+        // already compacted once. The epoch mismatch triggers a single trie
+        // sync over the effective set.
         var primary = new SyncableNode();
         var sharedKeys = new List<byte[]>();
         for (int i = 0; i < 50; i++)
@@ -193,39 +196,37 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         }
 
         primary.DeleteBulk(sharedKeys.Take(5));
-        primary.CompactDeleteStore(); // epoch → 1
+        primary.Compact(); // epoch → 1
 
-        var replica = new SyncableNode(); // epoch = 0, empty stores
+        var replica = new SyncableNode(); // epoch = 0, empty
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
-        Assert.Equal(primary.DeleteEpoch, replica.DeleteEpoch);
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
+        Assert.Equal(primary.Epoch, replica.Epoch);
     }
 
     [Fact]
     public void Epoch_Mismatch_replicaDropsStaleKeys()
     {
-        // replica syncs, primary then compacts. On the next sync the replica must
-        // drop the keys the primary has already removed from its AddStore.
+        // Replica syncs, primary then compacts. On the next sync the replica must
+        // drop the keys the primary removed during compaction.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output)); // replica gets tombstones
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output)); // replica gets deletes
 
-        primary.CompactDeleteStore(); // wipes DeleteStore, bumps epoch
+        primary.Compact(); // squash log, bump epoch
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
-        Assert.Equal(primary.DeleteEpoch, replica.DeleteEpoch);
-        Assert.Equal(0, primary.DeleteStore.Count()); // primary delete store is empty post-compact
-        Assert.Equal(0, replica.DeleteStore.Count()); // replica wiped its own on epoch recovery
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
+        Assert.Equal(primary.Epoch, replica.Epoch);
     }
 
     [Fact]
@@ -234,13 +235,13 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // After compaction the primary has both new adds and new deletes in the
         // current epoch. The replica must handle all of them in one sync.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5));
         Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
         primary.DeleteBulk(sharedKeys.Skip(5).Take(5)); // 5 more deletes before compact
-        primary.CompactDeleteStore();
+        primary.Compact();
 
         for (int i = 0; i < 8; i++) primary.Insert(RandomKey()); // new adds in new epoch
         primary.DeleteBulk(sharedKeys.Skip(10).Take(3));         // new deletes in new epoch
@@ -248,11 +249,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
-        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
-        Assert.Equal(primary.DeleteEpoch, replica.DeleteEpoch);
         Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
+        Assert.Equal(primary.Epoch, replica.Epoch);
     }
 
     [Fact]
@@ -266,7 +265,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         primary.DeleteBulk(keys.Take(10));
         var sumBefore = primary.Sum();
 
-        primary.CompactDeleteStore();
+        primary.Compact();
 
         Assert.Equal(sumBefore, primary.Sum());
     }
@@ -276,23 +275,22 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     [Fact]
     public void Corruption_ReplicaLostOneItem_FallbackRecovers()
     {
-        // Replica silently loses a key from its AddStore (e.g. disk corruption).
-        // The sequence-based fast path should detect the sum mismatch and fall
-        // back to bidirectional trie sync, which recovers the lost key.
+        // Replica silently loses a key from its effective set (e.g. disk corruption).
+        // The fast path should detect the sum mismatch and fall back to trie sync.
         var (primary, replica) = MakeNodesWithSharedKeys(100);
 
-        // Corrupt the replica: delete one key directly from the store.
-        var replicaKeys = replica.AddStore.GetAllItems().ToList();
+        // Corrupt the replica: delete one key directly from the effective set.
+        var replicaKeys = replica.EffectiveSet.GetAllItems().ToList();
         var lostKey = replicaKeys[42];
-        replica.AddStore.DeleteBulkPresorted([lostKey]);
-        replica.AddStore.Prepare();
+        replica.EffectiveSet.DeleteBulkPresorted([lostKey]);
+        replica.EffectiveSet.Prepare();
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.True(sim.UsedFallback, "sum mismatch should trigger trie fallback");
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     [Fact]
@@ -302,18 +300,18 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // recover all of them in one pass.
         var (primary, replica) = MakeNodesWithSharedKeys(200);
 
-        var replicaKeys = replica.AddStore.GetAllItems().ToList();
+        var replicaKeys = replica.EffectiveSet.GetAllItems().ToList();
         var lostKeys = new[] { replicaKeys[10], replicaKeys[50], replicaKeys[100], replicaKeys[150] }
             .OrderBy(k => k, ByteComparer.Instance).ToList();
-        replica.AddStore.DeleteBulkPresorted(lostKeys);
-        replica.AddStore.Prepare();
+        replica.EffectiveSet.DeleteBulkPresorted(lostKeys);
+        replica.EffectiveSet.Prepare();
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.True(sim.UsedFallback);
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     [Fact]
@@ -324,15 +322,15 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
 
         var extraKey = RandomKey();
-        replica.AddStore.Insert(extraKey);
-        replica.AddStore.Prepare();
+        replica.EffectiveSet.Insert(extraKey);
+        replica.EffectiveSet.Prepare();
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.True(sim.UsedFallback);
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     [Fact]
@@ -346,41 +344,42 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         for (int i = 0; i < 5; i++) primary.Insert(RandomKey());
 
         // Corrupt the replica: lose one of the original shared keys.
-        var replicaKeys = replica.AddStore.GetAllItems().ToList();
-        replica.AddStore.DeleteBulkPresorted([replicaKeys[30]]);
-        replica.AddStore.Prepare();
+        var replicaKeys = replica.EffectiveSet.GetAllItems().ToList();
+        replica.EffectiveSet.DeleteBulkPresorted([replicaKeys[30]]);
+        replica.EffectiveSet.Prepare();
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.True(sim.UsedFallback);
-        Assert.Equal(primary.AddStore.Sum(), replica.AddStore.Sum());
-        Assert.Equal(primary.AddStore.Count(), replica.AddStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     [Fact]
-    public void Corruption_ReplicaDeleteStoreLostItem_FallbackRecovers()
+    public void Corruption_AfterDeleteSync_ReplicaGainedDeletedKey_FallbackRecovers()
     {
-        // Replica loses a tombstone from its DeleteStore. The sync should detect
-        // the mismatch and re-deliver the tombstone via trie fallback.
+        // Replica syncs deletes from the primary, then corruption re-adds a
+        // deleted key to the replica's effective set. The next sync should
+        // detect the mismatch and remove the stale key via trie fallback.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.AddStore.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
 
         // Primary deletes 10 keys, sync to replica.
         primary.DeleteBulk(sharedKeys.Take(10));
         Assert.True(new SyncNodes(replica, primary).TrySync(_output));
 
-        // Corrupt the replica's delete store: remove one tombstone.
-        var tombstones = replica.DeleteStore.GetAllItems().ToList();
-        replica.DeleteStore.DeleteBulkPresorted([tombstones[3]]);
-        replica.DeleteStore.Prepare();
+        // Corrupt the replica: re-add one of the deleted keys directly.
+        var deletedKey = sharedKeys[3];
+        replica.EffectiveSet.Insert(deletedKey);
+        replica.EffectiveSet.Prepare();
 
         var sim = new SyncNodes(replica, primary);
         Assert.True(sim.TrySync(_output));
 
         Assert.True(sim.UsedFallback);
-        Assert.Equal(primary.DeleteStore.Sum(), replica.DeleteStore.Sum());
-        Assert.Equal(primary.DeleteStore.Count(), replica.DeleteStore.Count());
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
 
     // ── SortedKeyStore.Remove (single-key pending-delete path) ───────────────

@@ -6,18 +6,16 @@ namespace Setsum.Sync.Test;
 /// Simulates a two-node sync protocol over a network.
 ///
 /// Protocol overview:
-///   Each node maintains two append-only stores:
-///     AddStore    - all inserted keys. Synced primary→replica (unidirectional).
-///     DeleteStore - all deleted keys. Synced primary→replica (unidirectional).
+///   Each node maintains a single interleaved operation log (inserts + deletes)
+///   plus an effective-set for trie-based fallback sync.
 ///
 ///   Sequence-based fast path:
-///     Every insert is numbered. Replica sends (count, sum) for each store.
-///     Primary verifies sum == insertionPrefixSum[count], then sends the tail items.
-///     If verification fails, falls back to bidirectional trie sync.
+///     Replica sends (epoch, logPosition, effectiveSum).
+///     Primary verifies effectiveSum == prefixSums[logPosition], then sends the
+///     tail operations — both adds and deletes in one stream.
 ///
-///   Epoch — bumped when the primary compacts its delete store. The replica detects
-///   this, materializes local tombstones, wipes local delete store, then falls back
-///   to bidirectional trie sync on both stores.
+///   Epoch — bumped when the primary compacts its log. The replica detects this
+///   and falls back to a single bidirectional trie sync over effective sets.
 /// </summary>
 public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 {
@@ -47,101 +45,96 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         BytesSent = 0;
         BytesReceived = 0;
 
-        // ---- Round 1: replica sends epoch + sequence info for both stores ----
-        // Wire: [epoch (varint)] [addCount (varint)] [addSum (32B)] [delCount (varint)] [delSum (32B)]
-        BytesSent += VarInt.Size(_replica.DeleteEpoch)
-                   + VarInt.Size(_replica.AddStore.InsertionCount) + SetsumSize
-                   + VarInt.Size(_replica.DeleteStore.InsertionCount) + SetsumSize;
+        _replica.Prepare();
+        _primary.Prepare();
 
-        bool epochMatch = _replica.DeleteEpoch == _primary.DeleteEpoch;
+        // ---- Round 1: replica sends epoch + log position + effective sum ----
+        // Wire: [epoch (varint)] [logPosition (varint)] [effectiveSum (32B)]
+        var replicaEffectiveSum = _replica.EffectiveSet.Sum();
+        BytesSent += VarInt.Size(_replica.Epoch)
+                   + VarInt.Size(_replica.LogPosition) + SetsumSize;
+
+        bool epochMatch = _replica.Epoch == _primary.Epoch;
 
         if (!epochMatch)
         {
-            // ---- Epoch mismatch: materialize tombstones, wipe, bidirectional repair ----
-            var (addRootHash, addRootCount) = _primary.AddStore.GetRootInfo();
-            var (delRootHash, delRootCount) = _primary.DeleteStore.GetRootInfo();
+            // ---- Epoch mismatch: single trie sync over effective sets ----
+            var (rootHash, rootCount) = _primary.EffectiveSet.GetRootInfo();
 
-            // Wire: [newEpoch (varint)] [addHash (32B)] [addCount (varint)] [delHash (32B)] [delCount (varint)]
-            BytesReceived += VarInt.Size(_primary.DeleteEpoch)
-                           + SetsumSize + VarInt.Size(addRootCount)
-                           + SetsumSize + VarInt.Size(delRootCount);
+            // Wire: [newEpoch (varint)] [rootHash (32B)] [rootCount (varint)]
+            BytesReceived += VarInt.Size(_primary.Epoch)
+                           + SetsumSize + VarInt.Size(rootCount);
 
             RoundTrips++;
             UsedFallback = true;
 
-            output.WriteLine("Epoch mismatch — materializing local tombstones before reset");
-            int epochRepairRemoved = _replica.MaterializeLocalDeleteStore();
-            _replica.WipeDeleteStore();
-
-            output.WriteLine("Epoch mismatch — repairing add store by bidirectional trie sync");
+            output.WriteLine("Epoch mismatch — single trie sync over effective sets");
             var (repairAdded, repairRemoved) = PerformBidirectionalTrieSync(
-                _primary.AddStore, _replica.AddStore, output, "add",
-                knownPrimaryRootHash: addRootHash,
-                knownPrimaryRootCount: addRootCount);
+                _primary.EffectiveSet, _replica.EffectiveSet, output, "effective",
+                knownPrimaryRootHash: rootHash,
+                knownPrimaryRootCount: rootCount);
             ItemsAdded = repairAdded;
-            ItemsDeleted = epochRepairRemoved + repairRemoved;
+            ItemsDeleted = repairRemoved;
 
-            _replica.AddStore.ResetInsertionOrder();
-            _replica.DeleteEpoch = _primary.DeleteEpoch;
-
-            if (delRootCount > 0)
-            {
-                output.WriteLine("Epoch mismatch — syncing delete store by bidirectional trie sync");
-                var (delAdded, _) = PerformBidirectionalTrieSync(
-                    _primary.DeleteStore, _replica.DeleteStore, output, "delete",
-                    knownPrimaryRootHash: delRootHash,
-                    knownPrimaryRootCount: delRootCount);
-                ItemsDeleted += delAdded;
-            }
-            else
-            {
-                output.WriteLine("Delete store: both empty after epoch repair, skipped");
-            }
-
-            _replica.DeleteStore.ResetInsertionOrder();
+            _replica.RebuildLog();
+            _replica.Epoch = _primary.Epoch;
         }
         else
         {
-            // ---- Normal path: sequence-based fast path ----
-            var addResult = _primary.AddStore.TryReconcileTail(
-                _replica.AddStore.InsertionCount, _replica.AddStore.Sum());
-            var delResult = _primary.DeleteStore.TryReconcileTail(
-                _replica.DeleteStore.InsertionCount, _replica.DeleteStore.Sum());
+            // ---- Normal path: sequence-based fast path over operation log ----
+            var result = _primary.TryGetTail(_replica.LogPosition, replicaEffectiveSum);
 
-            // Wire: [epoch (varint)] [addOutcome (1B)] [addPayload...] [delOutcome (1B)] [delPayload...]
-            BytesReceived += VarInt.Size(_primary.DeleteEpoch)
-                           + 1 + ResultPayloadSize(addResult)
-                           + 1 + ResultPayloadSize(delResult);
+            if (result != null)
+            {
+                // Fast path success: tail contains interleaved adds and deletes
+                int addCount = 0, delCount = 0;
+                foreach (var (isAdd, _) in result)
+                {
+                    if (isAdd) addCount++;
+                    else delCount++;
+                }
 
-            RoundTrips++;
+                // Wire: [epoch (varint)] [count (varint)] [ops: flag (1B) + key (32B) each]
+                BytesReceived += VarInt.Size(_primary.Epoch)
+                               + VarInt.Size(result.Count)
+                               + result.Count * (1 + KeySize);
 
-            ItemsAdded = ResolveStore(addResult, _primary.AddStore, _replica.AddStore, output, "add");
-            ItemsDeleted = ResolveStore(delResult, _primary.DeleteStore, _replica.DeleteStore, output, "delete");
+                RoundTrips++;
+
+                if (result.Count > 0)
+                {
+                    _replica.ApplyTail(result);
+                    _replica.Prepare();
+                }
+
+                ItemsAdded = addCount;
+                ItemsDeleted = delCount;
+            }
+            else
+            {
+                // Fast path failed — fallback to single trie sync over effective sets
+                UsedFallback = true;
+
+                var (rootHash, rootCount) = _primary.EffectiveSet.GetRootInfo();
+
+                // Wire: [epoch (varint)] [rootHash (32B)] [rootCount (varint)]
+                BytesReceived += VarInt.Size(_primary.Epoch)
+                               + SetsumSize + VarInt.Size(rootCount);
+                RoundTrips++;
+
+                output.WriteLine("Fast path failed — trie sync over effective sets");
+                var (repairAdded, repairRemoved) = PerformBidirectionalTrieSync(
+                    _primary.EffectiveSet, _replica.EffectiveSet, output, "effective",
+                    knownPrimaryRootHash: rootHash,
+                    knownPrimaryRootCount: rootCount);
+                ItemsAdded = repairAdded;
+                ItemsDeleted = repairRemoved;
+
+                _replica.RebuildLog();
+            }
         }
 
         output.WriteLine($"Sync complete — added: {ItemsAdded}, deleted: {ItemsDeleted}");
         return true;
     }
-
-    private int ResolveStore(List<byte[]>? result,
-        ReconcilableSet primary, ReconcilableSet replica, ITestOutputHelper output, string label)
-    {
-        if (result != null) // found
-        {
-            if (result.Count > 0)
-            {
-                result.Sort(ByteComparer.Instance);
-                replica.InsertBulkPresorted(result);
-                replica.Prepare();
-            }
-            return result.Count;
-        }
-        UsedFallback = true;
-        var (trieAdded, _) = PerformBidirectionalTrieSync(primary, replica, output, label);
-        replica.ResetInsertionOrder();
-        return trieAdded;
-    }
-
-    private static int ResultPayloadSize(List<byte[]>? r)
-        => r is { Count: > 0 } ? VarInt.Size(r.Count) + r.Count * KeySize : 0;
 }

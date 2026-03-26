@@ -1,6 +1,8 @@
 # Setsum Sync
 
-A set-reconciliation library for efficiently synchronising two sets of 32-byte keys across a network. The protocol minimises round-trips by trying a sequence-based unidirectional fast path before falling back to a full bidirectional binary-prefix trie traversal.
+A unidirectional, stateless set-reconciliation protocol for efficiently synchronising two sets of 32-byte keys across a network. Sync always flows **primary → replica**: the primary is the authoritative owner of the set, and replicas converge to it. The primary keeps **no per-replica state** — every sync is self-describing because the replica sends its own position and checksum in a single message.
+
+The protocol minimises round-trips by trying a sequence-based fast path before falling back to a binary-prefix trie traversal. The trie traversal itself is bidirectional (it discovers items to add *and* remove from the replica in a single pass), but the sync direction is always primary → replica.
 
 This protocol assumes all participating nodes are mutually trusted — reported counts and sums are accepted at face value.
 
@@ -8,15 +10,24 @@ This protocol assumes all participating nodes are mutually trusted — reported 
 
 ## Data Model
 
-Each node owns two append-only stores and an epoch counter:
+Both the primary and each replica maintain their own independent copy of the same structures:
 
-- **`AddStore`** — all inserted keys, synced primary→replica
-- **`DeleteStore`** — tombstones for deleted keys, synced primary→replica
-- **Effective membership** — `AddStore − DeleteStore`, computed at query time
+- **Operation log** — an ordered sequence of inserts (`+key`) and deletes (`-key`), with prefix sums tracking the effective setsum at each position
+- **Effective set** — the current membership set, maintained as a sorted store for trie-based queries
+- **Epoch** — incremented on compaction; gives replicas an unambiguous signal that the log was squashed
 
-Both stores are append-only, which keeps the protocol valid: the primary is always a superset of the replica within each store, so diffs are always non-negative within a store.
+The setsum's invertibility means prefix sums work naturally over mixed operations:
 
-**Compaction** lets the primary periodically apply tombstones to `AddStore`, wipe `DeleteStore`, and increment `DeleteEpoch`. Without it, tombstones would accumulate forever. The epoch gives replicas an unambiguous signal that this happened, so they can recover before resuming normal sync. Without epochs you must either keep tombstones forever or risk silently missing deletes that were compacted before a replica synced.
+```
+Log:       [+A, +B, -A, +C]
+PrefixSum: [H(A), H(A)+H(B), H(B), H(B)+H(C)]
+```
+
+The prefix sum at any position is the setsum of the effective set at that point.
+
+The primary's log is authoritative. A replica's log tracks its own view — during sync, the replica sends `(epoch, logPosition, effectiveSum)` and the primary responds purely from its own log and effective set, with no memory of any previous sync. This means any number of replicas can sync independently, and a replica that goes offline for an arbitrary period simply resumes from wherever it left off.
+
+**Compaction** squashes the log down to just the current effective set (all inserts), re-sequences, and increments the epoch. There is no separate tombstone store to wipe — the replica just knows its log position is stale and falls back to a single trie sync over effective membership.
 
 ---
 
@@ -34,52 +45,51 @@ This lets the primary node compute what a replica is missing by subtraction alon
 
 ## Sync Protocol
 
-Every sync starts the same way: the replica sends its epoch and sequence state for both stores in a single message. The primary's response determines which path follows.
+Every sync is initiated by the replica. It sends its epoch, log position, and effective-set sum in a single message — this fully describes the replica's state without the primary needing to remember anything about it. The primary's response determines which path follows.
 
 ```mermaid
 sequenceDiagram
     participant R as Replica
     participant P as Primary
 
-    R->>P: [epoch, addCount, addSum, delCount, delSum]
+    R->>P: [epoch, logPosition, effectiveSum]
 
-    alt Epoch matches + both stores verify
-        P-->>R: [epoch, addTailItems, delTailItems]
-        Note over R: Insert tail items — done
-    else Epoch matches + sum mismatch on a store
-        P-->>R: Fallback signal
-        Note over R: Bidirectional trie sync on that store
+    alt Epoch matches + prefix sum verifies
+        P-->>R: [epoch, tailOps (+key / -key)]
+        Note over R: Apply tail — done (1 RT)
+    else Epoch matches + sum mismatch
+        P-->>R: [epoch, rootHash, rootCount]
+        Note over R: Bidirectional trie sync on effective sets
     else Epoch mismatch
-        P-->>R: [newEpoch, addRootHash, addRootCount, delRootHash, delRootCount]
-        Note over R: Materialize local tombstones, wipe DeleteStore
-        Note over R: Bidirectional trie sync on AddStore (+ DeleteStore if non-empty)
+        P-->>R: [newEpoch, rootHash, rootCount]
+        Note over R: Bidirectional trie sync on effective sets
     end
 ```
 
 ### Fast path
 
-Every insert is numbered. Both stores maintain prefix sums over their insertion hashes. The primary verifies that `insertionPrefixSum[replicaCount] == replicaSum` — i.e. the replica holds exactly the first N items from the primary's history. If so, it sends only the tail.
+The primary maintains prefix sums over its operation log. It verifies that `prefixSum[replicaLogPosition] == replicaEffectiveSum` — i.e. the replica's effective set matches the primary's at that log position. If so, it sends the tail operations — both adds and deletes in one stream.
 
-This resolves any diff in 1 RT as long as the replica is simply behind — a diff of 1 item or 100,000 items is the same cost.
+This resolves any diff in 1 RT as long as the replica is simply behind — a diff of 1 item or 100,000 items is the same cost. Deletes flow through the exact same fast path as adds.
 
 ### Trie sync — the universal fallback
 
 The trie sync is not specific to any one failure mode. It is the single repair mechanism for all forms of divergence:
 
 - **Sum mismatch** — the replica has lost or gained items; the bidirectional trie finds and corrects all differences
-- **Epoch mismatch** — the primary has compacted; the replica first materializes its local tombstones into `AddStore`, wipes `DeleteStore`, then runs the same bidirectional trie sync to converge both stores
+- **Epoch mismatch** — the primary has compacted; one trie sync over effective sets converges both sides
 
-After any trie sync, the replica resets its insertion-order tracking from its current store contents so the fast path works again on the next sync.
+After any trie sync, the replica rebuilds its operation log from its current effective set so the fast path works again on the next sync.
 
-On epoch mismatch the primary piggybacks root `(hash, count)` for both stores in its response, so the trie BFS can start immediately with no extra round trip. If the delete store is empty after compaction (the common case), its sync is skipped entirely.
+On epoch mismatch the primary piggybacks root `(hash, count)` for the effective set in its response, so the trie BFS can start immediately with no extra round trip.
 
 ---
 
-## Bidirectional Trie Sync
+## Trie Sync (Fallback)
 
 Keys are sorted by their bit representation; each trie node covers all keys sharing a common bit-prefix. The protocol exchanges subtree `(hash, count)` pairs level by level, recursing into subtrees where the two sides differ, until each is small enough to resolve directly.
 
-Both directions are handled in a single BFS pass — additions and removals in the same traversal:
+The traversal is bidirectional in the sense that it discovers differences in both directions — items the replica is missing (added from primary) and items the replica has that the primary doesn't (removed from replica) — but the goal is always to converge the replica to the primary's state:
 
 ```mermaid
 flowchart TD
@@ -121,24 +131,32 @@ All messages are binary with VarInt-encoded counts. Key = 32 B, Setsum = 32 B.
 | Field | Size |
 |---|---|
 | epoch | varint |
-| addCount | varint |
-| addSum | 32 B |
-| delCount | varint |
-| delSum | 32 B |
+| logPosition | varint |
+| effectiveSum | 32 B |
 
-Covers both stores in one round trip.
+Covers everything in one round trip.
 
 ### Sequence response (primary → replica)
+
+**Fast path success:**
 
 | Field | Size |
 |---|---|
 | epoch | varint |
-| addOutcome | 1 B (0=Identical, 1=Found, 2=Fallback) |
-| addPayload | varint(count) + count × 32 B keys (if Found) |
-| delOutcome | 1 B |
-| delPayload | varint(count) + count × 32 B keys (if Found) |
+| opCount | varint |
+| ops | opCount × (1 B flag + 32 B key) |
 
-On epoch mismatch: `[newEpoch, addRootHash, addRootCount, delRootHash, delRootCount]` instead.
+Each operation carries a 1-byte flag (add or delete) and the 32-byte key.
+
+**Epoch or sum mismatch:**
+
+| Field | Size |
+|---|---|
+| newEpoch | varint |
+| rootHash | 32 B |
+| rootCount | varint |
+
+Followed by trie sync rounds.
 
 ### Trie expansion (per BFS level)
 
@@ -162,11 +180,10 @@ On epoch mismatch: `[newEpoch, addRootHash, addRootCount, delRootHash, delRootCo
 
 | Scenario | Round Trips | Notes |
 |---|---|---|
-| Sets identical | 1 | Sequence check covers both stores |
-| Replica behind by D items | 1 | Tail send, any D |
+| Sets identical | 1 | Sequence check, single message |
+| Replica behind by D items (adds and/or deletes) | 1 | Tail send, any D |
 | Sum mismatch (corruption) | 1 + O(log N) | 1 RT detects mismatch, trie sync repairs |
-| Epoch mismatch (empty del store) | 1 + O(log N) | Root info piggybacked, delete store skipped |
-| Epoch mismatch (non-empty del store) | 1 + O(log N) + O(log N) | Two trie passes, root info piggybacked |
+| Epoch mismatch | 1 + O(log N) | Root info piggybacked, single trie pass |
 
 ---
 
@@ -176,8 +193,8 @@ On epoch mismatch: `[newEpoch, addRootHash, addRootCount, delRootHash, delRootCo
 |---|---|
 | `Setsum.cs` | Commutative, invertible 256-bit hash with SIMD arithmetic |
 | `SortedKeyStore.cs` | Sorted flat array with O(log N) range-hash queries and Setsum peeling |
-| `ReconcilableSet.cs` | Set with sequence-based fast path, insertion-order tracking, and trie leaf resolution |
-| `SyncNodes.Triesync.cs` | Bidirectional trie BFS with combined leaf+expansion round trips |
+| `ReconcilableSet.cs` | Sorted set with trie prefix queries and leaf resolution |
+| `SyncableNode.cs` | Per-node operation log, effective set, compaction, and epoch management |
 | `SyncNodes.cs` | Sync orchestration and wire-byte accounting |
-| `SyncableNode.cs` | Per-node add/delete stores, compaction, and epoch management |
+| `SyncNodes.Triesync.cs` | Bidirectional trie BFS with combined leaf+expansion round trips |
 | `BitPrefix.cs` | Bit-level trie prefix with multi-bit extension |
