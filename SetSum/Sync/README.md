@@ -144,9 +144,10 @@ Covers everything in one round trip.
 |---|---|
 | epoch | varint |
 | opCount | varint |
-| ops | opCount × (1 B flag + 32 B key) |
+| flags | ⌈opCount / 8⌉ B (1 bit per op: 1 = add, 0 = delete) |
+| keys | opCount × 32 B |
 
-Each operation carries a 1-byte flag (add or delete) and the 32-byte key.
+Flags are packed as a bitfield — one bit per operation.
 
 **Epoch or sum mismatch:**
 

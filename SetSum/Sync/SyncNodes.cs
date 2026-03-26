@@ -94,10 +94,11 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
                     else delCount++;
                 }
 
-                // Wire: [epoch (varint)] [count (varint)] [ops: flag (1B) + key (32B) each]
+                // Wire: [epoch (varint)] [count (varint)] [flagBits (⌈count/8⌉ B)] [keys (count × 32B)]
                 BytesReceived += VarInt.Size(_primary.Epoch)
                                + VarInt.Size(result.Count)
-                               + result.Count * (1 + KeySize);
+                               + (result.Count + 7) / 8
+                               + result.Count * KeySize;
 
                 RoundTrips++;
 
