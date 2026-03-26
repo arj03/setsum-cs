@@ -95,7 +95,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Delete_replicaReceivesDeletesAfterSync()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.All().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
@@ -111,7 +111,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Delete_EffectiveSetExcludesDeletedKeys()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.All().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
@@ -165,7 +165,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Insert_AfterDelete_SyncsCorrectlyToreplica()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(20);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.All().ToList();
         var targetKey = sharedKeys[0];
 
         primary.Delete(targetKey);
@@ -214,7 +214,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // Replica syncs, primary then compacts. On the next sync the replica must
         // drop the keys the primary removed during compaction.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.All().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
         Assert.True(new SyncNodes(replica, primary).TrySync(_output)); // replica gets deletes
@@ -235,7 +235,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // After compaction the primary has both new adds and new deletes in the
         // current epoch. The replica must handle all of them in one sync.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.All().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5));
         Assert.True(new SyncNodes(replica, primary).TrySync(_output));
@@ -280,7 +280,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
 
         // Corrupt the replica: delete one key directly from the effective set.
-        var replicaKeys = replica.EffectiveSet.GetAllItems().ToList();
+        var replicaKeys = replica.EffectiveSet.All().ToList();
         var lostKey = replicaKeys[42];
         replica.EffectiveSet.DeleteBulkPresorted([lostKey]);
         replica.EffectiveSet.Prepare();
@@ -300,7 +300,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // recover all of them in one pass.
         var (primary, replica) = MakeNodesWithSharedKeys(200);
 
-        var replicaKeys = replica.EffectiveSet.GetAllItems().ToList();
+        var replicaKeys = replica.EffectiveSet.All().ToList();
         var lostKeys = new[] { replicaKeys[10], replicaKeys[50], replicaKeys[100], replicaKeys[150] }
             .OrderBy(k => k, ByteComparer.Instance).ToList();
         replica.EffectiveSet.DeleteBulkPresorted(lostKeys);
@@ -322,7 +322,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
 
         var extraKey = RandomKey();
-        replica.EffectiveSet.Insert(extraKey);
+        replica.EffectiveSet.Add(extraKey);
         replica.EffectiveSet.Prepare();
 
         var sim = new SyncNodes(replica, primary);
@@ -344,7 +344,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         for (int i = 0; i < 5; i++) primary.Insert(RandomKey());
 
         // Corrupt the replica: lose one of the original shared keys.
-        var replicaKeys = replica.EffectiveSet.GetAllItems().ToList();
+        var replicaKeys = replica.EffectiveSet.All().ToList();
         replica.EffectiveSet.DeleteBulkPresorted([replicaKeys[30]]);
         replica.EffectiveSet.Prepare();
 
@@ -363,7 +363,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         // deleted key to the replica's effective set. The next sync should
         // detect the mismatch and remove the stale key via trie fallback.
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().ToList();
+        var sharedKeys = primary.EffectiveSet.All().ToList();
 
         // Primary deletes 10 keys, sync to replica.
         primary.DeleteBulk(sharedKeys.Take(10));
@@ -371,7 +371,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         // Corrupt the replica: re-add one of the deleted keys directly.
         var deletedKey = sharedKeys[3];
-        replica.EffectiveSet.Insert(deletedKey);
+        replica.EffectiveSet.Add(deletedKey);
         replica.EffectiveSet.Prepare();
 
         var sim = new SyncNodes(replica, primary);

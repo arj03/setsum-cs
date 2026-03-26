@@ -1,7 +1,10 @@
+using System.Diagnostics;
+
 namespace Setsum.Sync;
 
 /// <summary>
-/// A sorted store of fixed-size (32-byte) keys with O(log N) range-hash queries via prefix sums.
+/// A sorted store of fixed-size (32-byte) keys with O(log N) range-hash queries via prefix sums,
+/// binary-prefix trie queries, and Setsum peeling at trie leaves.
 ///
 /// Layout: keys in a flat byte[] (_data). Per-key hashes are not stored — they are computed
 /// on demand in RebuildPrefixSums and derived from adjacent prefix sums during peeling.
@@ -162,11 +165,63 @@ public class SortedKeyStore
             yield return KeyAt(_data, i).ToArray();
     }
 
+    public Setsum Sum() => TotalInfo().Hash;
+
     public IEnumerable<byte[]> All()
     {
         EnsureSorted();
         for (int i = 0; i < _count; i++)
             yield return KeyAt(_data, i).ToArray();
+    }
+
+    public void InsertBulkPresorted(List<byte[]> items)
+    {
+        if (items.Count == 0) return;
+        Debug.Assert(IsSorted(items), "InsertBulkPresorted called with unsorted input.");
+        int n = items.Count;
+        var flat = new byte[n * KeySize];
+        for (int i = 0; i < n; i++)
+            items[i].CopyTo(flat, i * KeySize);
+        MergeSorted(flat, n);
+    }
+
+    public void DeleteBulkPresorted(List<byte[]> items)
+    {
+        if (items.Count == 0) return;
+        Debug.Assert(IsSorted(items), "DeleteBulkPresorted called with unsorted input.");
+        int n = items.Count;
+        var flat = new byte[n * KeySize];
+        for (int i = 0; i < n; i++)
+            items[i].CopyTo(flat, i * KeySize);
+        RemoveSorted(flat, n);
+    }
+
+    internal (int[] Splits, Setsum[] Hashes, int[] Counts) GetDescendantInfoByIndex(
+        int start, int end, int depth, int bits)
+    {
+        int numChildren = 1 << bits;
+        int[] splits = GetDescendantSplits(start, end, depth, bits);
+        var hashes = new Setsum[numChildren];
+        var counts = new int[numChildren];
+        for (int i = 0; i < numChildren; i++)
+        {
+            var (h, c) = RangeInfoByIndex(splits[i], splits[i + 1]);
+            hashes[i] = h;
+            counts[i] = c;
+        }
+        return (splits, hashes, counts);
+    }
+
+    internal List<byte[]>? TryReconcilePrefixByIndex(int start, int end, Setsum otherPrefixSum, int k)
+    {
+        var (myPrefixSum, _) = RangeInfoByIndex(start, end);
+        if (myPrefixSum == otherPrefixSum) return [];
+        if (otherPrefixSum.IsEmpty())
+            return RangeByIndex(start, end).ToList();
+        var diff = myPrefixSum - otherPrefixSum;
+        return TryPeelRangeByIndex(start, end, diff,
+            maxCountForPairPeel: k >= 2 ? 512 : 0,
+            maxCountForTriplePeel: k >= 3 ? 256 : 0);
     }
 
     internal List<byte[]>? TryPeelRangeByIndex(int start, int end, Setsum diff, int maxCountForPairPeel, int maxCountForTriplePeel = 256)
@@ -370,5 +425,13 @@ public class SortedKeyStore
     {
         if (arr.Length >= needed) return;
         arr = new T[Math.Max(needed, arr.Length * 2)];
+    }
+
+    private static bool IsSorted(List<byte[]> items)
+    {
+        for (int i = 1; i < items.Count; i++)
+            if (ByteComparer.Instance.Compare(items[i - 1], items[i]) > 0)
+                return false;
+        return true;
     }
 }

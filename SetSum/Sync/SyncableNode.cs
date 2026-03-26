@@ -17,7 +17,7 @@ public class SyncableNode
     private bool _logValid = true;
 
     // Effective membership set (for trie-based sync fallback)
-    public ReconcilableSet EffectiveSet { get; private set; } = new();
+    public SortedKeyStore EffectiveSet { get; private set; } = new();
 
     public int Epoch { get; set; }
     public int LogPosition => _logKeys.Count;
@@ -30,7 +30,7 @@ public class SyncableNode
         _logKeys.Add(key);
         _logIsAdd.Add(true);
         _prefixSums.Add(_prefixSums[^1] + Setsum.Hash(key));
-        EffectiveSet.Insert(key);
+        EffectiveSet.Add(key);
     }
 
     public void Delete(byte[] key)
@@ -138,7 +138,7 @@ public class SyncableNode
         _prefixSums.Add(new Setsum());
 
         EffectiveSet.Prepare();
-        foreach (var key in EffectiveSet.GetAllItems())
+        foreach (var key in EffectiveSet.All())
         {
             _logKeys.Add(key);
             _logIsAdd.Add(true);

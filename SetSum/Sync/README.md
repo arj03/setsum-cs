@@ -193,8 +193,7 @@ Followed by trie sync rounds.
 | File | Purpose |
 |---|---|
 | `Setsum.cs` | Commutative, invertible 256-bit hash with SIMD arithmetic |
-| `SortedKeyStore.cs` | Sorted flat array with O(log N) range-hash queries and Setsum peeling |
-| `ReconcilableSet.cs` | Sorted set with trie prefix queries and leaf resolution |
+| `SortedKeyStore.cs` | Sorted flat array with O(log N) range-hash queries, trie prefix queries, and Setsum peeling at leaves |
 | `SyncableNode.cs` | Per-node operation log, effective set, compaction, and epoch management |
 | `SyncNodes.cs` | Sync orchestration and wire-byte accounting |
 | `SyncNodes.Triesync.cs` | Bidirectional trie BFS with combined leaf+expansion round trips |

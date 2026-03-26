@@ -59,7 +59,7 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         if (!epochMatch)
         {
             // ---- Epoch mismatch: single trie sync over effective sets ----
-            var (rootHash, rootCount) = _primary.EffectiveSet.GetRootInfo();
+            var (rootHash, rootCount) = _primary.EffectiveSet.TotalInfo();
 
             // Wire: [newEpoch (varint)] [rootHash (32B)] [rootCount (varint)]
             BytesReceived += VarInt.Size(_primary.Epoch)
@@ -116,7 +116,7 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
                 // Fast path failed — fallback to single trie sync over effective sets
                 UsedFallback = true;
 
-                var (rootHash, rootCount) = _primary.EffectiveSet.GetRootInfo();
+                var (rootHash, rootCount) = _primary.EffectiveSet.TotalInfo();
 
                 // Wire: [epoch (varint)] [rootHash (32B)] [rootCount (varint)]
                 BytesReceived += VarInt.Size(_primary.Epoch)

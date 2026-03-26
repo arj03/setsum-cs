@@ -14,8 +14,8 @@ public partial class SyncNodes
     /// Per BFS level: one round trip batching leaf resolution + child expansion.
     /// </summary>
     private (int Added, int Removed) PerformBidirectionalTrieSync(
-        ReconcilableSet primary,
-        ReconcilableSet replica,
+        SortedKeyStore primary,
+        SortedKeyStore replica,
         ITestOutputHelper output,
         string label,
         Setsum? knownPrimaryRootHash = null,
@@ -29,7 +29,7 @@ public partial class SyncNodes
         // ---- Root -------------------------------------------------------
         var (primaryRootStart, primaryRootEnd) = primary.GetRootBounds();
         var (replicaRootStart, replicaRootEnd) = replica.GetRootBounds();
-        var (replicaRootHash, replicaRootCount) = replica.GetInfoByIndex(replicaRootStart, replicaRootEnd);
+        var (replicaRootHash, replicaRootCount) = replica.RangeInfoByIndex(replicaRootStart, replicaRootEnd);
 
         Setsum primaryRootHash;
         int primaryRootCount;
@@ -41,7 +41,7 @@ public partial class SyncNodes
         }
         else
         {
-            (primaryRootHash, primaryRootCount) = primary.GetRootInfo();
+            (primaryRootHash, primaryRootCount) = primary.TotalInfo();
             // Wire: request = 0 bytes (root), response = varint(count) + Setsum
             RoundTrips++;
             BytesReceived += VarInt.Size(primaryRootCount) + (primaryRootCount > 0 ? SetsumSize : 0);
@@ -83,7 +83,7 @@ public partial class SyncNodes
 
                 if (primaryCount == 0)
                 {
-                    var stale = replica.GetItemsByIndex(rsStart, rsEnd).ToList();
+                    var stale = replica.RangeByIndex(rsStart, rsEnd).ToList();
                     pendingRemoves.AddRange(stale);
                     removed += stale.Count;
                 }
@@ -114,7 +114,7 @@ public partial class SyncNodes
                 {
                     // Bulk pull: request prefix, receive all keys.
                     BytesSent += prefix.NetworkSize;
-                    var items = primary.GetItemsByIndex(psStart, psEnd).ToList();
+                    var items = primary.RangeByIndex(psStart, psEnd).ToList();
                     BytesReceived += items.Count * KeySize;
                     pendingAdds.AddRange(items);
                     added += items.Count;
@@ -158,10 +158,10 @@ public partial class SyncNodes
                 }
 
                 // depth >= MaxPrefixDepth — full key exchange.
-                var replicaItems = replica.GetItemsByIndex(rsStart, rsEnd).ToList();
+                var replicaItems = replica.RangeByIndex(rsStart, rsEnd).ToList();
                 BytesSent += prefix.NetworkSize + replicaItems.Count * KeySize;
 
-                var primaryItems = primary.GetItemsByIndex(psStart, psEnd).ToList();
+                var primaryItems = primary.RangeByIndex(psStart, psEnd).ToList();
                 var (toAdd, toRemove) = DiffSorted(primaryItems, replicaItems);
 
                 BytesReceived += toAdd.Count * KeySize;

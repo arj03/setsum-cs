@@ -135,7 +135,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     public void Perf_Delete_LargeAddsAndDeletes()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().Take(50_000).ToList();
+        var sharedKeys = primary.EffectiveSet.All().Take(50_000).ToList();
 
         primary.DeleteBulk(sharedKeys);
         for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
@@ -161,7 +161,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     public void Perf_Epoch_TinyResync_AfterCompaction()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().Take(5_001).ToList();
+        var sharedKeys = primary.EffectiveSet.All().Take(5_001).ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
         primary.Prepare(); replica.Prepare();
@@ -184,7 +184,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     public void Perf_Epoch_LargeResync_AfterCompaction()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().Take(55_000).ToList();
+        var sharedKeys = primary.EffectiveSet.All().Take(55_000).ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
         primary.Prepare(); replica.Prepare();
@@ -207,7 +207,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     public void Perf_Epoch_OnlyAdds_AfterCompaction()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().Take(5_000).ToList();
+        var sharedKeys = primary.EffectiveSet.All().Take(5_000).ToList();
 
         primary.DeleteBulk(sharedKeys);
         primary.Prepare(); replica.Prepare();
@@ -229,7 +229,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     public void Perf_Epoch_DeletesBeforeAndAfterCompaction()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
-        var sharedKeys = primary.EffectiveSet.GetAllItems().Take(25_000).ToList();
+        var sharedKeys = primary.EffectiveSet.All().Take(25_000).ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
         primary.Prepare(); replica.Prepare();
