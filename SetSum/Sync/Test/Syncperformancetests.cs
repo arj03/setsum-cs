@@ -22,7 +22,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         return b;
     }
 
-    private (SyncableNode primary, SyncableNode replica) MakeNodesWithSharedKeys(int shared)
+    private static (SyncableNode primary, SyncableNode replica) MakeNodesWithSharedKeys(int shared)
     {
         var primary = new SyncableNode();
         var replica = new SyncableNode();
@@ -43,14 +43,13 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
         for (int i = 0; i < 3; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.Equal(3, sim.ItemsAdded);
-        _output.WriteLine($"Small diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        Assert.Equal(1, result.RoundTrips);
+        Assert.Equal(3, result.ItemsAdded);
+        _output.WriteLine($"Small diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     [Fact]
@@ -59,22 +58,19 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
         for (int i = 0; i < 8; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.Equal(8, sim.ItemsAdded);
+        Assert.Equal(1, result.RoundTrips);
+        Assert.Equal(8, result.ItemsAdded);
         Assert.True(sw.ElapsedMilliseconds < 100);
-        _output.WriteLine($"Medium diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Medium diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     [Fact]
     public void Perf_Add_LargeDiff_FastPathSendsTail()
     {
-        // With sequence-based fast path, even large diffs resolve in one RT
-        // because the tail is always available. Verify it returns the tail, not null.
         var (primary, replica) = MakeNodesWithSharedKeys(50_000);
         for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
 
@@ -82,11 +78,11 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         primary.Prepare();
 
         var sw = Stopwatch.StartNew();
-        var result = primary.TryGetTail(replica.LogPosition, replica.EffectiveSet.Sum());
+        var tail = primary.TryGetTail(replica.LogPosition, replica.EffectiveSet.Sum());
         sw.Stop();
 
-        Assert.NotNull(result);
-        Assert.Equal(50_000, result.Count);
+        Assert.NotNull(tail);
+        Assert.Equal(50_000, tail.Count);
         _output.WriteLine($"Large tail send – {sw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
@@ -97,20 +93,15 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         int newItems = 10_000;
         for (int i = 0; i < newItems; i++) primary.Insert(RandomKey());
 
-        replica.Prepare();
-        primary.Prepare();
-
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
-        // With sequence-based protocol, this resolves via fast path (tail send), not trie fallback.
-        Assert.False(sim.UsedFallback);
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.Equal(newItems, sim.ItemsAdded);
+        Assert.False(result.UsedFallback);
+        Assert.Equal(1, result.RoundTrips);
+        Assert.Equal(newItems, result.ItemsAdded);
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Large fast path – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Large fast path – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     [Fact]
@@ -121,12 +112,11 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         for (int i = 0; i < items; i++) primary.Insert(RandomKey());
 
         var replica = new SyncableNode();
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.Equal(items, sim.ItemsAdded);
+        Assert.Equal(items, result.ItemsAdded);
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Empty replica – Trips: {sim.RoundTrips}, Items: {sim.ItemsAdded}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Empty replica – Trips: {result.RoundTrips}, Items: {result.ItemsAdded}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     // ── Delete-path (deletes flow through the same fast path) ─────────────────
@@ -139,20 +129,16 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys);
         for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
-        primary.Prepare();
-        replica.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
-        Assert.Equal(50_000, sim.ItemsAdded);
-        Assert.Equal(50_000, sim.ItemsDeleted);
-        // Deletes now flow through the same fast path — should be 1 RT
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.False(sim.UsedFallback);
-        _output.WriteLine($"Large deletes – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        Assert.Equal(50_000, result.ItemsAdded);
+        Assert.Equal(50_000, result.ItemsDeleted);
+        Assert.Equal(1, result.RoundTrips);
+        Assert.False(result.UsedFallback);
+        _output.WriteLine($"Large deletes – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     // ── Epoch recovery ────────────────────────────────────────────────────────
@@ -164,20 +150,18 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var sharedKeys = primary.EffectiveSet.All().Take(5_001).ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
-        primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        replica.SyncFrom(primary);
 
         primary.Delete(sharedKeys[5_000]);
         primary.Insert(RandomKey());
         primary.Compact();
 
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     [Fact]
@@ -187,20 +171,18 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var sharedKeys = primary.EffectiveSet.All().Take(55_000).ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
-        primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        replica.SyncFrom(primary);
 
         primary.DeleteBulk(sharedKeys.Skip(5_000).Take(50_000));
         for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
         primary.Compact();
 
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch large – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch large – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     [Fact]
@@ -210,19 +192,17 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var sharedKeys = primary.EffectiveSet.All().Take(5_000).ToList();
 
         primary.DeleteBulk(sharedKeys);
-        primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        replica.SyncFrom(primary);
 
         for (int i = 0; i < 10_000; i++) primary.Insert(RandomKey());
         primary.Compact();
 
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch adds-only – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch adds-only – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 
     [Fact]
@@ -232,19 +212,17 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var sharedKeys = primary.EffectiveSet.All().Take(25_000).ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
-        primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        replica.SyncFrom(primary);
 
         primary.DeleteBulk(sharedKeys.Skip(5_000).Take(10_000));
         primary.Compact();
-        primary.DeleteBulk(sharedKeys.Skip(15_000).Take(10_000)); // new deletes post-compact
+        primary.DeleteBulk(sharedKeys.Skip(15_000).Take(10_000));
 
-        var sim = new SyncNodes(replica, primary);
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch delete-after – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch delete-after – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {result.RoundTrips}, Rx: {result.BytesReceived:N0}, Tx: {result.BytesSent:N0}");
     }
 }

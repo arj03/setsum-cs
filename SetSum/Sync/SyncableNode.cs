@@ -84,7 +84,7 @@ public class SyncableNode
     }
 
     /// <summary>
-    /// Apply tail operations received from the primary. Updates the log in order,
+    /// Apply tail operations received from a primary. Updates the log in order,
     /// then applies effective-set changes as batch operations for performance.
     /// </summary>
     public void ApplyTail(List<(bool IsAdd, byte[] Key)> ops)
@@ -153,4 +153,33 @@ public class SyncableNode
     }
 
     public int EffectiveCount() => EffectiveSet.Count();
+
+    // ── Sync (convenience) ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Synchronises this node (replica) from the given primary by running
+    /// the message-based protocol in-process.
+    /// </summary>
+    public SyncResult SyncFrom(SyncableNode primary)
+    {
+        var session = new ReplicaSession(this);
+        var responder = new PrimaryResponder(primary);
+
+        byte[] msg = session.Start();
+        int bytesSent = 0, bytesReceived = 0;
+        while (true)
+        {
+            bytesSent += msg.Length;
+            byte[] response = responder.Respond(msg);
+            bytesReceived += response.Length;
+            var result = session.Process(response);
+            if (result.Done)
+            {
+                result.BytesSent = bytesSent;
+                result.BytesReceived = bytesReceived;
+                return result;
+            }
+            msg = result.NextMessage!;
+        }
+    }
 }

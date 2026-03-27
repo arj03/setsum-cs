@@ -21,4 +21,31 @@ public static class VarInt
         if (value < 0x10000000) return 4;
         return 5;
     }
+
+    /// <summary>Encodes <paramref name="value"/> into <paramref name="ms"/>.</summary>
+    public static void Write(MemoryStream ms, int value)
+    {
+        if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+        uint v = (uint)value;
+        while (v >= 0x80)
+        {
+            ms.WriteByte((byte)(v | 0x80));
+            v >>= 7;
+        }
+        ms.WriteByte((byte)v);
+    }
+
+    /// <summary>Decodes a varint from <paramref name="buf"/> at <paramref name="pos"/>, advancing pos.</summary>
+    public static int Read(byte[] buf, ref int pos)
+    {
+        int value = 0, shift = 0;
+        byte b;
+        do
+        {
+            b = buf[pos++];
+            value |= (b & 0x7F) << shift;
+            shift += 7;
+        } while ((b & 0x80) != 0);
+        return value;
+    }
 }

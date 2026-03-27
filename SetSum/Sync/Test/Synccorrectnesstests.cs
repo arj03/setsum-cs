@@ -1,6 +1,5 @@
 using System.Security.Cryptography;
 using Xunit;
-using Xunit.Abstractions;
 
 namespace Setsum.Sync.Test;
 
@@ -9,10 +8,8 @@ namespace Setsum.Sync.Test;
 /// datasets so they run fast and failures are easy to diagnose. For throughput
 /// and round-trip efficiency at scale, see <see cref="SyncPerformanceTests"/>.
 /// </summary>
-public class SyncCorrectnessTests(ITestOutputHelper output)
+public class SyncCorrectnessTests
 {
-    private readonly ITestOutputHelper _output = output;
-
     private static byte[] RandomKey()
     {
         var b = new byte[32];
@@ -39,11 +36,10 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Add_Identical_IsNoop()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sim = new SyncNodes(replica, primary);
+        var result = replica.SyncFrom(primary);
 
-        Assert.True(sim.TrySync(_output));
-        Assert.Equal(0, sim.ItemsAdded);
-        Assert.Equal(0, sim.ItemsDeleted);
+        Assert.Equal(0, result.ItemsAdded);
+        Assert.Equal(0, result.ItemsDeleted);
         Assert.Equal(primary.Sum(), replica.Sum());
     }
 
@@ -53,11 +49,10 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(50);
         for (int i = 0; i < 5; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.Equal(5, sim.ItemsAdded);
-        Assert.Equal(0, sim.ItemsDeleted);
+        Assert.Equal(5, result.ItemsAdded);
+        Assert.Equal(0, result.ItemsDeleted);
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
@@ -69,10 +64,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var replica = new SyncableNode();
         for (int i = 0; i < 200; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.Equal(200, sim.ItemsAdded);
+        Assert.Equal(200, result.ItemsAdded);
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
@@ -81,12 +75,10 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Add_MinimalRoundTrips_IdenticalStores()
     {
         var (primary, replica) = MakeNodesWithSharedKeys(50);
-        var sim = new SyncNodes(replica, primary);
-
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
         // Exactly 1 round trip for a fully-identical sync
-        Assert.Equal(1, sim.RoundTrips);
+        Assert.Equal(1, result.RoundTrips);
     }
 
     // ── Delete (no compaction) ────────────────────────────────────────────────
@@ -99,10 +91,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.Equal(10, sim.ItemsDeleted);
+        Assert.Equal(10, result.ItemsDeleted);
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
@@ -115,8 +106,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys.Take(10));
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        replica.SyncFrom(primary);
 
         // Effective set sum must match on both sides.
         Assert.Equal(primary.Sum(), replica.Sum());
@@ -136,8 +126,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         Assert.Equal(sumBefore, primary.Sum()); // phantom delete is a no-op
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        replica.SyncFrom(primary);
 
         Assert.Equal(primary.Sum(), replica.Sum());
     }
@@ -171,8 +160,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         primary.Delete(targetKey);
         primary.Insert(targetKey); // re-insert
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        replica.SyncFrom(primary);
 
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
@@ -200,8 +188,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         var replica = new SyncableNode(); // epoch = 0, empty
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
@@ -217,12 +204,11 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var sharedKeys = primary.EffectiveSet.All().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(10));
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output)); // replica gets deletes
+        replica.SyncFrom(primary); // replica gets deletes
 
         primary.Compact(); // squash log, bump epoch
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        replica.SyncFrom(primary);
 
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
@@ -238,7 +224,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         var sharedKeys = primary.EffectiveSet.All().ToList();
 
         primary.DeleteBulk(sharedKeys.Take(5));
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        replica.SyncFrom(primary);
 
         primary.DeleteBulk(sharedKeys.Skip(5).Take(5)); // 5 more deletes before compact
         primary.Compact();
@@ -246,8 +232,7 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         for (int i = 0; i < 8; i++) primary.Insert(RandomKey()); // new adds in new epoch
         primary.DeleteBulk(sharedKeys.Skip(10).Take(3));         // new deletes in new epoch
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        replica.SyncFrom(primary);
 
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
@@ -285,10 +270,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         replica.EffectiveSet.DeleteBulkPresorted([lostKey]);
         replica.EffectiveSet.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.True(sim.UsedFallback, "sum mismatch should trigger trie fallback");
+        Assert.True(result.UsedFallback, "sum mismatch should trigger trie fallback");
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
@@ -306,10 +290,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         replica.EffectiveSet.DeleteBulkPresorted(lostKeys);
         replica.EffectiveSet.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.True(sim.UsedFallback);
+        Assert.True(result.UsedFallback);
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
@@ -325,10 +308,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         replica.EffectiveSet.Add(extraKey);
         replica.EffectiveSet.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.True(sim.UsedFallback);
+        Assert.True(result.UsedFallback);
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
@@ -348,10 +330,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         replica.EffectiveSet.DeleteBulkPresorted([replicaKeys[30]]);
         replica.EffectiveSet.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.True(sim.UsedFallback);
+        Assert.True(result.UsedFallback);
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }
@@ -367,17 +348,16 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
 
         // Primary deletes 10 keys, sync to replica.
         primary.DeleteBulk(sharedKeys.Take(10));
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        replica.SyncFrom(primary);
 
         // Corrupt the replica: re-add one of the deleted keys directly.
         var deletedKey = sharedKeys[3];
         replica.EffectiveSet.Add(deletedKey);
         replica.EffectiveSet.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var result = replica.SyncFrom(primary);
 
-        Assert.True(sim.UsedFallback);
+        Assert.True(result.UsedFallback);
         Assert.Equal(primary.Sum(), replica.Sum());
         Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
     }

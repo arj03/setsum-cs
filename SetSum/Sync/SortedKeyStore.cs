@@ -133,6 +133,55 @@ public class SortedKeyStore
         return (0, _count);
     }
 
+    /// <summary>
+    /// Finds the index range [start, end) of all keys whose leading bits match the given prefix.
+    /// </summary>
+    internal (int Start, int End) FindRange(BitPrefix prefix)
+    {
+        if (prefix.Length == 0)
+            return (0, _count);
+
+        // Build the low key: prefix bits followed by zeros
+        Span<byte> lo = stackalloc byte[KeySize];
+        WritePrefixBits(lo, prefix.Bits, prefix.Length);
+
+        // Build the high key: prefix bits followed by ones
+        Span<byte> hi = stackalloc byte[KeySize];
+        hi.Fill(0xFF);
+        WritePrefixBits(hi, prefix.Bits, prefix.Length);
+
+        return (LowerBound(lo, 0, _count), UpperBound(hi, 0, _count));
+    }
+
+    private static void WritePrefixBits(Span<byte> key, ulong bits, int length)
+    {
+        // Write the full bytes of the prefix
+        int fullBytes = length / 8;
+        for (int i = 0; i < fullBytes; i++)
+            key[i] = (byte)(bits >> (56 - i * 8));
+
+        // Write the partial byte: keep only the top `rem` bits from the prefix,
+        // preserve the remaining bits of the destination (0s for lo, 1s for hi)
+        int rem = length % 8;
+        if (rem > 0)
+        {
+            byte prefixByte = (byte)(bits >> (56 - fullBytes * 8));
+            byte mask = (byte)(0xFF << (8 - rem));
+            key[fullBytes] = (byte)((prefixByte & mask) | (key[fullBytes] & ~mask));
+        }
+    }
+
+    private int UpperBound(ReadOnlySpan<byte> t, int lo, int hi)
+    {
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (KeyAt(_data, mid).SequenceCompareTo(t) <= 0) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
     internal int[] GetDescendantSplits(int start, int end, int depth, int bits)
     {
         int numLeaves = 1 << bits;
