@@ -49,7 +49,7 @@ function clear() { logEl.innerHTML = ""; }
 // ---------------------------------------------------------------------------
 let wasm;
 try {
-  const resp = await fetch("build/setsum.wasm?v=" + Date.now());
+  const resp = await fetch("build/setsum.wasm");
   const { instance } = await WebAssembly.instantiateStreaming(resp, {
     env: { abort: () => { throw new Error("abort"); } }
   });
