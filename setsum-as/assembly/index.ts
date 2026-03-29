@@ -163,30 +163,14 @@ export function setsum_sub(a: usize, b: usize, out: usize): void {
 
 /** Batch insert: state += reduce(hashes[0..n-1]).  Hashes are contiguous 32-byte records. */
 export function setsum_insert_batch(state: usize, hashes: usize, n: i32): void {
-  let lo = v128.load(state);
-  let hi = v128.load(state + 16);
-
   for (let i: i32 = 0; i < n; i++) {
-    const ptr = hashes + (<usize>i << 5); // i * 32
-    lo = addModLo(lo, reduceLo(v128.load(ptr)));
-    hi = addModHi(hi, reduceHi(v128.load(ptr + 16)));
+    setsum_insert(state, hashes + (<usize>i << 5), state);
   }
-
-  v128.store(state, lo);
-  v128.store(state + 16, hi);
 }
 
 /** Batch remove: state -= reduce(hashes[0..n-1]). */
 export function setsum_remove_batch(state: usize, hashes: usize, n: i32): void {
-  let lo = v128.load(state);
-  let hi = v128.load(state + 16);
-
   for (let i: i32 = 0; i < n; i++) {
-    const ptr = hashes + (<usize>i << 5);
-    lo = addModLo(lo, negateLo(reduceLo(v128.load(ptr))));
-    hi = addModHi(hi, negateHi(reduceHi(v128.load(ptr + 16))));
+    setsum_remove(state, hashes + (<usize>i << 5), state);
   }
-
-  v128.store(state, lo);
-  v128.store(state + 16, hi);
 }
