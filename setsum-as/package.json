@@ -1,0 +1,14 @@
+{
+  "name": "setsum-as",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "asc assembly/index.ts --target release",
+    "build:debug": "asc assembly/index.ts --target debug",
+    "test": "node test.mjs",
+    "serve": "npx serve ."
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.0"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "options": {
+    "bindings": "raw"
+  },
+  "targets": {
+    "release": {
+      "outFile": "build/setsum.wasm",
+      "textFile": "build/setsum.wat",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "noAssert": true,
+      "runtime": "stub",
+      "memoryBase": 1024,
+      "exportStart": false
+    },
+    "debug": {
+      "outFile": "build/setsum.debug.wasm",
+      "textFile": "build/setsum.debug.wat",
+      "debug": true,
+      "runtime": "stub",
+      "memoryBase": 1024
+    }
+  }
+}

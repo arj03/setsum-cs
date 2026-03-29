@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Setsum WASM Benchmark</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
+  h1 { font-size: 1.5rem; margin-bottom: 1.5rem; color: #f8fafc; }
+  .controls { display: flex; gap: 1rem; margin-bottom: 1.5rem; align-items: center; flex-wrap: wrap; }
+  label { font-size: 0.875rem; color: #94a3b8; }
+  input[type=number] { width: 8rem; padding: 0.4rem 0.6rem; background: #1e293b; border: 1px solid #334155; border-radius: 4px; color: #e2e8f0; font-size: 0.875rem; }
+  button { padding: 0.5rem 1.2rem; border: none; border-radius: 4px; font-size: 0.875rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: #3b82f6; color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: #2563eb; }
+  .btn-secondary { background: #475569; color: #fff; }
+  .btn-secondary:hover:not(:disabled) { background: #64748b; }
+  #log { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 1rem; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 0.8125rem; line-height: 1.7; white-space: pre-wrap; min-height: 12rem; max-height: 32rem; overflow-y: auto; }
+  .dim { color: #64748b; }
+  .ok  { color: #4ade80; }
+  .val { color: #facc15; }
+  .hi  { color: #f472b6; }
+</style>
+</head>
+<body>
+
+<h1>Setsum &mdash; AssemblyScript WASM Benchmark</h1>
+
+<div class="controls">
+  <label>Items: <input id="count" type="number" value="1000000" min="1" step="100000"></label>
+  <button id="btnLcg" class="btn-primary">Run LCG benchmark</button>
+  <button id="btnSha" class="btn-secondary">Run SHA-256 benchmark</button>
+</div>
+
+<div id="log"><span class="dim">Loading WASM module&hellip;</span></div>
+
+<script type="module">
+const logEl = document.getElementById("log");
+const btnLcg = document.getElementById("btnLcg");
+const btnSha = document.getElementById("btnSha");
+const countEl = document.getElementById("count");
+
+function log(html) { logEl.innerHTML += "\n" + html; logEl.scrollTop = logEl.scrollHeight; }
+function clear() { logEl.innerHTML = ""; }
+
+// ---------------------------------------------------------------------------
+// Load WASM
+// ---------------------------------------------------------------------------
+let wasm;
+try {
+  const resp = await fetch("build/setsum.wasm");
+  const { instance } = await WebAssembly.instantiateStreaming(resp, {
+    env: { abort: () => { throw new Error("abort"); } }
+  });
+  wasm = instance.exports;
+  clear();
+  log(`<span class="ok">WASM loaded.</span>  Memory: ${(wasm.memory.buffer.byteLength / 1024).toFixed(0)} KB`);
+  log(`<span class="dim">Choose a benchmark to run.</span>`);
+} catch (e) {
+  clear();
+  log(`<span class="hi">Failed to load WASM:</span> ${e.message}`);
+  log(`<span class="dim">Make sure you built with: npm run build</span>`);
+  log(`<span class="dim">And serve this directory, e.g.: npx serve .</span>`);
+}
+
+// ---------------------------------------------------------------------------
+// Memory helpers
+// ---------------------------------------------------------------------------
+function getU8()  { return new Uint8Array(wasm.memory.buffer); }
+function getU32() { return new Uint32Array(wasm.memory.buffer); }
+
+// Scratch pointers (above memoryBase=1024 and static data)
+const STATE = 4096;
+const HASH  = 4096 + 32;
+const OUT   = 4096 + 64;
+
+function readHex(ptr) {
+  const mem = getU8();
+  let s = "";
+  for (let i = 0; i < 32; i++) s += mem[ptr + i].toString(16).padStart(2, "0");
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// LCG hash generation  (matches Program.cs)
+// ---------------------------------------------------------------------------
+function generateLcg(n) {
+  // Pre-generate all hashes into a flat ArrayBuffer
+  const buf = new Uint8Array(n * 32);
+  for (let i = 0; i < n; i++) {
+    let val = i;
+    const base = i * 32;
+    for (let j = 0; j < 32; j++) {
+      buf[base + j] = (val ^ (val >>> 8)) & 0xff;
+      val = (Math.imul(val, 1664525) + 1013904223) | 0;
+    }
+  }
+  return buf;
+}
+
+// ---------------------------------------------------------------------------
+// SHA-256 hash generation  (matches Perf.cs)
+// ---------------------------------------------------------------------------
+async function generateSha256(n) {
+  const buf = new Uint8Array(n * 32);
+  // Batch to avoid blocking the UI
+  const batchSize = 50000;
+  for (let start = 0; start < n; start += batchSize) {
+    const end = Math.min(start + batchSize, n);
+    const promises = [];
+    for (let i = start; i < end; i++) {
+      // SHA256(little-endian i32) — matches BitConverter.GetBytes(i) in C#
+      const input = new Uint8Array(4);
+      const dv = new DataView(input.buffer);
+      dv.setInt32(0, i, true);
+      promises.push(crypto.subtle.digest("SHA-256", input));
+    }
+    const results = await Promise.all(promises);
+    for (let k = 0; k < results.length; k++) {
+      buf.set(new Uint8Array(results[k]), (start + k) * 32);
+    }
+    if (start + batchSize < n) {
+      log(`<span class="dim">  hashing… ${end.toLocaleString()} / ${n.toLocaleString()}</span>`);
+      await new Promise(r => setTimeout(r, 0)); // yield to UI
+    }
+  }
+  return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Core benchmark: insert N hashes from a flat buffer
+// ---------------------------------------------------------------------------
+function runInsertBench(hashes, n) {
+  const mem = getU8();
+  // Copy all hashes into WASM memory starting after scratch area
+  const hashesBase = OUT + 32;
+
+  // Grow memory if needed
+  const needed = hashesBase + n * 32;
+  while (wasm.memory.buffer.byteLength < needed) {
+    wasm.memory.grow(Math.ceil((needed - wasm.memory.buffer.byteLength) / 65536));
+  }
+
+  // Re-acquire views after possible grow
+  const mem2 = new Uint8Array(wasm.memory.buffer);
+  mem2.set(hashes, hashesBase);
+
+  // Benchmark: insert all hashes
+  wasm.setsum_empty(STATE);
+
+  const t0 = performance.now();
+  for (let i = 0; i < n; i++) {
+    const hPtr = hashesBase + i * 32;
+    wasm.setsum_insert(STATE, hPtr, STATE); // in-place: state = state + hash
+  }
+  const t1 = performance.now();
+
+  return { ms: t1 - t0, digest: readHex(STATE) };
+}
+
+// ---------------------------------------------------------------------------
+// Button handlers
+// ---------------------------------------------------------------------------
+async function runBench(mode) {
+  const n = parseInt(countEl.value) || 1_000_000;
+  btnLcg.disabled = btnSha.disabled = true;
+  clear();
+
+  log(`<span class="ok">Benchmark:</span> ${mode === "lcg" ? "LCG (deterministic)" : "SHA-256"} — <span class="val">${n.toLocaleString()}</span> items`);
+  log("");
+
+  // Generate hashes
+  log(`<span class="dim">Generating hashes…</span>`);
+  const genStart = performance.now();
+  const hashes = mode === "lcg" ? generateLcg(n) : await generateSha256(n);
+  const genMs = performance.now() - genStart;
+  log(`Hash generation: <span class="val">${genMs.toFixed(1)} ms</span>`);
+  log("");
+
+  // Yield before benchmark
+  await new Promise(r => setTimeout(r, 10));
+
+  // Run
+  log(`<span class="dim">Running insertions…</span>`);
+  const { ms, digest } = runInsertBench(hashes, n);
+
+  log("");
+  log(`<span class="ok">━━━ Results ━━━</span>`);
+  log(`Insert ${n.toLocaleString()} items: <span class="hi">${ms.toFixed(2)} ms</span>`);
+  log(`Throughput:        <span class="hi">${(n / ms * 1000).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ",")} ops/sec</span>`);
+  log(`Per insert:        <span class="val">${(ms / n * 1e6).toFixed(1)} ns</span>`);
+  log(`Digest:            <span class="val">${digest}</span>`);
+
+  btnLcg.disabled = btnSha.disabled = false;
+}
+
+btnLcg.addEventListener("click", () => runBench("lcg"));
+btnSha.addEventListener("click", () => runBench("sha"));
+</script>
+</body>
+</html>
