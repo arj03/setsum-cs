@@ -49,7 +49,7 @@ function clear() { logEl.innerHTML = ""; }
 // ---------------------------------------------------------------------------
 let wasm;
 try {
-  const resp = await fetch("build/setsum.wasm");
+  const resp = await fetch("build/setsum.wasm?v=" + Date.now());
   const { instance } = await WebAssembly.instantiateStreaming(resp, {
     env: { abort: () => { throw new Error("abort"); } }
   });
@@ -146,14 +146,11 @@ function runInsertBench(hashes, n) {
   const mem2 = new Uint8Array(wasm.memory.buffer);
   mem2.set(hashes, hashesBase);
 
-  // Benchmark: insert all hashes
+  // Benchmark: batch insert (single WASM call, loop stays inside WASM)
   wasm.setsum_empty(STATE);
 
   const t0 = performance.now();
-  for (let i = 0; i < n; i++) {
-    const hPtr = hashesBase + i * 32;
-    wasm.setsum_insert(STATE, hPtr, STATE); // in-place: state = state + hash
-  }
+  wasm.setsum_insert_batch(STATE, hashesBase, n);
   const t1 = performance.now();
 
   return { ms: t1 - t0, digest: readHex(STATE) };

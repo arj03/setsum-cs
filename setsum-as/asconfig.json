@@ -1,6 +1,7 @@
 {
   "options": {
-    "bindings": "raw"
+    "bindings": "raw",
+    "enable": ["simd"]
   },
   "targets": {
     "release": {

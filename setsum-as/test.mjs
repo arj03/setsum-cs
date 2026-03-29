@@ -9,7 +9,8 @@ const {
   memory,
   setsum_empty, setsum_is_empty, setsum_equals,
   setsum_hash, setsum_insert, setsum_remove,
-  setsum_add, setsum_sub
+  setsum_add, setsum_sub,
+  setsum_insert_batch, setsum_remove_batch
 } = instance.exports;
 
 const mem = new Uint8Array(memory.buffer);
@@ -118,5 +119,28 @@ for (let i = 0; i < 8; i++) {
   console.assert(v < p, `field ${i}: ${v} should be < ${p}`);
 }
 console.log("PASS: values reduced below primes");
+
+// Test 8: batch insert matches sequential inserts
+const BATCH_BASE = 4096;  // area for batch hashes
+mem.set(hashA, BATCH_BASE);
+mem.set(hashB, BATCH_BASE + 32);
+
+setsum_empty(STATE);
+setsum_insert_batch(STATE, BATCH_BASE, 2);  // batch insert A, B
+
+// Compare to sequential
+setsum_empty(OUT);
+mem.set(hashA, HASH);
+setsum_insert(OUT, HASH, OUT2);
+mem.set(hashB, HASH);
+setsum_insert(OUT2, HASH, OUT);
+
+console.assert(setsum_equals(STATE, OUT), "batch insert should match sequential");
+console.log("PASS: batch insert matches sequential");
+
+// Test 9: batch remove reverses batch insert
+setsum_remove_batch(STATE, BATCH_BASE, 2);
+console.assert(setsum_is_empty(STATE), "batch insert then batch remove should be empty");
+console.log("PASS: batch remove reverses batch insert");
 
 console.log("\nAll tests passed!");
