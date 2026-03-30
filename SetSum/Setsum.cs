@@ -127,6 +127,20 @@ public readonly struct Setsum
         return v - (overflow & Primes);
     }
 
+    /// <summary>
+    /// Batch insert from a contiguous block of 32-byte hashes.
+    /// </summary>
+    public static Setsum InsertHashes(Setsum current, ReadOnlySpan<byte> hashes)
+    {
+        int count = hashes.Length / DigestSize;
+        var state = current._state;
+
+        for (int i = 0; i < count; i++)
+            state = Add(state, LoadAndReduce(hashes.Slice(i * DigestSize, DigestSize)));
+
+        return new(state);
+    }
+
     // Operators
     public static Setsum operator +(Setsum lhs, Setsum rhs) => new(Add(lhs._state, rhs._state));
     public static Setsum operator -(Setsum lhs, Setsum rhs) => new(Add(lhs._state, Negate(rhs._state)));
