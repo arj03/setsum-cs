@@ -18,8 +18,8 @@ public partial class SyncNodes
         SortedKeyStore replica,
         ITestOutputHelper output,
         string label,
-        Setsum? knownPrimaryRootHash = null,
-        int? knownPrimaryRootCount = null)
+        Setsum primaryRootHash,
+        int primaryRootCount)
     {
         int added = 0;
         int removed = 0;
@@ -27,25 +27,11 @@ public partial class SyncNodes
         var pendingRemoves = new List<byte[]>();
 
         // ---- Root -------------------------------------------------------
+        // The caller always supplies the primary's root (hash, count): it is piggybacked on
+        // the sequence response, so the BFS starts immediately with no extra root round trip.
         var (primaryRootStart, primaryRootEnd) = primary.GetRootBounds();
         var (replicaRootStart, replicaRootEnd) = replica.GetRootBounds();
         var (replicaRootHash, replicaRootCount) = replica.RangeInfoByIndex(replicaRootStart, replicaRootEnd);
-
-        Setsum primaryRootHash;
-        int primaryRootCount;
-
-        if (knownPrimaryRootHash.HasValue && knownPrimaryRootCount.HasValue)
-        {
-            primaryRootHash = knownPrimaryRootHash.Value;
-            primaryRootCount = knownPrimaryRootCount.Value;
-        }
-        else
-        {
-            (primaryRootHash, primaryRootCount) = primary.TotalInfo();
-            // Wire: request = 0 bytes (root), response = varint(count) + Setsum
-            RoundTrips++;
-            BytesReceived += VarInt.Size(primaryRootCount) + (primaryRootCount > 0 ? SetsumSize : 0);
-        }
 
         if (primaryRootHash == replicaRootHash && primaryRootCount == replicaRootCount)
             return (0, 0);
@@ -157,14 +143,18 @@ public partial class SyncNodes
                     continue;
                 }
 
-                // depth >= MaxPrefixDepth — full key exchange.
+                // depth >= MaxPrefixDepth — full key exchange. The replica sends every key it
+                // holds under this prefix; the primary diffs against its own keys and returns
+                // both the keys to add and the keys to remove. The removes must be sent
+                // explicitly: the replica never sees the primary's full set, so it cannot
+                // derive replica\primary from the adds (primary\replica) alone.
                 var replicaItems = replica.RangeByIndex(rsStart, rsEnd).ToList();
                 BytesSent += prefix.NetworkSize + replicaItems.Count * KeySize;
 
                 var primaryItems = primary.RangeByIndex(psStart, psEnd).ToList();
                 var (toAdd, toRemove) = DiffSorted(primaryItems, replicaItems);
 
-                BytesReceived += toAdd.Count * KeySize;
+                BytesReceived += (toAdd.Count + toRemove.Count) * KeySize;
                 pendingAdds.AddRange(toAdd);
                 pendingRemoves.AddRange(toRemove);
                 added += toAdd.Count;

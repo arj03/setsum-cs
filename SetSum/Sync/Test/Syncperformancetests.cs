@@ -50,7 +50,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(3, sim.ItemsAdded);
-        _output.WriteLine($"Small diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Small diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -67,7 +67,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(8, sim.ItemsAdded);
         Assert.True(sw.ElapsedMilliseconds < 100);
-        _output.WriteLine($"Medium diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Medium diff – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -110,7 +110,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         Assert.Equal(1, sim.RoundTrips);
         Assert.Equal(newItems, sim.ItemsAdded);
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Large fast path – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Large fast path – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -126,7 +126,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(items, sim.ItemsAdded);
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Empty replica – Trips: {sim.RoundTrips}, Items: {sim.ItemsAdded}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Empty replica – Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Items: {sim.ItemsAdded}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     // ── Delete-path (deletes flow through the same fast path) ─────────────────
@@ -152,7 +152,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         // Deletes now flow through the same fast path — should be 1 RT
         Assert.Equal(1, sim.RoundTrips);
         Assert.False(sim.UsedFallback);
-        _output.WriteLine($"Large deletes – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Large deletes – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     // ── Epoch recovery ────────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -200,7 +200,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch large – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch large – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -222,7 +222,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch adds-only – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch adds-only – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -245,6 +245,6 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Epoch delete-after – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Epoch delete-after – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 }

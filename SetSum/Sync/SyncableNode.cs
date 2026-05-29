@@ -14,14 +14,12 @@ public class SyncableNode
     private readonly List<byte[]> _logKeys = [];
     private readonly List<bool> _logIsAdd = [];
     private readonly List<Setsum> _prefixSums = [new Setsum()];
-    private bool _logValid = true;
 
     // Effective membership set (for trie-based sync fallback)
     public SortedKeyStore EffectiveSet { get; private set; } = new();
 
     public int Epoch { get; set; }
     public int LogPosition => _logKeys.Count;
-    public bool LogValid => _logValid;
 
     public Setsum Sum() => _prefixSums[^1];
 
@@ -45,34 +43,44 @@ public class SyncableNode
     /// <summary>
     /// Batch delete: updates the log per-key but applies all removals to the
     /// effective set in a single O(N) merge pass rather than O(k*N) individual removals.
+    ///
+    /// Input keys are sorted and de-duplicated first: a key appearing more than once in
+    /// <paramref name="keys"/> must only subtract from the prefix sum once. Otherwise the
+    /// log sum would drift from the effective-set sum, since the store removes it just once.
     /// </summary>
     public void DeleteBulk(IEnumerable<byte[]> keys)
     {
         EffectiveSet.Prepare();
-        var toDelete = new List<byte[]>();
+
+        // Collect keys that are actually present, then sort so any duplicates are adjacent.
+        var present = new List<byte[]>();
         foreach (var key in keys)
+            if (EffectiveSet.Contains(key)) present.Add(key);
+        if (present.Count == 0) return;
+        present.Sort(ByteComparer.Instance);
+
+        // Log and stage each distinct key exactly once. present is already sorted, so
+        // toDelete stays sorted and can go straight to DeleteBulkPresorted.
+        var toDelete = new List<byte[]>(present.Count);
+        foreach (var key in present)
         {
-            if (!EffectiveSet.Contains(key)) continue;
+            if (toDelete.Count > 0 && ByteComparer.Instance.Compare(toDelete[^1], key) == 0)
+                continue; // duplicate within this batch: already logged and staged
             _logKeys.Add(key);
             _logIsAdd.Add(false);
             _prefixSums.Add(_prefixSums[^1] - Setsum.Hash(key));
             toDelete.Add(key);
         }
-        if (toDelete.Count > 0)
-        {
-            toDelete.Sort(ByteComparer.Instance);
-            EffectiveSet.DeleteBulkPresorted(toDelete);
-        }
+        EffectiveSet.DeleteBulkPresorted(toDelete);
     }
 
     /// <summary>
     /// Fast path: verify prefix sum at the given log position, return tail operations.
-    /// Returns null if the log is invalid or the prefix sum doesn't match.
+    /// Returns null if the position is out of range or the prefix sum doesn't match.
     /// Returns empty list if the position matches the end of the log.
     /// </summary>
     public List<(bool IsAdd, byte[] Key)>? TryGetTail(int position, Setsum prefixSum)
     {
-        if (!_logValid) return null;
         if (position < 0 || position > _logKeys.Count) return null;
         if (_prefixSums[position] != prefixSum) return null;
         if (position == _logKeys.Count) return [];
@@ -144,7 +152,6 @@ public class SyncableNode
             _logIsAdd.Add(true);
             _prefixSums.Add(_prefixSums[^1] + Setsum.Hash(key));
         }
-        _logValid = true;
     }
 
     public void Prepare()

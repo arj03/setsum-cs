@@ -21,7 +21,17 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 {
     private const int LeafThreshold = 3;
     private const int MaxPrefixDepth = 64;
-    private const int BitsPerExpansion = 1;
+
+    /// <summary>
+    /// Bits of prefix resolved per trie BFS level. 1 resolves a single bit per round trip
+    /// (least bandwidth, most round trips); higher values fan out 2^bits children per node,
+    /// trading bytes for fewer round trips. Must divide <see cref="MaxPrefixDepth"/> (64) so
+    /// the final level lands exactly on the depth cap rather than overshooting it.
+    ///
+    /// Defaults to 2: roughly halves trie-fallback round trips versus 1 at essentially the
+    /// same bandwidth. 4 cuts round trips further but inflates bytes on sparse diffs.
+    /// </summary>
+    public int BitsPerExpansion { get; init; } = 2;
 
     private const int KeySize = Setsum.DigestSize;
     private const int SetsumSize = Setsum.DigestSize;
@@ -32,6 +42,15 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     public int ItemsDeleted { get; private set; }
     public int BytesSent { get; private set; }
     public int BytesReceived { get; private set; }
+
+    /// <summary>
+    /// Assumed network round-trip time. Round trips — not bytes — dominate sync cost on a
+    /// WAN, so this turns the round-trip count into a wall-clock latency estimate.
+    /// </summary>
+    public const int RoundTripLatencyMs = 50;
+
+    /// <summary>Estimated wall-clock latency from round trips alone: RoundTrips × RTT.</summary>
+    public int EstimatedLatencyMs => RoundTrips * RoundTripLatencyMs;
 
     private readonly SyncableNode _replica = replica;
     private readonly SyncableNode _primary = primary;
@@ -71,8 +90,7 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
             output.WriteLine("Epoch mismatch — single trie sync over effective sets");
             var (repairAdded, repairRemoved) = PerformBidirectionalTrieSync(
                 _primary.EffectiveSet, _replica.EffectiveSet, output, "effective",
-                knownPrimaryRootHash: rootHash,
-                knownPrimaryRootCount: rootCount);
+                rootHash, rootCount);
             ItemsAdded = repairAdded;
             ItemsDeleted = repairRemoved;
 
@@ -126,8 +144,7 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
                 output.WriteLine("Fast path failed — trie sync over effective sets");
                 var (repairAdded, repairRemoved) = PerformBidirectionalTrieSync(
                     _primary.EffectiveSet, _replica.EffectiveSet, output, "effective",
-                    knownPrimaryRootHash: rootHash,
-                    knownPrimaryRootCount: rootCount);
+                    rootHash, rootCount);
                 ItemsAdded = repairAdded;
                 ItemsDeleted = repairRemoved;
 

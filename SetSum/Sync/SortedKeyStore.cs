@@ -229,44 +229,55 @@ public class SortedKeyStore
         int count = end - start;
         if (count == 0) return null;
 
-        // k=1: one linear scan
+        // k=1: one linear scan. Optimal for a single lookup, and skips building the probe
+        // table in the common single-item case (where maxCountForPairPeel is 0).
         for (int i = start; i < end; i++)
             if (_prefixSums[i + 1] - _prefixSums[i] == diff)
                 return [KeyAt(_data, i).ToArray()];
 
         if (count > maxCountForPairPeel) return null;
 
-        // k=2: O(n²) pair scan
+        // For k>=2, build an open-addressed probe table mapping each key's hash to its
+        // index, once. Open addressing (rather than one slot per bucket) keeps every
+        // distinct hash findable: a bucket collision can never overwrite and hide a valid
+        // partner, so the peel has no false negatives.
+        const int tableSize = 1024;
+        const int tableMask = tableSize - 1;
+        Debug.Assert(count < tableSize, "peel range larger than probe table");
+        Span<int> table = stackalloc int[tableSize];
+        table.Fill(-1);
+        for (int i = start; i < end; i++)
+        {
+            int slot = (_prefixSums[i + 1] - _prefixSums[i]).GetHashCode() & tableMask;
+            while (table[slot] != -1) slot = (slot + 1) & tableMask;
+            table[slot] = i;
+        }
+
+        // k=2: for each i, probe for the unique partner whose hash completes the diff — O(n).
+        for (int i = start; i < end; i++)
+        {
+            var need = diff - (_prefixSums[i + 1] - _prefixSums[i]);
+            for (int slot = need.GetHashCode() & tableMask; table[slot] != -1; slot = (slot + 1) & tableMask)
+            {
+                int j = table[slot];
+                if (j != i && _prefixSums[j + 1] - _prefixSums[j] == need)
+                    return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray()];
+            }
+        }
+
+        if (count > maxCountForTriplePeel) return null;
+
+        // k=3: O(n²) outer scan over (i, j), O(1) probe for the third item.
         for (int i = start; i < end; i++)
         {
             var remaining = diff - (_prefixSums[i + 1] - _prefixSums[i]);
             for (int j = i + 1; j < end; j++)
-                if (_prefixSums[j + 1] - _prefixSums[j] == remaining)
-                    return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray()];
-        }
-
-        // k=3: O(n²) with stack-allocated hash-table probe for the third item
-        if (count <= maxCountForTriplePeel)
-        {
-            const int tableSize = 1024;
-            const int tableMask = tableSize - 1;
-            Span<int> table = stackalloc int[tableSize];
-            table.Fill(-1);
-
-            for (int i = start; i < end; i++)
             {
-                var h = _prefixSums[i + 1] - _prefixSums[i];
-                table[h.GetHashCode() & tableMask] = i;
-            }
-
-            for (int i = start; i < end; i++)
-            {
-                var remaining2 = diff - (_prefixSums[i + 1] - _prefixSums[i]);
-                for (int j = i + 1; j < end; j++)
+                var need = remaining - (_prefixSums[j + 1] - _prefixSums[j]);
+                for (int slot = need.GetHashCode() & tableMask; table[slot] != -1; slot = (slot + 1) & tableMask)
                 {
-                    var need = remaining2 - (_prefixSums[j + 1] - _prefixSums[j]);
-                    int k = table[need.GetHashCode() & tableMask];
-                    if (k >= start && k != i && k != j && _prefixSums[k + 1] - _prefixSums[k] == need)
+                    int k = table[slot];
+                    if (k != i && k != j && _prefixSums[k + 1] - _prefixSums[k] == need)
                         return [KeyAt(_data, i).ToArray(), KeyAt(_data, j).ToArray(), KeyAt(_data, k).ToArray()];
                 }
             }

@@ -110,7 +110,9 @@ One round trip per depth level, batching all leaf resolutions and child expansio
 - `primaryCount == 0` — replica's items are stale; removed locally with no wire traffic
 - `replicaCount == 0` — primary sends all its items directly
 - `|primaryCount − replicaCount| ≤ 3` — resolved via Setsum peeling
-- `depth ≥ MaxPrefixDepth` — full key exchange
+- `depth ≥ MaxPrefixDepth` — full key exchange (both adds **and** removes)
+
+`MaxPrefixDepth` is 64: the trie discriminates on the first 64 bits of each key, which assumes keys are uniformly distributed there (digests/hashes). Divergent leaves then isolate far above that bound. Any keys that share a full 64-bit prefix collapse into a single depth-64 leaf, reconciled by a direct full key exchange — correct, but without the trie's bandwidth savings, so structured keys with long shared prefixes are out of scope.
 
 ### Leaf resolution via Setsum peeling
 
@@ -173,7 +175,9 @@ Followed by trie sync rounds.
 | signedDiff > 0 (primary ahead) | prefix + 32 B replicaHash | count × 32 B missing keys |
 | signedDiff < 0 (replica ahead) | — | — (replica peels locally) |
 | signedDiff == 0 | — | — (expanded further) |
-| depth ≥ MaxPrefixDepth | prefix + count × 32 B replicaKeys | count × 32 B keys to add |
+| depth ≥ MaxPrefixDepth | prefix + count × 32 B replicaKeys | (adds + removes) × 32 B keys |
+
+At a `depth ≥ MaxPrefixDepth` leaf the primary returns **both** the keys to add and the keys to remove: the replica sent only its own keys, so it cannot derive `replica \ primary` from the adds (`primary \ replica`) alone.
 
 ---
 
@@ -185,6 +189,10 @@ Followed by trie sync rounds.
 | Replica behind by D items (adds and/or deletes) | 1 | Tail send, any D |
 | Sum mismatch (corruption) | 1 + O(log N) | 1 RT detects mismatch, trie sync repairs |
 | Epoch mismatch | 1 + O(log N) | Root info piggybacked, single trie pass |
+
+### Latency
+
+Round trips — not bytes — dominate cost on a WAN. The performance tests report an estimated latency of `RoundTrips × RoundTripLatencyMs` (50 ms by default). The fast path is always one round trip (~50 ms regardless of diff size). A trie fallback instead costs one round trip per `BitsPerExpansion` bits of prefix depth it has to descend. At the default of 2, over a 1 M-key set a tiny epoch resync runs ~5 round trips (~250 ms) and a ~100 K-item divergence ~17 (~850 ms). `BitsPerExpansion` is the main lever: 1 minimises bandwidth but doubles the round trips, while 4 roughly halves them again at the cost of more bytes on sparse diffs.
 
 ---
 
