@@ -82,7 +82,7 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         primary.Prepare();
 
         var sw = Stopwatch.StartNew();
-        var result = primary.TryGetTail(replica.LogPosition, replica.EffectiveSet.Sum());
+        var result = primary.TryGetTail(replica.Epoch, replica.LogPosition, replica.EffectiveSet.Sum());
         sw.Stop();
 
         Assert.NotNull(result);
@@ -178,6 +178,38 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         Assert.Equal(primary.Sum(), replica.Sum());
         _output.WriteLine($"Epoch tiny – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+    }
+
+    [Fact]
+    public void Perf_Epoch_MidResync_AfterCompaction()
+    {
+        // A replica ~500 ops behind when the primary compacts. That is still inside the
+        // retained window (SumIndexWindow = 1,024), so the replica's sum is addressable and
+        // it fast-paths across the epoch bump in a single round trip — the cross-compaction
+        // win is not limited to tiny diffs. The pre-window baseline took a multi-RT trie.
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000_000);
+        var sharedKeys = primary.EffectiveSet.All().Take(5_250).ToList();
+
+        primary.DeleteBulk(sharedKeys.Take(5_000));
+        primary.Prepare(); replica.Prepare();
+        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+
+        // Diverge by ~500 ops (250 deletes + 250 adds), then compact.
+        primary.DeleteBulk(sharedKeys.Skip(5_000).Take(250));
+        for (int i = 0; i < 250; i++) primary.Insert(RandomKey());
+        primary.Compact();
+
+        var sim = new SyncNodes(replica, primary);
+        var sw = Stopwatch.StartNew();
+        Assert.True(sim.TrySync(_output));
+        sw.Stop();
+
+        Assert.False(sim.UsedFallback);
+        Assert.Equal(1, sim.RoundTrips);
+        Assert.Equal(250, sim.ItemsAdded);
+        Assert.Equal(250, sim.ItemsDeleted);
+        Assert.Equal(primary.Sum(), replica.Sum());
+        _output.WriteLine($"Epoch mid (~500) – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]

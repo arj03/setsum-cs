@@ -86,8 +86,10 @@ public class SyncBitsSweepTests(ITestOutputHelper output)
             foreach (var bits in new[] { 1, 2, 4 })
             {
                 // Identical inputs for every bit width (seeded), so deltas are purely the bit width.
+                // ForceTrieSync bypasses the sum-addressable fast path: this sweep exists to
+                // measure trie behaviour, which a fast-pathed sync would never exercise.
                 var (primary, replica) = build();
-                var sim = new SyncNodes(replica, primary) { BitsPerExpansion = bits };
+                var sim = new SyncNodes(replica, primary) { BitsPerExpansion = bits, ForceTrieSync = true };
                 Assert.True(sim.TrySync(NullOutput.Instance));
                 Assert.Equal(primary.Sum(), replica.Sum());
                 Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());

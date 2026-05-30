@@ -184,8 +184,9 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
     public void Epoch_Freshreplica_ConnectsToCompactedprimary()
     {
         // A brand-new replica (Epoch = 0) connecting to a primary that has
-        // already compacted once. The epoch mismatch triggers a single trie
-        // sync over the effective set.
+        // already compacted once. The whole short history still fits the primary's
+        // retained window, so the empty-set sum resolves at position 0 and the replica
+        // fast-paths the full op tail across the epoch bump (no trie needed).
         var primary = new SyncableNode();
         var sharedKeys = new List<byte[]>();
         for (int i = 0; i < 50; i++)
@@ -268,6 +269,50 @@ public class SyncCorrectnessTests(ITestOutputHelper output)
         primary.Compact();
 
         Assert.Equal(sumBefore, primary.Sum());
+    }
+
+    [Fact]
+    public void Epoch_WithinWindow_FastPathsAcrossCompaction()
+    {
+        // A replica that diverged only a little before the primary compacted: its synced
+        // sum still lands in the retained window, so it fast-paths across the epoch bump
+        // (one round trip, no trie) — the case the sum-addressable index exists for.
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000);
+
+        primary.DeleteBulk(primary.EffectiveSet.All().Take(20).ToList());
+        for (int i = 0; i < 50; i++) primary.Insert(RandomKey());
+        primary.Compact(); // epoch → 1, log trimmed to the recent window
+
+        var sim = new SyncNodes(replica, primary);
+        Assert.True(sim.TrySync(_output));
+
+        Assert.False(sim.UsedFallback);
+        Assert.Equal(1, sim.RoundTrips);
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
+        Assert.Equal(primary.Epoch, replica.Epoch);
+    }
+
+    [Fact]
+    public void Epoch_DivergedPastWindow_FallsBackToTrie()
+    {
+        // The mirror image: the primary moves more than a full retention window past the
+        // replica before compacting, so the replica's synced sum is evicted from the
+        // index and no longer addressable. The sync must fall back to the trie and still
+        // converge.
+        var (primary, replica) = MakeNodesWithSharedKeys(1_000);
+
+        int beyondWindow = SyncableNode.SumIndexWindow + 1_000;
+        for (int i = 0; i < beyondWindow; i++) primary.Insert(RandomKey());
+        primary.Compact();
+
+        var sim = new SyncNodes(replica, primary);
+        Assert.True(sim.TrySync(_output));
+
+        Assert.True(sim.UsedFallback);
+        Assert.Equal(primary.Sum(), replica.Sum());
+        Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
+        Assert.Equal(primary.Epoch, replica.Epoch);
     }
 
     // ── Replica data corruption → fallback recovery ─────────────────────────

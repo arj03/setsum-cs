@@ -2,7 +2,7 @@
 
 A unidirectional, stateless set-reconciliation protocol for efficiently synchronising two sets of 32-byte keys across a network. Sync always flows **primary → replica**: the primary is the authoritative owner of the set, and replicas converge to it. The primary keeps **no per-replica state** — every sync is self-describing because the replica sends its own position and checksum in a single message.
 
-The protocol minimises round-trips by trying a sequence-based fast path before falling back to a binary-prefix trie traversal. The trie traversal itself is bidirectional (it discovers items to add *and* remove from the replica in a single pass), but the sync direction is always primary → replica.
+The protocol minimises round-trips by trying a **sum-addressable** fast path before falling back to a binary-prefix trie traversal. The fast path resolves the replica's state by the *content* of its set — its effective sum — rather than by a log position that a compaction would invalidate, so a replica that is only a little behind fast-paths in a single round trip even across a compaction. The trie traversal itself is bidirectional (it discovers items to add *and* remove from the replica in a single pass), but the sync direction is always primary → replica.
 
 This protocol assumes all participating nodes are mutually trusted — reported counts and sums are accepted at face value.
 
@@ -13,8 +13,9 @@ This protocol assumes all participating nodes are mutually trusted — reported 
 Both the primary and each replica maintain their own independent copy of the same structures:
 
 - **Operation log** — an ordered sequence of inserts (`+key`) and deletes (`-key`), with prefix sums tracking the effective setsum at each position
+- **Sum index** — a sliding window over the most recent operations mapping each effective sum → its log position. This is what makes the fast path sum-addressable: a replica is matched by what its set *contains*, so the match survives a compaction that renumbers positions. It is per-set state (one window per set), not per-replica, so statelessness with respect to who is syncing is preserved
 - **Effective set** — the current membership set, maintained as a sorted store for trie-based queries
-- **Epoch** — incremented on compaction; gives replicas an unambiguous signal that the log was squashed
+- **Epoch** — incremented on compaction; lets a replica tell that the log was re-sequenced so it does not trust a raw position number across the bump
 
 The setsum's invertibility means prefix sums work naturally over mixed operations:
 
@@ -25,9 +26,9 @@ PrefixSum: [H(A), H(A)+H(B), H(B), H(B)+H(C)]
 
 The prefix sum at any position is the setsum of the effective set at that point.
 
-The primary's log is authoritative. A replica's log tracks its own view — during sync, the replica sends `(epoch, logPosition, effectiveSum)` and the primary responds purely from its own log and effective set, with no memory of any previous sync. This means any number of replicas can sync independently, and a replica that goes offline for an arbitrary period simply resumes from wherever it left off.
+The primary's log is authoritative. A replica's log tracks its own view — during sync, the replica sends `(epoch, logPosition, effectiveSum)` and the primary responds purely from its own log, sum index, and effective set, with no memory of any previous sync. This means any number of replicas can sync independently, and a replica that goes offline for an arbitrary period simply resumes from wherever it left off.
 
-**Compaction** squashes the log down to just the current effective set (all inserts), re-sequences, and increments the epoch. There is no separate tombstone store to wipe — the replica just knows its log position is stale and falls back to a single trie sync over effective membership.
+**Compaction** trims the log to a recent window of the most recent `SumIndexWindow` operations (default 1,024) and increments the epoch. Crucially it keeps the *real* recent op history — actual adds and deletes, not a flat list of all-inserts — and rebuilds the sum index over the retained window. A replica whose effective sum still lands in that window therefore fast-paths *across* the compaction in one round trip; only a replica that has diverged further than the window falls back to a trie sync over effective membership. The window bounds per-set memory (a few tens of KB) and is the single lever trading memory for how far behind a replica can be and still bridge a compaction.
 
 ---
 
@@ -45,7 +46,7 @@ This lets the primary node compute what a replica is missing by subtraction alon
 
 ## Sync Protocol
 
-Every sync is initiated by the replica. It sends its epoch, log position, and effective-set sum in a single message — this fully describes the replica's state without the primary needing to remember anything about it. The primary's response determines which path follows.
+Every sync is initiated by the replica. It sends its epoch, log position, and effective-set sum in a single message — this fully describes the replica's state without the primary needing to remember anything about it. The primary tries to resolve that effective sum to one of its own log positions; if it can, the diff is the tail from there. Otherwise it falls back to the trie.
 
 ```mermaid
 sequenceDiagram
@@ -54,34 +55,36 @@ sequenceDiagram
 
     R->>P: [epoch, logPosition, effectiveSum]
 
-    alt Epoch matches + prefix sum verifies
+    alt effectiveSum resolves to a log position
+        Note over P: by position if epoch matches,<br/>else via the retained-window sum index
         P-->>R: [epoch, tailOps (+key / -key)]
         Note over R: Apply tail — done (1 RT)
-    else Epoch matches + sum mismatch
+    else effectiveSum not addressable
+        Note over P: diverged past the window, or corruption
         P-->>R: [epoch, rootHash, rootCount]
-        Note over R: Bidirectional trie sync on effective sets
-    else Epoch mismatch
-        P-->>R: [newEpoch, rootHash, rootCount]
         Note over R: Bidirectional trie sync on effective sets
     end
 ```
 
 ### Fast path
 
-The primary maintains prefix sums over its operation log. It verifies that `prefixSum[replicaLogPosition] == replicaEffectiveSum` — i.e. the replica's effective set matches the primary's at that log position. If so, it sends the tail operations — both adds and deletes in one stream.
+The primary resolves the replica's effective sum to a log position two ways, in order:
 
-This resolves any diff in 1 RT as long as the replica is simply behind — a diff of 1 item or 100,000 items is the same cost. Deletes flow through the exact same fast path as adds.
+1. **By position** — when the replica shares the primary's epoch, their log positions line up (same op history, no compaction has re-sequenced them), so the primary checks `prefixSum[replicaLogPosition] == replicaEffectiveSum` directly. This is unbounded: a replica arbitrarily far behind *in the same epoch* still resolves in O(1).
+2. **By sum** — otherwise the primary looks the sum up in its retained-window index. Because the address is the set's content, this resolves even across a compaction (epoch bump), as long as the replica is within `SumIndexWindow` operations of the primary.
+
+Either way it then sends the tail operations from that position — both adds and deletes in one stream. A diff of 1 item or 100,000 items in the same epoch is the same cost. Deletes flow through the exact same fast path as adds.
 
 ### Trie sync — the universal fallback
 
-The trie sync is not specific to any one failure mode. It is the single repair mechanism for all forms of divergence:
+The trie sync is not specific to any one failure mode. It is the single repair mechanism for all forms of divergence the fast path cannot address:
 
-- **Sum mismatch** — the replica has lost or gained items; the bidirectional trie finds and corrects all differences
-- **Epoch mismatch** — the primary has compacted; one trie sync over effective sets converges both sides
+- **Sum mismatch** — the replica has lost or gained items (corruption); its sum matches no position in the primary's log, so the bidirectional trie finds and corrects all differences
+- **Diverged past the window** — the primary has compacted *and* the replica is more than `SumIndexWindow` operations behind, so its sum has been evicted from the index; one trie sync over effective sets converges both sides
 
-After any trie sync, the replica rebuilds its operation log from its current effective set so the fast path works again on the next sync.
+A replica that compacted past but is still *within* the window never reaches here — it fast-paths across the compaction. After any trie sync, the replica rebuilds its operation log (and sum index) from its current effective set so the fast path works again on the next sync.
 
-On epoch mismatch the primary piggybacks root `(hash, count)` for the effective set in its response, so the trie BFS can start immediately with no extra round trip.
+When the fast path fails, the primary piggybacks root `(hash, count)` for the effective set in the same response, so the trie BFS can start immediately with no extra round trip.
 
 ---
 
@@ -151,11 +154,11 @@ Covers everything in one round trip.
 
 Flags are packed as a bitfield — one bit per operation.
 
-**Epoch or sum mismatch:**
+**Fallback (sum not addressable — corruption, or diverged past the window):**
 
 | Field | Size |
 |---|---|
-| newEpoch | varint |
+| epoch | varint |
 | rootHash | 32 B |
 | rootCount | varint |
 
@@ -186,13 +189,14 @@ At a `depth ≥ MaxPrefixDepth` leaf the primary returns **both** the keys to ad
 | Scenario | Round Trips | Notes |
 |---|---|---|
 | Sets identical | 1 | Sequence check, single message |
-| Replica behind by D items (adds and/or deletes) | 1 | Tail send, any D |
+| Replica behind by D items, same epoch | 1 | Tail send, any D |
+| Replica behind ≤ `SumIndexWindow` ops, across a compaction | 1 | Sum-addressed tail send |
 | Sum mismatch (corruption) | 1 + O(log N) | 1 RT detects mismatch, trie sync repairs |
-| Epoch mismatch | 1 + O(log N) | Root info piggybacked, single trie pass |
+| Diverged past the window, across a compaction | 1 + O(log N) | Root info piggybacked, single trie pass |
 
 ### Latency
 
-Round trips — not bytes — dominate cost on a WAN. The performance tests report an estimated latency of `RoundTrips × RoundTripLatencyMs` (50 ms by default). The fast path is always one round trip (~50 ms regardless of diff size). A trie fallback instead costs one round trip per `BitsPerExpansion` bits of prefix depth it has to descend. At the default of 2, over a 1 M-key set a tiny epoch resync runs ~5 round trips (~250 ms) and a ~100 K-item divergence ~17 (~850 ms). `BitsPerExpansion` is the main lever: 1 minimises bandwidth but doubles the round trips, while 4 roughly halves them again at the cost of more bytes on sparse diffs.
+Round trips — not bytes — dominate cost on a WAN. The performance tests report an estimated latency of `RoundTrips × RoundTripLatencyMs` (50 ms by default). The fast path is always one round trip (~50 ms regardless of diff size), and it now holds across a compaction too whenever the replica is within `SumIndexWindow` operations: a tiny epoch resync that previously took ~5 round trips (~250 ms) of trie descent is a single round trip (~50 ms). A replica that has diverged further than the window still pays the trie fallback — one round trip per `BitsPerExpansion` bits of prefix depth it descends. At the default of 2, over a 1 M-key set a ~100 K-item divergence runs ~17 round trips (~850 ms). `BitsPerExpansion` is the main lever there: 1 minimises bandwidth but doubles the round trips, while 4 roughly halves them again at the cost of more bytes on sparse diffs.
 
 ---
 
@@ -202,7 +206,7 @@ Round trips — not bytes — dominate cost on a WAN. The performance tests repo
 |---|---|
 | `Setsum.cs` | Commutative, invertible 256-bit hash with SIMD arithmetic |
 | `SortedKeyStore.cs` | Sorted flat array with O(log N) range-hash queries, trie prefix queries, and Setsum peeling at leaves |
-| `SyncableNode.cs` | Per-node operation log, effective set, compaction, and epoch management |
+| `SyncableNode.cs` | Per-node operation log, sum-addressable index, effective set, windowed compaction, and epoch management |
 | `SyncNodes.cs` | Sync orchestration and wire-byte accounting |
 | `SyncNodes.Triesync.cs` | Bidirectional trie BFS with combined leaf+expansion round trips |
 | `BitPrefix.cs` | Bit-level trie prefix with multi-bit extension |
