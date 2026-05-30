@@ -12,8 +12,8 @@ This protocol assumes all participating nodes are mutually trusted — reported 
 
 Both the primary and each replica maintain their own independent copy of the same structures:
 
-- **Operation log** — an ordered sequence of inserts (`+key`) and deletes (`-key`), with prefix sums tracking the effective setsum at each position
-- **Sum index** — a sliding window over the most recent operations mapping each effective sum → its log position. This is what makes the fast path sum-addressable: a replica is matched by what its set *contains*, so the match survives a compaction that renumbers positions. It is per-set state (one window per set), not per-replica, so statelessness with respect to who is syncing is preserved
+- **Operation log** — an ordered sequence of inserts (`+key`) and deletes (`-key`), with prefix sums tracking the effective setsum at each position. It grows unbounded between compactions and is trimmed only at compaction, so within an epoch every past position stays addressable
+- **Sum index** — a *continuously* windowed map of each effective sum → its log position, covering the most recent `SumIndexWindow` operations. The oldest entry is evicted on every new operation, so — unlike the log — the index never exceeds the window. This is what makes the fast path sum-addressable: a replica is matched by what its set *contains*, so the match survives a compaction that renumbers positions. It is per-set state (one window per set), not per-replica, so statelessness with respect to who is syncing is preserved
 - **Effective set** — the current membership set, maintained as a sorted store for trie-based queries
 - **Epoch** — incremented on compaction; lets a replica tell that the log was re-sequenced so it does not trust a raw position number across the bump
 
@@ -28,7 +28,7 @@ The prefix sum at any position is the setsum of the effective set at that point.
 
 The primary's log is authoritative. A replica's log tracks its own view — during sync, the replica sends `(epoch, logPosition, effectiveSum)` and the primary responds purely from its own log, sum index, and effective set, with no memory of any previous sync. This means any number of replicas can sync independently, and a replica that goes offline for an arbitrary period simply resumes from wherever it left off.
 
-**Compaction** trims the log to a recent window of the most recent `SumIndexWindow` operations (default 1,024) and increments the epoch. Crucially it keeps the *real* recent op history — actual adds and deletes, not a flat list of all-inserts — and rebuilds the sum index over the retained window. A replica whose effective sum still lands in that window therefore fast-paths *across* the compaction in one round trip; only a replica that has diverged further than the window falls back to a trie sync over effective membership. The window bounds per-set memory (a few tens of KB) and is the single lever trading memory for how far behind a replica can be and still bridge a compaction.
+**Compaction** trims the log to a recent window of the most recent `SumIndexWindow` operations (default 1,024) and increments the epoch. Crucially it keeps the *real* recent op history — actual adds and deletes, not a flat list of all-inserts — and rebuilds the sum index over the retained window. A replica whose effective sum still lands in that window therefore fast-paths *across* the compaction in one round trip; only a replica that has diverged further than the window falls back to a trie sync over effective membership. The window bounds per-set memory (well under a megabyte — the index plus the retained log window) and is the single lever trading memory for how far behind a replica can be and still bridge a compaction.
 
 ---
 
@@ -56,7 +56,7 @@ sequenceDiagram
     R->>P: [epoch, logPosition, effectiveSum]
 
     alt effectiveSum resolves to a log position
-        Note over P: by position if epoch matches,<br/>else via the retained-window sum index
+        Note over P: by position when the logs align,<br/>else via the retained-window sum index
         P-->>R: [epoch, tailOps (+key / -key)]
         Note over R: Apply tail — done (1 RT)
     else effectiveSum not addressable
@@ -68,12 +68,14 @@ sequenceDiagram
 
 ### Fast path
 
-The primary resolves the replica's effective sum to a log position two ways, in order:
+First the trivial case: if the replica's sum already equals the primary's current sum, the tail is empty and the sync is a one-message acknowledgement.
 
-1. **By position** — when the replica shares the primary's epoch, their log positions line up (same op history, no compaction has re-sequenced them), so the primary checks `prefixSum[replicaLogPosition] == replicaEffectiveSum` directly. This is unbounded: a replica arbitrarily far behind *in the same epoch* still resolves in O(1).
-2. **By sum** — otherwise the primary looks the sum up in its retained-window index. Because the address is the set's content, this resolves even across a compaction (epoch bump), as long as the replica is within `SumIndexWindow` operations of the primary.
+Otherwise the primary resolves the sum to a log position two ways, tried in order:
 
-Either way it then sends the tail operations from that position — both adds and deletes in one stream. A diff of 1 item or 100,000 items in the same epoch is the same cost. Deletes flow through the exact same fast path as adds.
+1. **By position** — a cheap first guess. The replica's reported position indexes straight into the primary's log, and the primary checks `prefixSum[replicaLogPosition] == replicaEffectiveSum`. This succeeds whenever the two logs are aligned — same epoch, same op history, nothing re-sequenced between them — which is the common incremental case. It is **unbounded within an epoch**: the log is trimmed only at compaction, so even a replica 100,000 ops behind in the same epoch still has a valid position to resolve against. (After a replica has fast-pathed *across* a compaction, its positions no longer line up with the primary's re-sequenced log — the check simply misses, and the sum index below takes over. Sharing an epoch is therefore not a guarantee of alignment, only a strong hint.)
+2. **By sum** — the content address. The primary looks the sum up in its retained-window index, which resolves even across a compaction (epoch bump) as long as the replica is within `SumIndexWindow` operations of the primary. Unlike the position path this is **capped at the window**, because the index — unlike the log — is evicted continuously.
+
+Either way the primary then streams the tail operations from that position — both adds and deletes, **in log order**. The replica must honour that order: a key can be added and later deleted (or vice versa) within a single tail, so the resulting membership of each touched key is its **last** op in the stream — not the result of blindly applying every remove and then every add. Applying out of order resurrects keys that the tail meant to drop. A diff of 1 item or 100,000 items in the same epoch costs the same one round trip, and deletes flow through the exact same fast path as adds.
 
 ### Trie sync — the universal fallback
 
@@ -112,7 +114,7 @@ One round trip per depth level, batching all leaf resolutions and child expansio
 
 - `primaryCount == 0` — replica's items are stale; removed locally with no wire traffic
 - `replicaCount == 0` — primary sends all its items directly
-- `|primaryCount − replicaCount| ≤ 3` — resolved via Setsum peeling
+- `|primaryCount − replicaCount| ≤ 3` — *attempted* via Setsum peeling; re-expands deeper if the peel can't isolate the differing items (and a count-equal leaf with mixed adds/removes never peels — it expands)
 - `depth ≥ MaxPrefixDepth` — full key exchange (both adds **and** removes)
 
 `MaxPrefixDepth` is 64: the trie discriminates on the first 64 bits of each key, which assumes keys are uniformly distributed there (digests/hashes). Divergent leaves then isolate far above that bound. Any keys that share a full 64-bit prefix collapse into a single depth-64 leaf, reconciled by a direct full key exchange — correct, but without the trie's bandwidth savings, so structured keys with long shared prefixes are out of scope.
@@ -189,14 +191,16 @@ At a `depth ≥ MaxPrefixDepth` leaf the primary returns **both** the keys to ad
 | Scenario | Round Trips | Notes |
 |---|---|---|
 | Sets identical | 1 | Sequence check, single message |
-| Replica behind by D items, same epoch | 1 | Tail send, any D |
+| Replica behind, same epoch | 1 | Tail send by position, any distance |
 | Replica behind ≤ `SumIndexWindow` ops, across a compaction | 1 | Sum-addressed tail send |
 | Sum mismatch (corruption) | 1 + O(log N) | 1 RT detects mismatch, trie sync repairs |
 | Diverged past the window, across a compaction | 1 + O(log N) | Root info piggybacked, single trie pass |
 
 ### Latency
 
-Round trips — not bytes — dominate cost on a WAN. The performance tests report an estimated latency of `RoundTrips × RoundTripLatencyMs` (50 ms by default). The fast path is always one round trip (~50 ms regardless of diff size), and it now holds across a compaction too whenever the replica is within `SumIndexWindow` operations: a tiny epoch resync that previously took ~5 round trips (~250 ms) of trie descent is a single round trip (~50 ms). A replica that has diverged further than the window still pays the trie fallback — one round trip per `BitsPerExpansion` bits of prefix depth it descends. At the default of 2, over a 1 M-key set a ~100 K-item divergence runs ~17 round trips (~850 ms). `BitsPerExpansion` is the main lever there: 1 minimises bandwidth but doubles the round trips, while 4 roughly halves them again at the cost of more bytes on sparse diffs.
+Round trips — not bytes — dominate cost on a WAN, and that is what the fast path optimises. The performance tests report an estimated latency of `RoundTrips × RoundTripLatencyMs` (50 ms by default). The fast path is always one round trip (~50 ms regardless of diff size), and it now holds across a compaction too whenever the replica is within `SumIndexWindow` operations: a tiny epoch resync that previously took a trie descent (~3 round trips / ~150 ms, more if the differing keys are scattered) collapses to a single round trip (~50 ms). A replica that has diverged further than the window still pays the trie fallback — one round trip per `BitsPerExpansion` bits of prefix depth it descends. At the default of 2, over a 1 M-key set a ~100 K-item divergence runs ~17 round trips (~850 ms). `BitsPerExpansion` is the main lever there: 1 minimises bandwidth but doubles the round trips, while 4 roughly halves them again at the cost of more bytes on sparse diffs.
+
+The fast path optimises round trips, and for **adds** it is byte-optimal too — new keys are data the replica genuinely lacks, so 32 B each is near the floor, and it even beats the trie's per-subtree overhead (≈321 KB vs ≈664 KB for 10k adds). **Deletes are the asymmetric case**: the replica already holds the keys, yet the fast path resends them (32 B each), because it streams the literal op tail. There is no cheap win to reclaim here for uniformly-distributed keys — real deletes scatter across the keyspace, so they cannot be folded into a few compact key ranges — which is why a delete-heavy tail can cost far more bytes than the trie, where the replica instead peels its own keys (identified by subtree bounds, never resent) at the price of more round trips. So on deletes the fast path trades bandwidth for latency; the lever for a bandwidth-constrained link is a smaller `SumIndexWindow`, which pushes delete-heavy divergence onto the more byte-frugal trie.
 
 ---
 
