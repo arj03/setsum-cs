@@ -15,11 +15,15 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 {
     private readonly ITestOutputHelper _output = output;
 
-    private static byte[] RandomKey()
+    /// <summary>In-memory transport wired to this test's output. Replaces the ITestOutputHelper
+    /// the protocol used to take directly.</summary>
+    private InMemoryTransport Transport() => new(_output.WriteLine);
+
+    private static Key RandomKey()
     {
-        var b = new byte[32];
+        Span<byte> b = stackalloc byte[Key.Size];
         RandomNumberGenerator.Fill(b);
-        return b;
+        return new Key(b);
     }
 
     private (SyncableNode primary, SyncableNode replica) MakeNodesWithSharedKeys(int shared)
@@ -43,9 +47,9 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
         for (int i = 0; i < 3; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.Equal(1, sim.RoundTrips);
@@ -59,9 +63,9 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         var (primary, replica) = MakeNodesWithSharedKeys(100);
         for (int i = 0; i < 8; i++) primary.Insert(RandomKey());
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.Equal(1, sim.RoundTrips);
@@ -73,21 +77,37 @@ public class SyncPerformanceTests(ITestOutputHelper output)
     [Fact]
     public void Perf_Add_LargeDiff_FastPathSendsTail()
     {
-        // With sequence-based fast path, even large diffs resolve in one RT
-        // because the tail is always available. Verify it returns the tail, not null.
-        var (primary, replica) = MakeNodesWithSharedKeys(50_000);
-        for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
+        // Whether a tail is served is decided by SumIndexWindow, not by diff size in the
+        // abstract: the replica's sum sits `diff` positions back in the log, and only the
+        // trailing window of positions stays addressable. Past it the tail is declined and
+        // the trie fallback carries the divergence — that is the design, not a miss, since
+        // serving every tail would mean retaining unbounded per-set history.
+        //
+        // Asserted relative to the window so this stays honest when the window is tuned.
+        const int diff = 50_000;
+        var (primary, replica) = MakeNodesWithSharedKeys(diff);
+        for (int i = 0; i < diff; i++) primary.Insert(RandomKey());
 
         replica.Prepare();
         primary.Prepare();
 
         var sw = Stopwatch.StartNew();
-        var result = primary.TryGetTail(replica.Epoch, replica.LogPosition, replica.EffectiveSet.Sum());
+        var result = primary.TryGetTail(replica.Epoch, replica.Cursor, replica.Sum().Tag);
         sw.Stop();
 
-        Assert.NotNull(result);
-        Assert.Equal(50_000, result.Count);
-        _output.WriteLine($"Large tail send – {sw.Elapsed.TotalMilliseconds:F2} ms");
+        if (diff > SyncableNode.SumIndexWindow)
+        {
+            Assert.Null(result);
+            _output.WriteLine($"Large tail declined (diff {diff:N0} > window "
+                            + $"{SyncableNode.SumIndexWindow:N0}) – {sw.Elapsed.TotalMilliseconds:F2} ms");
+        }
+        else
+        {
+            Assert.NotNull(result);
+            Assert.Equal(diff, result.Adds.Count);
+            Assert.Equal(0, result.RemoveCount);
+            _output.WriteLine($"Large tail send – {sw.Elapsed.TotalMilliseconds:F2} ms");
+        }
     }
 
     [Fact]
@@ -100,17 +120,18 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         replica.Prepare();
         primary.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
-        // With sequence-based protocol, this resolves via fast path (tail send), not trie fallback.
-        Assert.False(sim.UsedFallback);
-        Assert.Equal(1, sim.RoundTrips);
+        // Which path this takes is a function of SumIndexWindow: the replica is `newItems`
+        // ops behind, so it fast-paths while that fits the window and falls back past it.
+        // Either way it must converge on a 1M-key set at a cost set by the diff, not the set.
+        Assert.Equal(newItems > SyncableNode.SumIndexWindow, sim.UsedFallback);
         Assert.Equal(newItems, sim.ItemsAdded);
         Assert.Equal(primary.Sum(), replica.Sum());
-        _output.WriteLine($"Large fast path – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
+        _output.WriteLine($"Large diff ({(sim.UsedFallback ? "trie" : "fast path")}) – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
     [Fact]
@@ -121,8 +142,8 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         for (int i = 0; i < items; i++) primary.Insert(RandomKey());
 
         var replica = new SyncableNode();
-        var sim = new SyncNodes(replica, primary);
-        Assert.True(sim.TrySync(_output));
+        var sim = new SyncNodes(replica, primary, Transport());
+        Assert.True(sim.TrySync());
 
         Assert.Equal(items, sim.ItemsAdded);
         Assert.Equal(primary.Sum(), replica.Sum());
@@ -142,16 +163,18 @@ public class SyncPerformanceTests(ITestOutputHelper output)
         primary.Prepare();
         replica.Prepare();
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.Equal(50_000, sim.ItemsAdded);
         Assert.Equal(50_000, sim.ItemsDeleted);
-        // Deletes now flow through the same fast path — should be 1 RT
-        Assert.Equal(1, sim.RoundTrips);
-        Assert.False(sim.UsedFallback);
+        // 100,000 ops of divergence (50k deletes + 50k adds). Deletes take the same fast
+        // path as adds, so which path runs is again just diff-versus-window; the point
+        // retained here regardless is that both directions converge in one sync.
+        Assert.Equal(100_000 > SyncableNode.SumIndexWindow, sim.UsedFallback);
+        Assert.Equal(primary.Sum(), replica.Sum());
         _output.WriteLine($"Large deletes – {sw.Elapsed.TotalMilliseconds:F2} ms, Trips: {sim.RoundTrips}, Latency: {sim.EstimatedLatencyMs:N0} ms, Rx: {sim.BytesReceived:N0}, Tx: {sim.BytesSent:N0}");
     }
 
@@ -165,15 +188,15 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
         primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        Assert.True(new SyncNodes(replica, primary, Transport()).TrySync());
 
         primary.Delete(sharedKeys[5_000]);
         primary.Insert(RandomKey());
         primary.Compact();
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
@@ -192,16 +215,16 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
         primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        Assert.True(new SyncNodes(replica, primary, Transport()).TrySync());
 
         // Diverge by ~500 ops (250 deletes + 250 adds), then compact.
         primary.DeleteBulk(sharedKeys.Skip(5_000).Take(250));
         for (int i = 0; i < 250; i++) primary.Insert(RandomKey());
         primary.Compact();
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.False(sim.UsedFallback);
@@ -220,15 +243,15 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
         primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        Assert.True(new SyncNodes(replica, primary, Transport()).TrySync());
 
         primary.DeleteBulk(sharedKeys.Skip(5_000).Take(50_000));
         for (int i = 0; i < 50_000; i++) primary.Insert(RandomKey());
         primary.Compact();
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
@@ -243,14 +266,14 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys);
         primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        Assert.True(new SyncNodes(replica, primary, Transport()).TrySync());
 
         for (int i = 0; i < 10_000; i++) primary.Insert(RandomKey());
         primary.Compact();
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());
@@ -265,15 +288,15 @@ public class SyncPerformanceTests(ITestOutputHelper output)
 
         primary.DeleteBulk(sharedKeys.Take(5_000));
         primary.Prepare(); replica.Prepare();
-        Assert.True(new SyncNodes(replica, primary).TrySync(_output));
+        Assert.True(new SyncNodes(replica, primary, Transport()).TrySync());
 
         primary.DeleteBulk(sharedKeys.Skip(5_000).Take(10_000));
         primary.Compact();
         primary.DeleteBulk(sharedKeys.Skip(15_000).Take(10_000)); // new deletes post-compact
 
-        var sim = new SyncNodes(replica, primary);
+        var sim = new SyncNodes(replica, primary, Transport());
         var sw = Stopwatch.StartNew();
-        Assert.True(sim.TrySync(_output));
+        Assert.True(sim.TrySync());
         sw.Stop();
 
         Assert.Equal(primary.Sum(), replica.Sum());

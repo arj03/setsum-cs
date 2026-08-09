@@ -50,6 +50,15 @@ public readonly struct Setsum
     public bool IsEmpty() => _state == Vector256<uint>.Zero;
 
     /// <summary>
+    /// A 64-bit tag over the digest: the low two field limbs. Each limb is near-uniform
+    /// over [0, p), so this is a good hash of the whole set — but it is a truncation, not
+    /// a digest, and 64 bits of it can collide. It exists so the sync protocol can address
+    /// a set by content in 8 bytes instead of 32; every use is verified downstream by
+    /// comparing full sums, so a collision costs a wasted round trip and never a wrong result.
+    /// </summary>
+    public ulong Tag => _state.AsUInt64().GetElement(0);
+
+    /// <summary>
     /// Inserts a new item hash into the multi-set. If the item was already inserted, it will be inserted again.
     /// </summary>
     public Setsum InsertHash(ReadOnlySpan<byte> hash)

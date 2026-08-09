@@ -1,4 +1,4 @@
-﻿namespace Setsum.Sync;
+namespace Setsum.Sync;
 
 /// <summary>
 /// Protobuf-compatible unsigned varint (LEB128) codec for non-negative Int32 values.
@@ -11,6 +11,9 @@
 /// </summary>
 public static class VarInt
 {
+    /// <summary>Maximum encoded length of any non-negative Int32.</summary>
+    public const int MaxSize = 5;
+
     /// <summary>Returns the number of bytes needed to encode <paramref name="value"/>.</summary>
     public static int Size(int value)
     {
@@ -20,5 +23,34 @@ public static class VarInt
         if (value < 0x200000) return 3;
         if (value < 0x10000000) return 4;
         return 5;
+    }
+
+    /// <summary>Writes <paramref name="value"/> and returns the number of bytes written.</summary>
+    public static int Write(Span<byte> destination, int value)
+    {
+        if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+        uint remaining = (uint)value;
+        int written = 0;
+        while (remaining >= 0x80)
+        {
+            destination[written++] = (byte)(remaining | 0x80);
+            remaining >>= 7;
+        }
+        destination[written++] = (byte)remaining;
+        return written;
+    }
+
+    /// <summary>Reads a value, advancing <paramref name="offset"/> past it.</summary>
+    public static int Read(ReadOnlySpan<byte> source, ref int offset)
+    {
+        int result = 0, shift = 0;
+        while (true)
+        {
+            byte b = source[offset++];
+            result |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) return result;
+            shift += 7;
+            if (shift > 28) throw new FormatException("varint exceeds Int32 range");
+        }
     }
 }

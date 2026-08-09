@@ -16,11 +16,15 @@ public class SyncBitsSweepTests(ITestOutputHelper output)
 {
     private readonly ITestOutputHelper _output = output;
 
+    /// <summary>Non-tracing in-memory transport. The sweep prints its own table, so the
+    /// per-sync protocol trace is discarded (an InMemoryTransport with no trace callback).</summary>
+    private static InMemoryTransport Transport() => new();
+
     // Deterministic but uniformly-distributed 32-byte keys: SHA256(seed || counter). A plain
     // Random.NextBytes is reproducible too, but its weak high-bit distribution clusters keys in
     // the trie and inflates the expansion front, making byte counts unrepresentative of the
     // digest-style keys the protocol targets.
-    private static Func<byte[]> SeededKeys(int seed)
+    private static Func<Key> SeededKeys(int seed)
     {
         long counter = 0;
         return () =>
@@ -28,7 +32,7 @@ public class SyncBitsSweepTests(ITestOutputHelper output)
             Span<byte> input = stackalloc byte[16];
             BinaryPrimitives.WriteInt64LittleEndian(input, seed);
             BinaryPrimitives.WriteInt64LittleEndian(input[8..], counter++);
-            return SHA256.HashData(input);
+            return new Key(SHA256.HashData(input));
         };
     }
 
@@ -60,7 +64,7 @@ public class SyncBitsSweepTests(ITestOutputHelper output)
         primary.DeleteBulk(sortedKeys.Take(preDeletes));
         primary.Prepare();
         replica.Prepare();
-        new SyncNodes(replica, primary).TrySync(NullOutput.Instance);
+        new SyncNodes(replica, primary, Transport()).TrySync();
 
         // Diverge further, then compact so the next sync sees an epoch mismatch.
         if (postDeletes > 0) primary.DeleteBulk(sortedKeys.Skip(preDeletes).Take(postDeletes));
@@ -89,8 +93,8 @@ public class SyncBitsSweepTests(ITestOutputHelper output)
                 // ForceTrieSync bypasses the sum-addressable fast path: this sweep exists to
                 // measure trie behaviour, which a fast-pathed sync would never exercise.
                 var (primary, replica) = build();
-                var sim = new SyncNodes(replica, primary) { BitsPerExpansion = bits, ForceTrieSync = true };
-                Assert.True(sim.TrySync(NullOutput.Instance));
+                var sim = new SyncNodes(replica, primary, Transport()) { BitsPerExpansion = bits, ForceTrieSync = true };
+                Assert.True(sim.TrySync());
                 Assert.Equal(primary.Sum(), replica.Sum());
                 Assert.Equal(primary.EffectiveCount(), replica.EffectiveCount());
 
@@ -100,12 +104,4 @@ public class SyncBitsSweepTests(ITestOutputHelper output)
             _output.WriteLine(new string('-', 76));
         }
     }
-}
-
-/// <summary>An <see cref="ITestOutputHelper"/> that discards output, for the sweep's inner syncs.</summary>
-internal sealed class NullOutput : ITestOutputHelper
-{
-    public static readonly NullOutput Instance = new();
-    public void WriteLine(string message) { }
-    public void WriteLine(string format, params object[] args) { }
 }
