@@ -59,8 +59,20 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     /// </summary>
     public const int RoundTripLatencyMs = 50;
 
-    /// <summary>Estimated wall-clock latency from round trips alone: RoundTrips × RTT.</summary>
-    public int EstimatedLatencyMs => RoundTrips * RoundTripLatencyMs;
+    /// <summary>Assumed link rate, for the transfer term of <see cref="EstimatedLatencyMs"/>.</summary>
+    public int LinkMbps { get; init; } = 100;
+
+    /// <summary>
+    /// Estimated wall-clock latency: round trips × RTT, PLUS transfer time.
+    ///
+    /// Round trips dominate on a WAN for small diffs, which is what the fast path optimises
+    /// — but a 10,000-item tail is ~320 KB and bandwidth-bound, not RTT-bound. Counting only
+    /// round trips reported the same 50 ms for a 3-item and a 10,000-item sync, which hid
+    /// every byte-level difference in the benchmarks meant to measure them.
+    /// </summary>
+    public double EstimatedLatencyMs
+        => RoundTrips * (double)RoundTripLatencyMs
+         + (BytesSent + BytesReceived) * 8.0 / (LinkMbps * 1000.0);
 
     private readonly SyncableNode _replica = replica;
     private readonly SyncableNode _primary = primary;

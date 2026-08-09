@@ -210,6 +210,7 @@ public class SyncableNode
             _logIsAdd.Add(true);
             _prefixSums.Add(_prefixSums[^1] + Setsum.Hash(key));
         }
+        ReleaseSlack(); // Clear() keeps capacity too, so a rebuild to a smaller set leaks it
         RebuildSumIndex();
     }
 
@@ -272,8 +273,34 @@ public class SyncableNode
             _logKeys.RemoveRange(0, excess);
             _logIsAdd.RemoveRange(0, excess);
             _prefixSums.RemoveRange(0, excess); // keeps _prefixSums[0] = sum at window base
+            ReleaseSlack();
         }
         RebuildSumIndex();
+    }
+
+    /// <summary>
+    /// Give back the array capacity a trimmed log no longer needs.
+    ///
+    /// <see cref="List{T}.RemoveRange"/> moves Count but never shrinks Capacity, so without
+    /// this the log holds the largest array it ever allocated — measured at 64 MiB per list
+    /// after a 2M-op run — whatever <see cref="SumIndexWindow"/> is set to. That made the
+    /// window bound only the sum index, not the per-set memory it is documented to bound.
+    ///
+    /// Hysteresis: shrink only when slack exceeds both half the live count and a small
+    /// absolute floor, so a log hovering near the window does not reallocate on every
+    /// compaction and short logs are left alone. The floor matters because a log that
+    /// doubles between compactions lands at exactly 2x capacity — a pure ratio test set
+    /// at 2x would sit on the boundary and never reclaim in the commonest case.
+    /// </summary>
+    private void ReleaseSlack()
+    {
+        int slack = _logKeys.Capacity - _logKeys.Count;
+        if (slack > Math.Max(1024, _logKeys.Count / 2))
+        {
+            _logKeys.Capacity = _logKeys.Count;
+            _logIsAdd.Capacity = _logIsAdd.Count;
+            _prefixSums.Capacity = _prefixSums.Count;
+        }
     }
 
     /// <summary>
