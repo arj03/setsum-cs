@@ -94,6 +94,9 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         // The sum is the content address that lets the fast path resolve even across a
         // compaction (epoch bump); epoch + position stay a cheap pre-check for the
         // common same-epoch, aligned-history case.
+        // The EFFECTIVE SET's sum, not the log's. They agree by invariant, but only this one
+        // reflects out-of-band corruption of the set — which is exactly what the fallback
+        // exists to repair. It is O(1) now, so reading it costs the fast path nothing.
         var replicaEffectiveSum = _replica.EffectiveSet.Sum();
         BytesSent += VarInt.Size(_replica.Epoch)
                    + VarInt.Size(_replica.LogPosition) + SetsumSize;
@@ -134,6 +137,11 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
         {
             // ---- Fallback: sum not resolvable (diverged past the window or corrupt) ----
             UsedFallback = true;
+
+            // Only the trie needs the O(N) per-key prefix sums, so they are built here
+            // rather than up front — the fast path above must never pay for them.
+            _primary.PrepareTrie();
+            _replica.PrepareTrie();
 
             var (rootHash, rootCount) = _primary.EffectiveSet.TotalInfo();
 

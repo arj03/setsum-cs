@@ -25,6 +25,13 @@ public class SortedKeyStore
     private Setsum[] _prefixSums = new Setsum[17];
     private bool _prefixSumsDirty = true;
 
+    // Running setsum of current membership, maintained by every mutation funnel
+    // (MergeSorted / RemoveSorted / the EnsureSorted swap path). Kept here rather than
+    // derived from the log so that out-of-band mutations through Add / Remove /
+    // DeleteBulkPresorted — i.e. deliberate corruption — still show up in Sum(), which
+    // is what lets a sync detect a replica whose set no longer matches its own history.
+    private Setsum _sum;
+
     // Pending unsorted additions, flushed lazily on next query
     private byte[] _pending = new byte[16 * KeySize];
     private int _pendingCount;
@@ -34,6 +41,12 @@ public class SortedKeyStore
 
     private readonly int[] _counts = new int[256];
     private readonly int[] _offsets = new int[256];
+
+    /// <summary>
+    /// Whether the O(N) per-key prefix-sum array is currently built. Test hook: the fast path
+    /// must never trigger the build, and only the trie fallback should.
+    /// </summary>
+    internal bool PrefixSumsBuilt => !_prefixSumsDirty;
 
     public int Count()
     {
@@ -62,7 +75,86 @@ public class SortedKeyStore
     }
 
     /// <summary>
-    /// Flushes pending mutations and readies the store for queries.
+    /// Sorts, de-duplicates and merges <paramref name="keys"/>, returning exactly those that
+    /// were NOT already members, in the caller's original insertion order. One radix sort and
+    /// one merge walk for the whole batch — O(n log n + N) once, rather than an O(log N)
+    /// membership probe per key, so bulk loading pays for the duplicate check only once.
+    ///
+    /// The returned ORDER is load-bearing, not incidental. The caller logs exactly these keys,
+    /// and the log's prefix sums are the addresses the sum-addressable fast path resolves a
+    /// replica against. Returning the batch sorted instead would scatter a batch's genuinely
+    /// new keys among the ones already shared with a replica, leaving no prefix that sums to
+    /// the shared set — silently costing every sync the fast path, however small the diff.
+    /// </summary>
+    public List<byte[]> AddDistinct(List<byte[]> keys)
+    {
+        if (keys.Count == 0) return [];
+        EnsureSorted();
+
+        int n = keys.Count;
+        var candidates = new byte[n * KeySize];
+        for (int i = 0; i < n; i++) keys[i].CopyTo(candidates, i * KeySize);
+
+        GrowScratch(ref _scratch, n * KeySize);
+        SortPending(candidates, n, _scratch); // radix sort, result lands back in candidates
+
+        // Single merge walk against the store: drop keys duplicated within the batch and keys
+        // already present. MergeSorted needs this run sorted, so insertion order is recovered
+        // separately below rather than by building the result here.
+        var accepted = new byte[n * KeySize];
+        int m = 0, j = 0;
+        for (int i = 0; i < n; i++)
+        {
+            var candidate = KeyAt(candidates, i);
+            if (m > 0 && KeyAt(accepted, m - 1).SequenceCompareTo(candidate) == 0) continue;
+            while (j < _count && KeyAt(_data, j).SequenceCompareTo(candidate) < 0) j++;
+            if (j < _count && KeyAt(_data, j).SequenceCompareTo(candidate) == 0) continue;
+            candidate.CopyTo(accepted.AsSpan(m * KeySize));
+            m++;
+        }
+
+        // Replay the caller's order over the accepted run. O(n log m) — negligible beside the
+        // sort. `emitted` collapses a key repeated within the batch onto its first occurrence,
+        // matching the de-duplication the merge walk already applied.
+        var added = new List<byte[]>(m);
+        var emitted = new bool[m];
+        for (int i = 0; i < n && added.Count < m; i++)
+        {
+            int idx = IndexOfSorted(accepted, m, keys[i]);
+            if (idx >= 0 && !emitted[idx])
+            {
+                emitted[idx] = true;
+                added.Add(keys[i]);
+            }
+        }
+
+        if (m > 0) MergeSorted(accepted, m);
+        return added;
+    }
+
+    private static int IndexOfSorted(byte[] buffer, int count, ReadOnlySpan<byte> key)
+    {
+        int lo = 0, hi = count - 1;
+        while (lo <= hi)
+        {
+            int mid = (int)(((uint)lo + (uint)hi) >> 1);
+            int cmp = KeyAt(buffer, mid).SequenceCompareTo(key);
+            if (cmp == 0) return mid;
+            if (cmp < 0) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Flushes pending mutations. Cheap — this is all the fast path needs.
+    /// </summary>
+    public void Flush() => EnsureSorted();
+
+    /// <summary>
+    /// Flushes AND builds the per-key prefix-sum array that range-hash queries need.
+    /// O(N) whenever the set has changed, so only the trie fallback should call it —
+    /// the fast path resolves from the log's prefix sums and never touches these.
     /// </summary>
     public void Prepare()
     {
@@ -72,6 +164,9 @@ public class SortedKeyStore
 
     public void MergeSorted(byte[] keys, int newCount)
     {
+        for (int m = 0; m < newCount; m++)
+            _sum += Setsum.Hash(KeyAt(keys, m));
+
         int total = _count + newCount;
         GrowScratch(ref _scratch, total * KeySize);
 
@@ -105,7 +200,9 @@ public class SortedKeyStore
         {
             int cmp = KeyAt(_data, i).SequenceCompareTo(KeyAt(keys, j));
             if (cmp < 0) CopyKey(_data, i++, _scratch, k++);
-            else if (cmp == 0) { i++; j++; } // drop matched key
+            // Only a MATCHED key leaves the set, so only that one is subtracted — a
+            // remove request for a key we never held must not move the sum.
+            else if (cmp == 0) { _sum -= Setsum.Hash(KeyAt(_data, i)); i++; j++; } // drop matched key
             else j++;                          // skip key not in store
         }
         while (i < _count)
@@ -165,7 +262,16 @@ public class SortedKeyStore
             yield return KeyAt(_data, i).ToArray();
     }
 
-    public Setsum Sum() => TotalInfo().Hash;
+    /// <summary>
+    /// Current membership sum. O(1) — read from the incrementally maintained running sum
+    /// rather than the per-key prefix-sum array, so asking for it does not drag in the
+    /// O(N) rebuild that only the trie needs.
+    /// </summary>
+    public Setsum Sum()
+    {
+        EnsureSorted();
+        return _sum;
+    }
 
     public IEnumerable<byte[]> All()
     {
@@ -301,6 +407,8 @@ public class SortedKeyStore
 
             if (_count == 0)
             {
+                for (int i = 0; i < n; i++)
+                    _sum += Setsum.Hash(KeyAt(_pending, i));
                 (_data, _pending) = (_pending, _data);
                 _count = n;
                 _prefixSumsDirty = true;

@@ -47,17 +47,60 @@ public class SyncableNode
     public const int SumIndexWindow = 1 << 10; // 1,024 ops
 
     // Effective membership set (for trie-based sync fallback)
-    public SortedKeyStore EffectiveSet { get; private set; } = new();
+    private readonly SortedKeyStore _effectiveSet = new();
+
+    /// <summary>
+    /// Inserts staged by <see cref="Insert"/> but not yet logged. Deferring lets a whole batch
+    /// be de-duplicated against the effective set in one merge pass, so the log records only
+    /// keys that genuinely changed membership — which is what keeps the log's prefix sum equal
+    /// to the set's sum when the same key is inserted twice. Without it the set silently
+    /// becomes a multiset and two nodes given the same key a different number of times end up
+    /// with different sums.
+    /// </summary>
+    private readonly List<byte[]> _stagedInserts = [];
+
+    /// <summary>
+    /// Effective membership set. Reading this materialises any staged inserts, so callers
+    /// always observe the set as of the last mutation.
+    /// </summary>
+    public SortedKeyStore EffectiveSet
+    {
+        get { FlushInserts(); return _effectiveSet; }
+    }
 
     public int Epoch { get; set; }
-    public int LogPosition => _logKeys.Count;
 
-    public Setsum Sum() => _prefixSums[^1];
-
-    public void Insert(byte[] key)
+    public int LogPosition
     {
-        AppendOp(key, isAdd: true);
-        EffectiveSet.Add(key);
+        get { FlushInserts(); return _logKeys.Count; }
+    }
+
+    public Setsum Sum()
+    {
+        FlushInserts();
+        return _prefixSums[^1];
+    }
+
+    /// <summary>
+    /// Stages an insert. A key that is already a member is dropped at flush time rather than
+    /// appended twice, so the effective set stays a set.
+    /// </summary>
+    public void Insert(byte[] key) => _stagedInserts.Add(key);
+
+    /// <summary>
+    /// Merge staged inserts into the effective set and log exactly those that were not already
+    /// members. Duplicates — within the batch or against the existing set — never reach the
+    /// log, so the log stays a faithful history and the set stays a set.
+    /// </summary>
+    private void FlushInserts()
+    {
+        if (_stagedInserts.Count == 0) return;
+
+        var staged = new List<byte[]>(_stagedInserts);
+        _stagedInserts.Clear();
+
+        foreach (var key in _effectiveSet.AddDistinct(staged))
+            AppendOp(key, isAdd: true);
     }
 
     public void Delete(byte[] key)
@@ -77,12 +120,13 @@ public class SyncableNode
     /// </summary>
     public void DeleteBulk(IEnumerable<byte[]> keys)
     {
-        EffectiveSet.Prepare();
+        var store = EffectiveSet; // flushes staged inserts, so a delete sees them
+        store.Flush();
 
         // Collect keys that are actually present, then sort so any duplicates are adjacent.
         var present = new List<byte[]>();
         foreach (var key in keys)
-            if (EffectiveSet.Contains(key)) present.Add(key);
+            if (store.Contains(key)) present.Add(key);
         if (present.Count == 0) return;
         present.Sort(ByteComparer.Instance);
 
@@ -96,7 +140,7 @@ public class SyncableNode
             AppendOp(key, isAdd: false);
             toDelete.Add(key);
         }
-        EffectiveSet.DeleteBulkPresorted(toDelete);
+        store.DeleteBulkPresorted(toDelete);
     }
 
     /// <summary>
@@ -156,7 +200,7 @@ public class SyncableNode
         foreach (var (isAdd, key) in ops)
             finalIsAdd[key] = isAdd; // last op wins
 
-        EffectiveSet.Prepare();
+        EffectiveSet.Flush();
         var toAdd = new List<byte[]>();
         var toRemove = new List<byte[]>();
         foreach (var (key, isAdd) in finalIsAdd)
@@ -187,7 +231,7 @@ public class SyncableNode
     /// </summary>
     public void Compact()
     {
-        EffectiveSet.Prepare();
+        EffectiveSet.Flush();
         TrimLogToWindow();
         Epoch++;
     }
@@ -198,12 +242,16 @@ public class SyncableNode
     /// </summary>
     public void RebuildLog()
     {
+        // Before clearing: a staged flush appends to the log, so it must happen against the
+        // old log rather than the freshly cleared one.
+        FlushInserts();
+
         _logKeys.Clear();
         _logIsAdd.Clear();
         _prefixSums.Clear();
         _prefixSums.Add(new Setsum());
 
-        EffectiveSet.Prepare();
+        EffectiveSet.Flush();
         foreach (var key in EffectiveSet.All())
         {
             _logKeys.Add(key);
@@ -214,7 +262,21 @@ public class SyncableNode
         RebuildSumIndex();
     }
 
+    /// <summary>
+    /// Materialise staged mutations. Cheap — no O(N) per-key prefix-sum build.
+    /// </summary>
     public void Prepare()
+    {
+        EffectiveSet.Flush();
+    }
+
+    /// <summary>
+    /// Materialise staged mutations AND build the per-key prefix-sum index that trie range
+    /// queries need. O(N) when the set has changed, so only the fallback path calls it: the
+    /// fast path addresses the replica through the LOG's prefix sums and never reads these,
+    /// so building them up front made every one-round-trip sync pay an O(set) cost.
+    /// </summary>
+    public void PrepareTrie()
     {
         EffectiveSet.Prepare();
     }
