@@ -21,18 +21,18 @@ public readonly struct Setsum
     /// (birthday paradox gives ~2⁻²⁵⁶ probability for a random collision).
     /// </summary>
     private static readonly Vector256<uint> Primes = Vector256.Create(
-        4294967291u, // 2^32 - 5    (mod 8 = 3)
-        4294967279u, // 2^32 - 17   (mod 8 = 7)
-        4294967231u, // 2^32 - 65   (mod 8 = 7)
-        4294967143u, // 2^32 - 153  (mod 8 = 7)
-        4294967111u, // 2^32 - 185  (mod 8 = 7)
-        4294967087u, // 2^32 - 209  (mod 8 = 7)
-        4294966943u, // 2^32 - 353  (mod 8 = 7)
-        4294966667u  // 2^32 - 629  (mod 8 = 3)
+        4294967291u, // largest prime < 2³²
+        4294967279u,
+        4294967231u,
+        4294967197u,
+        4294967189u,
+        4294967161u,
+        4294967143u,
+        4294967111u  // 8th largest
     );
 
     private static readonly Vector256<uint> C = Vector256.Create(
-        5u, 17u, 65u, 153u, 185u, 209u, 353u, 629u);
+        5u, 17u, 65u, 99u, 107u, 135u, 153u, 185u);
 
     private readonly Vector256<uint> _state;
 
