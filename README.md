@@ -6,7 +6,7 @@ This is somewhat similar to [ECHM] for multiset hashing.
 
 ## Performance
 
-Can do around 200 million inserts per second on a 8 year old i7.
+Can do around 250 million inserts per second on a 8 year old i7.
 
 The implementation started out doing around 6 million. The 10x
 improvement came from various c# optimizations and using SIMD. The

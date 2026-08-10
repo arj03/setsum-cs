@@ -21,18 +21,18 @@ public readonly struct Setsum
     /// (birthday paradox gives ~2⁻²⁵⁶ probability for a random collision).
     /// </summary>
     private static readonly Vector256<uint> Primes = Vector256.Create(
-        4294967291u, // largest prime < 2³²
-        4294967279u,
-        4294967231u,
-        4294967197u,
-        4294967189u,
-        4294967161u,
-        4294967143u,
-        4294967111u  // 8th largest
+        4294967291u, // 2^32 - 5    (mod 8 = 3)
+        4294967279u, // 2^32 - 17   (mod 8 = 7)
+        4294967231u, // 2^32 - 65   (mod 8 = 7)
+        4294967143u, // 2^32 - 153  (mod 8 = 7)
+        4294967111u, // 2^32 - 185  (mod 8 = 7)
+        4294967087u, // 2^32 - 209  (mod 8 = 7)
+        4294966943u, // 2^32 - 353  (mod 8 = 7)
+        4294966667u  // 2^32 - 629  (mod 8 = 3)
     );
 
-    // Precomputed adjustment: 2^32 mod P. 
-    private static readonly Vector256<uint> Adjust = Vector256.Subtract(Vector256<uint>.Zero, Primes);
+    private static readonly Vector256<uint> C = Vector256.Create(
+        5u, 17u, 65u, 153u, 185u, 209u, 353u, 629u);
 
     private readonly Vector256<uint> _state;
 
@@ -92,26 +92,25 @@ public readonly struct Setsum
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<uint> Add(Vector256<uint> lhs, Vector256<uint> rhs)
     {
-        // Step 1: Standard integer addition
+        // Both inputs are < p, so sum < 2p
         var sum = lhs + rhs;
 
-        // Step 2: Detect carry (overflow of 32-bit addition)
-        var carry = Vector256.LessThan(sum, lhs);
+        // Carry means we wrapped past 2^32
+        var carry = Vector256.LessThan(sum, lhs);   // 0 or all-bits-1
 
-        // Step 3: Correction
-        // If a carry occurred, we added 2^32. We need to subtract 2^32 and add (2^32 mod P).
-        // (2^32 mod P) is precomputed in Adjust.
-        // Bitwise AND is efficient: mask is -1 if true.
-        sum += (carry & Adjust);
+        // Because p = 2^32 - c:
+        //   (a + b) mod p = (a + b - 2^32) + c   when carry occurred
+        //                 = a + b               otherwise
+        sum += carry & C;
 
-        // Step 4: Modular Reduction
-        // If sum >= Prime, subtract Prime.
-        var overflow = Vector256.GreaterThanOrEqual(sum, Primes);
-        return sum - (overflow & Primes);
+        // Final correction: if still >= p then subtract p
+        var ge = Vector256.GreaterThanOrEqual(sum, Primes);
+        return sum - (ge & Primes);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector256<uint> Negate(Vector256<uint> x) => Vector256.Subtract(Primes, x);
+    private static Vector256<uint> Negate(Vector256<uint> x)
+        => Vector256.Subtract(Primes, x);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<uint> LoadAndReduce(ReadOnlySpan<byte> hash)
@@ -122,9 +121,9 @@ public readonly struct Setsum
 
         var v = Vector256.LoadUnsafe(ref pUint);
 
-        // Reduce if value >= Prime
-        var overflow = Vector256.GreaterThanOrEqual(v, Primes);
-        return v - (overflow & Primes);
+        // Cheap reduction for a raw 32-bit value
+        var ge = Vector256.GreaterThanOrEqual(v, Primes);
+        return v - (ge & Primes);
     }
 
     /// <summary>
@@ -142,10 +141,18 @@ public readonly struct Setsum
     }
 
     // Operators
-    public static Setsum operator +(Setsum lhs, Setsum rhs) => new(Add(lhs._state, rhs._state));
-    public static Setsum operator -(Setsum lhs, Setsum rhs) => new(Add(lhs._state, Negate(rhs._state)));
-    public static bool operator ==(Setsum lhs, Setsum rhs) => lhs._state.Equals(rhs._state);
-    public static bool operator !=(Setsum lhs, Setsum rhs) => !lhs._state.Equals(rhs._state);
+    public static Setsum operator +(Setsum lhs, Setsum rhs)
+        => new(Add(lhs._state, rhs._state));
+
+    public static Setsum operator -(Setsum lhs, Setsum rhs)
+        => new(Add(lhs._state, Negate(rhs._state)));
+
+    public static bool operator ==(Setsum lhs, Setsum rhs)
+        => lhs._state.Equals(rhs._state);
+
+    public static bool operator !=(Setsum lhs, Setsum rhs)
+        => !lhs._state.Equals(rhs._state);
+
     public bool Equals(Setsum other) => _state.Equals(other._state);
     public override bool Equals(object? obj) => obj is Setsum s && Equals(s);
     public override int GetHashCode() => _state.GetHashCode();
