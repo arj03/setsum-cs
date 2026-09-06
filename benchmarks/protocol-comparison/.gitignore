@@ -1,0 +1,7 @@
+/before/
+/after/
+/*.log
+/*.trx
+/results.partial.json
+/results.json
+/comparison.md

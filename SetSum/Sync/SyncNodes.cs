@@ -35,8 +35,8 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
     /// <summary>
     /// Bits of prefix resolved per trie BFS level. 1 resolves a single bit per round trip
     /// (least bandwidth, most round trips); higher values fan out 2^bits children per node,
-    /// trading bytes for fewer round trips. Must divide <see cref="MaxPrefixDepth"/> (64) so
-    /// the final level lands exactly on the depth cap rather than overshooting it.
+    /// trading bytes for fewer round trips. Supported values are 1, 2, 4, and 8: these
+    /// divide the depth cap (64) and keep fanout bounded at 256 children per parent.
     ///
     /// Defaults to 2: roughly halves trie-fallback round trips versus 1 at essentially the
     /// same bandwidth. 4 cuts round trips further but inflates bytes on sparse diffs.
@@ -79,6 +79,10 @@ public partial class SyncNodes(SyncableNode replica, SyncableNode primary)
 
     public bool TrySync(ITestOutputHelper output)
     {
+        if (BitsPerExpansion is < 1 or > 8 || MaxPrefixDepth % BitsPerExpansion != 0)
+            throw new ArgumentOutOfRangeException(nameof(BitsPerExpansion),
+                "Use 1, 2, 4, or 8 bits per expansion.");
+
         RoundTrips = 0;
         UsedFallback = false;
         ItemsAdded = 0;

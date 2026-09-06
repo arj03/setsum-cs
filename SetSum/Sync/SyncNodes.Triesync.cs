@@ -58,6 +58,7 @@ public partial class SyncNodes
                                      int PrimaryStart, int PrimaryEnd,
                                      int ReplicaStart, int ReplicaEnd)>();
             var toExpand = new List<(BitPrefix Prefix, int Depth,
+                                     Setsum PrimaryHash, int PrimaryCount, bool Requested,
                                      int PrimaryStart, int PrimaryEnd,
                                      int ReplicaStart, int ReplicaEnd)>();
 
@@ -73,16 +74,28 @@ public partial class SyncNodes
                     pendingRemoves.AddRange(stale);
                     removed += stale.Count;
                 }
-                else if (replicaCount == 0
+                else if (replicaCount > primaryCount
+                      && replicaCount - primaryCount <= LeafThreshold
+                      && replica.TryReconcilePrefixByIndex(rsStart, rsEnd, primaryHash,
+                             replicaCount - primaryCount) is { } staleKeys)
+                {
+                    // Entirely local: the primary summary arrived in the previous response.
+                    pendingRemoves.AddRange(staleKeys);
+                    removed += staleKeys.Count;
+                }
+                else if (primaryCount <= LeafThreshold
+                      || replicaCount == 0
                       || depth >= MaxPrefixDepth
-                      || Math.Abs(primaryCount - replicaCount) <= LeafThreshold)
+                      || (primaryCount > replicaCount
+                          && primaryCount - replicaCount <= LeafThreshold))
                 {
                     leaves.Add((prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash,
                                 psStart, psEnd, rsStart, rsEnd));
                 }
                 else
                 {
-                    toExpand.Add((prefix, depth, psStart, psEnd, rsStart, rsEnd));
+                    toExpand.Add((prefix, depth, primaryHash, primaryCount, false,
+                                  psStart, psEnd, rsStart, rsEnd));
                 }
             }
 
@@ -96,14 +109,18 @@ public partial class SyncNodes
             foreach (var (prefix, depth, primaryCount, replicaCount, primaryHash, replicaHash,
                          psStart, psEnd, rsStart, rsEnd) in leaves)
             {
-                if (replicaCount == 0)
+                if (replicaCount == 0 || primaryCount <= LeafThreshold || depth >= MaxPrefixDepth)
                 {
-                    // Bulk pull: request prefix, receive all keys.
+                    // Authoritative subtree replacement: send only primary keys. The
+                    // replica computes both additions and removals locally.
                     BytesSent += prefix.NetworkSize;
                     var items = primary.RangeByIndex(psStart, psEnd).ToList();
                     BytesReceived += items.Count * KeySize;
-                    pendingAdds.AddRange(items);
-                    added += items.Count;
+                    var (toAdd, toRemove) = DiffSorted(items, replica.RangeByIndex(rsStart, rsEnd).ToList());
+                    pendingAdds.AddRange(toAdd);
+                    pendingRemoves.AddRange(toRemove);
+                    added += toAdd.Count;
+                    removed += toRemove.Count;
                     continue;
                 }
 
@@ -124,41 +141,11 @@ public partial class SyncNodes
                         continue;
                     }
                 }
-                else if (signedDiff < 0)
-                {
-                    // Replica ahead — primaryHash already in scope from expansion; peel replica locally (zero wire cost).
-                    var result = replica.TryReconcilePrefixByIndex(rsStart, rsEnd, primaryHash, absDiff);
 
-                    if (result != null) // found
-                    {
-                        pendingRemoves.AddRange(result);
-                        removed += result.Count;
-                        continue;
-                    }
-                }
-
-                if (depth < MaxPrefixDepth)
-                {
-                    toExpand.Add((prefix, depth, psStart, psEnd, rsStart, rsEnd));
-                    continue;
-                }
-
-                // depth >= MaxPrefixDepth — full key exchange. The replica sends every key it
-                // holds under this prefix; the primary diffs against its own keys and returns
-                // both the keys to add and the keys to remove. The removes must be sent
-                // explicitly: the replica never sees the primary's full set, so it cannot
-                // derive replica\primary from the adds (primary\replica) alone.
-                var replicaItems = replica.RangeByIndex(rsStart, rsEnd).ToList();
-                BytesSent += prefix.NetworkSize + replicaItems.Count * KeySize;
-
-                var primaryItems = primary.RangeByIndex(psStart, psEnd).ToList();
-                var (toAdd, toRemove) = DiffSorted(primaryItems, replicaItems);
-
-                BytesReceived += (toAdd.Count + toRemove.Count) * KeySize;
-                pendingAdds.AddRange(toAdd);
-                pendingRemoves.AddRange(toRemove);
-                added += toAdd.Count;
-                removed += toRemove.Count;
+                // Peel-or-expand request: the primary returns child summaries on failure
+                // in this SAME response. No request dependent on that response is needed.
+                toExpand.Add((prefix, depth, primaryHash, primaryCount, true,
+                              psStart, psEnd, rsStart, rsEnd));
             }
 
             // --- Interior expansion ---
@@ -167,28 +154,31 @@ public partial class SyncNodes
 
             int numChildren = 1 << BitsPerExpansion;
 
-            // Tx: prefix bytes for all children
-            foreach (var (prefix, depth, _, _, _, _) in toExpand)
-                for (int c = 0; c < numChildren; c++)
-                    BytesSent += prefix.ExtendN(c, BitsPerExpansion).NetworkSize;
+            // Request the parent once; all children follow in canonical order. Failed
+            // peel-or-expand requests already sent their parent prefix above.
+            foreach (var (prefix, _, _, _, requested, _, _, _, _) in toExpand)
+                if (!requested) BytesSent += prefix.NetworkSize;
 
             // Primary: split each parent into 2^BitsPerExpansion descendants.
             var primaryChildInfos = new (Setsum Hash, int Count)[toExpand.Count * numChildren];
             var primarySplitSets = new int[toExpand.Count][];
             for (int i = 0; i < toExpand.Count; i++)
             {
-                var (_, depth, pStart, pEnd, _, _) = toExpand[i];
+                var (_, depth, parentHash, parentCount, _, pStart, pEnd, _, _) = toExpand[i];
                 var (splits, hashes, counts) = primary.GetDescendantInfoByIndex(pStart, pEnd, depth, BitsPerExpansion);
                 primarySplitSets[i] = splits;
-                for (int c = 0; c < numChildren; c++)
+                // Send only fanout - 1 summaries. Reconstruct the last child from
+                // the previously received parent summary using Setsum subtraction.
+                var remainingHash = parentHash;
+                int remainingCount = parentCount;
+                for (int c = 0; c < numChildren - 1; c++)
+                {
                     primaryChildInfos[i * numChildren + c] = (hashes[c], counts[c]);
-            }
-
-            // Rx: varint(count) + (count > 0 ? Setsum : 0) per child
-            for (int i = 0; i < primaryChildInfos.Length; i++)
-            {
-                var (_, count) = primaryChildInfos[i];
-                BytesReceived += VarInt.Size(count) + (count > 0 ? SetsumSize : 0);
+                    BytesReceived += VarInt.Size(counts[c]) + (counts[c] > 0 ? SetsumSize : 0);
+                    remainingHash -= hashes[c];
+                    remainingCount -= counts[c];
+                }
+                primaryChildInfos[(i + 1) * numChildren - 1] = (remainingHash, remainingCount);
             }
 
             var nextLevel = new List<(BitPrefix Prefix, int Depth,
@@ -199,7 +189,7 @@ public partial class SyncNodes
 
             for (int i = 0; i < toExpand.Count; i++)
             {
-                var (prefix, depth, _, _, rsStart, rsEnd) = toExpand[i];
+                var (prefix, depth, _, _, _, _, _, rsStart, rsEnd) = toExpand[i];
                 int newDepth = depth + BitsPerExpansion;
                 var pSplits = primarySplitSets[i];
 

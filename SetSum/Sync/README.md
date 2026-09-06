@@ -110,12 +110,13 @@ flowchart TD
     G --> K["..."]
 ```
 
-One round trip per depth level, batching all leaf resolutions and child expansions. A node becomes a leaf when:
+One round trip per depth level that needs remote work, batching leaf resolutions and child expansions. Local deletion peeling happens before constructing the batch and adds no round trip. A node becomes a leaf when:
 
 - `primaryCount == 0` — replica's items are stale; removed locally with no wire traffic
 - `replicaCount == 0` — primary sends all its items directly
+- `primaryCount <= 3` — primary sends its complete subtree; the replica computes both adds and removes locally, including equal-count mixed differences
 - `|primaryCount − replicaCount| ≤ 3` — *attempted* via Setsum peeling; re-expands deeper if the peel can't isolate the differing items (and a count-equal leaf with mixed adds/removes never peels — it expands)
-- `depth ≥ MaxPrefixDepth` — full key exchange (both adds **and** removes)
+- `depth ≥ MaxPrefixDepth` — primary sends its complete subtree; the replica computes both adds and removes locally
 
 `MaxPrefixDepth` is 64: the trie discriminates on the first 64 bits of each key, which assumes keys are uniformly distributed there (digests/hashes). Divergent leaves then isolate far above that bound. Any keys that share a full 64-bit prefix collapse into a single depth-64 leaf, reconciled by a direct full key exchange — correct, but without the trie's bandwidth savings, so structured keys with long shared prefixes are out of scope.
 
@@ -125,13 +126,19 @@ One round trip per depth level, batching all leaf resolutions and child expansio
 
 **Replica ahead** (`signedDiff < 0`): The primary's hash is already in scope from the expansion response. The replica peels locally — **zero wire cost**.
 
-**Same count, different hash** (`signedDiff == 0`): Expanded further.
+**Same count, different hash** (`signedDiff == 0`): Replace directly when the primary subtree has at most 3 keys; otherwise expand further.
+
+**Failed primary peel**: the request means *peel or expand*. The primary returns child summaries immediately if peeling fails, without waiting for another request. A failed local replica peel is known before sending the batch, so it becomes an ordinary expansion request.
+
+**Expansion compression**: request each parent prefix once, rather than every child prefix. Return only the first `2^BitsPerExpansion - 1` child summaries in canonical order. The replica derives the last child's count and sum by subtracting those siblings from the already-known parent. This removes one summary per expansion (25% of summaries at the default fanout of four), without changing reconciliation guarantees or adding primary state.
 
 ---
 
 ## Wire Protocol
 
 All messages are binary with VarInt-encoded counts. Key = 32 B, Setsum = 32 B.
+
+The implementation is an in-process protocol simulator, not a binary transport codec. Its byte counters model the payload fields below; they exclude framing, operation/response tags, prefix-depth encoding, batch lengths, and snapshot identifiers. A transport must encode these explicitly, including the distinction between a successful peel and its expansion response. Counts and prefix depths needed to interpret requests must be self-describing to preserve primary statelessness.
 
 ### Sequence request (replica → primary)
 
@@ -168,9 +175,9 @@ Followed by trie sync rounds.
 
 ### Trie expansion (per BFS level)
 
-**Request** (replica → primary): prefix bytes per child — `ceil(depth / 8)` bytes each.
+**Request** (replica → primary): one parent prefix — `ceil(parentDepth / 8)` bytes per parent. A peel-or-expand request already carries this prefix and does not send it again on failure.
 
-**Response** (primary → replica): `varint(count) + 32 B hash` per child (hash omitted when count = 0).
+**Response** (primary → replica): `varint(count) + 32 B hash` for each of the first `fanout - 1` children (hash omitted when count = 0). Derive the final child by subtracting the transmitted summaries from the cached parent summary.
 
 ### Leaf resolution (within the same BFS round trip)
 
@@ -179,10 +186,15 @@ Followed by trie sync rounds.
 | replicaCount == 0 | prefix bytes | count × 32 B keys |
 | signedDiff > 0 (primary ahead) | prefix + 32 B replicaHash | count × 32 B missing keys |
 | signedDiff < 0 (replica ahead) | — | — (replica peels locally) |
-| signedDiff == 0 | — | — (expanded further) |
-| depth ≥ MaxPrefixDepth | prefix + count × 32 B replicaKeys | (adds + removes) × 32 B keys |
+| primaryCount ≤ 3 | prefix bytes | primaryCount × 32 B keys; diff locally |
+| signedDiff == 0, primaryCount > 3 | — | — (expanded further) |
+| depth ≥ MaxPrefixDepth | prefix bytes | primaryCount × 32 B keys; diff locally |
 
-At a `depth ≥ MaxPrefixDepth` leaf the primary returns **both** the keys to add and the keys to remove: the replica sent only its own keys, so it cannot derive `replica \ primary` from the adds (`primary \ replica`) alone.
+At a terminal leaf the replica receives the entire authoritative subtree. It can therefore derive both `primary \ replica` and `replica \ primary` locally. No replica keys or explicit removal keys cross the wire. This also bounds the cost of mixed differences in small subtrees instead of descending to separate every add from every delete.
+
+### Snapshot requirement
+
+The simulator runs over quiescent nodes. A real multi-round implementation must keep every response tied to the same primary snapshot, and keep the replica's compared state stable until applying the result. Compaction epochs alone are insufficient: inserts and deletes do not bump them. A transport can include a primary revision in every request and restart if it changes, or read an immutable snapshot identified by the request. Neither requires per-replica state. Parent-minus-siblings reconstruction, like subtree skipping in the original protocol, depends on this consistency.
 
 ---
 
