@@ -133,8 +133,34 @@ public readonly struct Setsum
     {
         int count = hashes.Length / DigestSize;
         var state = current._state;
+        int i = 0;
 
-        for (int i = 0; i < count; i++)
+        if (count >= 8)
+        {
+            // Independent chains let the CPU overlap modular additions across hashes.
+            var state1 = Vector256<uint>.Zero;
+            var state2 = Vector256<uint>.Zero;
+            var state3 = Vector256<uint>.Zero;
+            var state4 = Vector256<uint>.Zero;
+            var state5 = Vector256<uint>.Zero;
+            var state6 = Vector256<uint>.Zero;
+            var state7 = Vector256<uint>.Zero;
+            for (; i <= count - 8; i += 8)
+            {
+                state = Add(state, LoadAndReduce(hashes.Slice(i * DigestSize, DigestSize)));
+                state1 = Add(state1, LoadAndReduce(hashes.Slice((i + 1) * DigestSize, DigestSize)));
+                state2 = Add(state2, LoadAndReduce(hashes.Slice((i + 2) * DigestSize, DigestSize)));
+                state3 = Add(state3, LoadAndReduce(hashes.Slice((i + 3) * DigestSize, DigestSize)));
+                state4 = Add(state4, LoadAndReduce(hashes.Slice((i + 4) * DigestSize, DigestSize)));
+                state5 = Add(state5, LoadAndReduce(hashes.Slice((i + 5) * DigestSize, DigestSize)));
+                state6 = Add(state6, LoadAndReduce(hashes.Slice((i + 6) * DigestSize, DigestSize)));
+                state7 = Add(state7, LoadAndReduce(hashes.Slice((i + 7) * DigestSize, DigestSize)));
+            }
+            state = Add(Add(Add(state, state1), Add(state2, state3)),
+                        Add(Add(state4, state5), Add(state6, state7)));
+        }
+
+        for (; i < count; i++)
             state = Add(state, LoadAndReduce(hashes.Slice(i * DigestSize, DigestSize)));
 
         return new(state);
