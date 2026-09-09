@@ -6,17 +6,19 @@ This is somewhat similar to [ECHM] for multiset hashing.
 
 ## Performance
 
-Can do around 250 million inserts per second on a 8 year old i7.
+Can do around 285 million inserts per second on a 8 year old i7. 800
+million on a modern laptop.
 
 The implementation started out doing around 6 million. The 10x
 improvement came from various c# optimizations and using SIMD. The
-last 3x came from bulk inserts in a continous memory region.
+last 3x came from bulk inserts in a continous memory region. Last
+major bump was instruction-level parallelism.
 
 ## WASM
 
 There is a WASM implementation in SetsumWASM written in
-AssemblyScript. It can do 133 million inserts per second, not that far
-behind the c# version. The compiled wasm file is 1.7KB.
+AssemblyScript. It can do 230 million inserts per second, not that far
+behind the c# version. The compiled wasm file is 3.2KB.
 
 ## Sync
 
